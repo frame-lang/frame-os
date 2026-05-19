@@ -21,6 +21,7 @@ rustyline = { workspace = true }
 insta = { workspace = true }
 assert_cmd = { workspace = true }
 predicates = { workspace = true }
+tempfile = { workspace = true }
 
 [build-dependencies]
 anyhow = { workspace = true }

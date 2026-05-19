@@ -272,6 +272,7 @@ dependencies = [
  "insta",
  "predicates",
  "rustyline",
+ "tempfile",
 ]
 
 [[package]]

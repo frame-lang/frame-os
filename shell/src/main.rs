@@ -32,7 +32,7 @@ use rustyline::DefaultEditor;
 fn main() -> ExitCode {
     // Banner — printed once at startup, before the Shell prints its first
     // prompt. (Shell::__create() runs $Prompting.$> which prints "frame-os> ".)
-    println!("Frame OS shell — H0");
+    println!("Frame OS shell — H1");
     println!("type 'exit' or 'quit' to leave (Ctrl-C or Ctrl-D also work)");
 
     let mut shell = Shell::__create();

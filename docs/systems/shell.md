@@ -9,7 +9,7 @@
 | Source file | [`../../frame/shell.frs`](../../frame/shell.frs) |
 | State diagram | [`shell.svg`](shell.svg) |
 | Instances at runtime | Exactly one per process |
-| Status | In progress (H1 Step 2 — structure landed; Step 3 fills in builtin behavior) |
+| Status | In progress (H1 — all 8 builtins implemented) |
 
 ## State diagram
 
@@ -187,7 +187,24 @@ The `Builtin` enum:
 - `Empty` — no-op for empty token vectors
 - `Unknown(String, Vec<String>)` — command not matched; carries the name for the error message and the args for H2's external-execution path
 
-`classify(tokens: Vec<String>) -> Builtin` maps the parser's token output to a variant. `execute(builtin, &mut cwd, &history)` dispatches; at H1 Step 2 the per-variant bodies are `println!("(todo: <name>)")` placeholders. Step 3 fills them in one at a time, each with its own E2E test.
+`classify(tokens: Vec<String>) -> Builtin` maps the parser's token output to a variant. `execute(builtin, &mut cwd, &history)` dispatches. H1 Step 3 implementations:
+
+| Builtin | Behavior |
+|---|---|
+| `Cd(None)` | Goes to `$HOME`; prints `cd: HOME not set` if env var is missing |
+| `Cd(Some(path))` | Canonicalizes against `cwd`; updates if directory exists, prints error otherwise |
+| `Pwd` | Prints `cwd.display()` |
+| `Ls(None)` | Reads `cwd`, prints filenames alphabetically sorted, one per line |
+| `Ls(Some(path))` | Same against the resolved path |
+| `Cat(Some(path))` | Reads file as UTF-8 string and prints verbatim (no implicit newline, matching bash) |
+| `Cat(None)` | Prints `cat: missing file argument` |
+| `Echo(args)` | Joins args with single spaces; prints with newline |
+| `History` | Numbered list of prior commands (current command not yet appended at exec time) |
+| `Help` | Prints the builtin catalog |
+| `Empty` | No-op |
+| `Unknown(name, _)` | `println!("unknown command: {name} (try 'exit')")` |
+
+Filesystem paths from the user are resolved through a single `resolve(path, &cwd)` helper: absolute paths pass through, relative paths join onto `cwd`. The `cd` builtin additionally `canonicalize()`s to resolve `..`/`.` and follow symlinks before committing the new cwd.
 
 ## Open questions
 
@@ -207,3 +224,4 @@ The `Builtin` enum:
 - **2026-05-19** — initial doc; H0 implementation with `line` and `is_done`.
 - **2026-05-19** — added `interrupt()` event for Ctrl-C / Ctrl-D handling, completing H0 scope per `docs/roadmap.md`. State graph adds `Prompting -> Exiting [label=interrupt]` edge. Three new behavioral tests cover the new state-event pairs.
 - **2026-05-19** — H1 Step 2: added `$Parsing` and `$RunningBuiltin` transient states, four domain fields (`current_line`, `current_builtin`, `cwd`, `history`), and the native `Builtin` enum + `classify` / `execute` dispatch in `shell/src/builtin.rs`. State graph now has 9 edges. `print_unknown` moved from `actions:` into `execute()` so unknown commands flow through the standard `$Parsing → $RunningBuiltin` cycle. All H0 behavioral and E2E tests still pass unchanged. The 8 builtin variants currently have placeholder `(todo: <name>)` bodies; Step 3 fills in real behavior.
+- **2026-05-19** — H1 Step 3: filled in all seven builtin executions (`cd`/`pwd`/`ls`/`cat`/`echo`/`history`/`help`; `exit` is the fast-path keyword in `$Prompting`). Added 20 Level-6 E2E tests in `shell/tests/builtins_e2e.rs`, each tied to a specific roadmap exit-criterion row. Filesystem-touching tests use `tempfile::TempDir` for isolated state. The `tempfile` crate is now a workspace dev-dep. No `.frs` changes; this commit is pure native data work — exactly the split the architecture doc commits to. Total test count: 85.

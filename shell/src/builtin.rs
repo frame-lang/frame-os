@@ -13,14 +13,8 @@
 // $RunningBuiltin's enter handler, between $Parsing and the return to
 // $Prompting). This split keeps the Frame system focused on lifecycle
 // dispatch and leaves the data work to ordinary Rust.
-//
-// H1 Step 2 (this commit): structure only. execute() is stub-only —
-// each variant prints a "(todo: <name>)" placeholder. Step 3 fills in
-// the real behavior, one builtin at a time, each with its own E2E test.
-// The interface for execute() stabilizes here so Step 3 is purely
-// per-builtin work.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// A classified user command, ready for execution.
 ///
@@ -74,19 +68,16 @@ pub fn classify(tokens: Vec<String>) -> Builtin {
 ///
 /// `cwd` is mutable because `Cd` updates it. `history` is read-only
 /// because the `History` builtin only displays it — appending happens
-/// in Shell's `$RunningBuiltin.$>` after `execute()` returns, so each
-/// invocation can see every prior line including the one just executed.
-///
-/// H1 Step 2: stubs. Step 3 fills these in.
-pub fn execute(builtin: &Builtin, _cwd: &mut PathBuf, _history: &[String]) {
+/// in Shell's `$RunningBuiltin.$>` after `execute()` returns.
+pub fn execute(builtin: &Builtin, cwd: &mut PathBuf, history: &[String]) {
     match builtin {
-        Builtin::Cd(_) => println!("(todo: cd)"),
-        Builtin::Pwd => println!("(todo: pwd)"),
-        Builtin::Ls(_) => println!("(todo: ls)"),
-        Builtin::Cat(_) => println!("(todo: cat)"),
-        Builtin::Echo(_) => println!("(todo: echo)"),
-        Builtin::History => println!("(todo: history)"),
-        Builtin::Help => println!("(todo: help)"),
+        Builtin::Cd(path) => execute_cd(path.as_deref(), cwd),
+        Builtin::Pwd => println!("{}", cwd.display()),
+        Builtin::Ls(path) => execute_ls(path.as_deref(), cwd),
+        Builtin::Cat(path) => execute_cat(path.as_deref(), cwd),
+        Builtin::Echo(args) => println!("{}", args.join(" ")),
+        Builtin::History => execute_history(history),
+        Builtin::Help => execute_help(),
         Builtin::Empty => {
             // Nothing to do. Reached when the user input parsed to zero
             // tokens (e.g. whitespace-only that somehow got past the
@@ -97,6 +88,112 @@ pub fn execute(builtin: &Builtin, _cwd: &mut PathBuf, _history: &[String]) {
             println!("unknown command: {cmd} (try 'exit')");
         }
     }
+}
+
+/// Resolve a user-supplied path against `cwd`. Absolute paths are returned
+/// as-is; relative paths are joined onto `cwd`. The result is not yet
+/// canonicalized — callers do that when they need it.
+fn resolve(path: &str, cwd: &Path) -> PathBuf {
+    let p = PathBuf::from(path);
+    if p.is_absolute() {
+        p
+    } else {
+        cwd.join(p)
+    }
+}
+
+fn execute_cd(arg: Option<&str>, cwd: &mut PathBuf) {
+    let target = match arg {
+        None => match std::env::var("HOME") {
+            Ok(home) => PathBuf::from(home),
+            Err(_) => {
+                println!("cd: HOME not set");
+                return;
+            }
+        },
+        Some(p) => resolve(p, cwd),
+    };
+    match target.canonicalize() {
+        Ok(canonical) if canonical.is_dir() => {
+            *cwd = canonical;
+        }
+        Ok(_) => {
+            println!("cd: not a directory: {}", target.display());
+        }
+        Err(e) => {
+            println!("cd: {}: {e}", target.display());
+        }
+    }
+}
+
+fn execute_ls(arg: Option<&str>, cwd: &Path) {
+    let dir = match arg {
+        None => cwd.to_path_buf(),
+        Some(p) => resolve(p, cwd),
+    };
+    match std::fs::read_dir(&dir) {
+        Ok(entries) => {
+            let mut names: Vec<String> = entries
+                .filter_map(Result::ok)
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .collect();
+            names.sort();
+            for name in names {
+                println!("{name}");
+            }
+        }
+        Err(e) => {
+            println!("ls: {}: {e}", dir.display());
+        }
+    }
+}
+
+fn execute_cat(arg: Option<&str>, cwd: &Path) {
+    let path = match arg {
+        None => {
+            println!("cat: missing file argument");
+            return;
+        }
+        Some(p) => resolve(p, cwd),
+    };
+    match std::fs::read_to_string(&path) {
+        Ok(contents) => {
+            // Print verbatim; don't add a trailing newline if the file
+            // doesn't have one. Shells differ here — bash cats with no
+            // implicit newline. Match that.
+            print!("{contents}");
+        }
+        Err(e) => {
+            println!("cat: {}: {e}", path.display());
+        }
+    }
+}
+
+fn execute_history(history: &[String]) {
+    // Numbered list, 1-based, right-aligned 4-wide. Matches bash's `history`
+    // output shape roughly. The current `history` command itself is NOT in
+    // the list — Shell appends to history AFTER execute() returns, so each
+    // invocation sees only the lines that completed before it.
+    for (i, line) in history.iter().enumerate() {
+        // line is the raw input as typed (including trailing newline if
+        // any); trim for display.
+        println!("{:4}  {}", i + 1, line.trim_end());
+    }
+}
+
+fn execute_help() {
+    // Keep this list in sync with the Builtin enum variants. Order is the
+    // order a reader is likely to need them: navigation, listing, reading,
+    // output, history, meta.
+    println!("Available commands:");
+    println!("  cd [path]      change directory (defaults to $HOME)");
+    println!("  pwd            print current working directory");
+    println!("  ls [path]      list directory contents (sorted)");
+    println!("  cat <file>     print file contents");
+    println!("  echo <args...> print arguments separated by spaces");
+    println!("  history        show command history");
+    println!("  help           show this list");
+    println!("  exit | quit    leave the shell");
 }
 
 #[cfg(test)]

@@ -34,6 +34,7 @@ ctrlc = "3"
 insta = "1.40"
 assert_cmd = "2"
 predicates = "3"
+tempfile = "3"
 
 # Used by xtask
 anyhow = "1"

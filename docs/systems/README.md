@@ -23,7 +23,7 @@ These run inside the hosted-mode shell (`cargo run --bin frame-os-shell`) on Lin
 
 | System | Milestone | Status | Description |
 |---|---|---|---|
-| [`Shell` (hosted variant)](shell.md) | H0–H3 | In progress (H1 Step 2) | Top-level shell lifecycle: prompt, parse, run, repeat. State-dependent signal handling. |
+| [`Shell` (hosted variant)](shell.md) | H0–H3 | In progress (H1 complete) | Top-level shell lifecycle: prompt, parse, run, repeat. State-dependent signal handling. |
 | [`Parser`](parser.md) | H1 | In progress (H1) | Per-char event-driven tokenizer. `$ReadingWord → $InWord → $InQuotedString → $Done / $Failed`. Handles whitespace separation and double/single quoted substrings. |
 | `JobControl` | H3 | Planned | Manager system for background jobs. Tracks `fg`/`bg`/`jobs`/`wait` semantics. |
 | `Job` | H3 | Planned | Per-instance job state machine. One instance per running or stopped job. |
