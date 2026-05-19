@@ -19,6 +19,24 @@ $&gt;()<br ALIGN="LEFT"/>line(input: &amp;str)<br ALIGN="LEFT"/>interrupt()<br A
             </font></td></tr>
         </table>
     > margin=0 shape=none]
+    Parsing [label = <
+        <table CELLBORDER="0" CELLPADDING="5" style="rounded">
+            <tr><td><b>Parsing</b></td></tr>
+            <hr/>
+            <tr><td align="left"><font point-size="10">
+$&gt;()<br ALIGN="LEFT"/>line(input: &amp;str)<br ALIGN="LEFT"/>interrupt()<br ALIGN="LEFT"/>is_done()<br ALIGN="LEFT"/>
+            </font></td></tr>
+        </table>
+    > margin=0 shape=none]
+    RunningBuiltin [label = <
+        <table CELLBORDER="0" CELLPADDING="5" style="rounded">
+            <tr><td><b>RunningBuiltin</b></td></tr>
+            <hr/>
+            <tr><td align="left"><font point-size="10">
+$&gt;()<br ALIGN="LEFT"/>line(input: &amp;str)<br ALIGN="LEFT"/>interrupt()<br ALIGN="LEFT"/>is_done()<br ALIGN="LEFT"/>
+            </font></td></tr>
+        </table>
+    > margin=0 shape=none]
     Exiting [label = <
         <table CELLBORDER="0" CELLPADDING="5" style="rounded">
             <tr><td><b>Exiting</b></td></tr>
@@ -30,5 +48,11 @@ $&gt;()<br ALIGN="LEFT"/>line(input: &amp;str)<br ALIGN="LEFT"/>interrupt()<br A
     > margin=0 shape=none]
 
     Prompting -> Exiting [label=" line "]
+    Prompting -> Parsing [label=" line "]
     Prompting -> Exiting [label=" interrupt "]
+    Parsing -> Prompting [label=" interrupt "]
+    Parsing -> Prompting [label=" $> "]
+    Parsing -> RunningBuiltin [label=" $> "]
+    RunningBuiltin -> Prompting [label=" interrupt "]
+    RunningBuiltin -> Prompting [label=" $> "]
 }

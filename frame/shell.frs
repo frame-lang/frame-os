@@ -1,19 +1,46 @@
 // frame/shell.frs
 //
-// Frame OS Shell — H0 (minimum viable shell)
+// Frame OS Shell — H1 (builtins).
 //
-// The hosted-mode shell at its smallest. Two states:
-//   $Prompting — accepting input
-//   $Exiting   — terminal, the host loop should stop after seeing is_done() == true
+// State graph:
 //
-// Future milestones extend this system rather than replacing it:
-//   H1 adds $Parsing and $RunningBuiltin, plus more transitions out of $Prompting
-//   H2 adds $RunningExternal
-//   H3 adds $Suspended for job control
+//   ┌──────────────────────────────────────────────────────┐
+//   │  $Prompting  (initial — waiting for input)           │
+//   └──────────────────────────────────────────────────────┘
+//        │                       │                  │
+//        │ line("exit"/"quit")   │ line(non-empty,  │ interrupt()
+//        │ or line(empty)        │ non-exit)        │ (Ctrl-C / Ctrl-D)
+//        │                       │                  │
+//        ▼                       ▼                  ▼
+//   ┌──────────┐            ┌──────────┐       ┌──────────┐
+//   │ $Exiting │ ◄──────────│ $Parsing │       │ $Exiting │
+//   │(terminal)│            │          │       │(terminal)│
+//   └──────────┘            └──────────┘       └──────────┘
+//      goodbye                  │
+//                               │ parse error → $Prompting
+//                               │ parse ok → $RunningBuiltin
+//                               ▼
+//                         ┌───────────────────┐
+//                         │ $RunningBuiltin   │
+//                         └───────────────────┘
+//                               │
+//                               │ (always returns to $Prompting at H1;
+//                               │ H2 will add transition to $Exiting
+//                               │ for an `exit` builtin if we move it
+//                               │ behind the parser)
+//                               ▼
+//                         (back to $Prompting)
 //
-// The actions delegate all I/O to native Rust (print_prompt, print_goodbye,
-// print_unknown). The Frame source only describes which transitions are legal
-// when, and what each handler does at the state-machine level.
+// Two states added at H1: $Parsing and $RunningBuiltin. Both are
+// transient — they enter, run their $> handler synchronously, and
+// transition out. There are no user-facing events that arrive in
+// these states except interrupt() (defensively handled).
+//
+// The Frame argument at H1 strengthens vs. H0: line() now has
+// three meaningfully different outcomes (exit, parse, ignore) and
+// the per-state interrupt() handlers prefigure H2's per-state
+// signal dispatch (interrupt() in $RunningExternal will SIGKILL
+// the child, not return to the prompt).
 
 @@[target("rust")]
 
@@ -31,24 +58,74 @@
 
             line(input: &str) {
                 let trimmed = input.trim();
-                if trimmed == "exit" || trimmed == "quit" {
+                if trimmed.is_empty() {
+                    self.print_prompt();
+                } else if trimmed == "exit" || trimmed == "quit" {
                     -> $Exiting
-                } else if trimmed.is_empty() {
-                    self.print_prompt();
                 } else {
-                    self.print_unknown(trimmed);
-                    self.print_prompt();
+                    self.current_line = input.to_string();
+                    -> $Parsing
                 }
             }
 
-            // H0 behavior: Ctrl-C at the prompt exits cleanly. In H2 this
-            // handler will be split — $Prompting.interrupt() will clear the
-            // line and stay, while $RunningExternal.interrupt() will kill
-            // the child. The fact that the same event will dispatch
-            // differently per state is the Frame argument; H0 establishes
-            // the event in the interface so H2 only adds a state.
             interrupt() {
                 -> $Exiting
+            }
+
+            is_done(): bool {
+                @@:(false)
+            }
+        }
+
+        $Parsing {
+            $>() {
+                let mut p = Parser::__create();
+                for c in self.current_line.chars() {
+                    p.consume(c);
+                }
+                p.finalize();
+                if !p.error().is_empty() {
+                    println!("parse error: {}", p.error());
+                    -> $Prompting
+                } else {
+                    self.current_builtin = classify(p.tokens());
+                    -> $RunningBuiltin
+                }
+            }
+
+            line(input: &str) {
+                // $Parsing is transient — the $> handler runs synchronously
+                // and transitions out within a single shell.line() call.
+                // This handler exists for interface completeness; it's
+                // unreachable in practice.
+            }
+
+            interrupt() {
+                // Same — transient state, defensively handled.
+                -> $Prompting
+            }
+
+            is_done(): bool {
+                @@:(false)
+            }
+        }
+
+        $RunningBuiltin {
+            $>() {
+                execute(&self.current_builtin, &mut self.cwd, &self.history);
+                self.history.push(self.current_line.clone());
+                -> $Prompting
+            }
+
+            line(input: &str) {
+                // Transient state — see $Parsing's note.
+            }
+
+            interrupt() {
+                // H1 builtins are synchronous and brief; nothing to abort.
+                // H2 will add $RunningExternal where interrupt() actually
+                // matters (SIGKILL the child).
+                -> $Prompting
             }
 
             is_done(): bool {
@@ -85,7 +162,20 @@
             println!("goodbye");
         }
 
-        print_unknown(cmd: &str) {
-            println!("unknown command: {} (try 'exit')", cmd);
-        }
+    domain:
+        // The most recent line being processed. Stored when transitioning
+        // out of $Prompting so $Parsing's $> can read it from domain.
+        current_line: String = String::new()
+
+        // The classified Builtin from the most recent parse, populated by
+        // $Parsing's $> and consumed by $RunningBuiltin's $>.
+        current_builtin: Builtin = Builtin::Empty
+
+        // Current working directory. Initialized to the process's CWD at
+        // shell construction; subsequent `cd` builtins update it.
+        cwd: std::path::PathBuf = std::env::current_dir().unwrap_or_default()
+
+        // Command history — every line that resulted in a builtin execution
+        // (success or unknown). Read by the `history` builtin.
+        history: Vec<String> = Vec::new()
 }

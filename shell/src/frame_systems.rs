@@ -11,6 +11,14 @@
 //
 // To regenerate: edit the .frs files in the workspace's frame/ directory,
 // then `cargo build`. The build script will re-run framec on each.
+//
+// The `use` lines below import items that the Frame-generated code
+// references from inside its wrapping `mod _<name>_framec { use super::*; }`
+// — `super::*` glob-imports whatever is visible here. Adding a domain
+// field referencing a type from another module of this crate? Import it
+// here so the generated module can see it.
+
+use crate::builtin::{classify, execute, Builtin};
 
 include!(concat!(env!("OUT_DIR"), "/shell.rs"));
 include!(concat!(env!("OUT_DIR"), "/parser.rs"));

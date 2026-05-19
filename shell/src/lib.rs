@@ -10,6 +10,8 @@
 //
 // The Frame-generated code is included via the frame_systems module.
 
+pub mod builtin;
 pub mod frame_systems;
 
+pub use builtin::Builtin;
 pub use frame_systems::{Parser, Shell};
