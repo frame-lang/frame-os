@@ -1,0 +1,26 @@
+# Cargo build artifacts
+/target/
+**/*.rs.bk
+Cargo.lock.bak
+
+# IDE
+.vscode/settings.json
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Insta pending snapshots (review before committing)
+**/*.snap.new
+
+# Generated diagrams that aren't yet committed
+# (committed diagrams live in docs/systems/*.svg)
+/tmp_diagrams/
+
+# Kernel build artifacts that escape the target dir
+kernel.img
+kernel.iso
+*.uf2

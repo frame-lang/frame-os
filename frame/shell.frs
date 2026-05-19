@@ -1,0 +1,91 @@
+// frame/shell.frs
+//
+// Frame OS Shell — H0 (minimum viable shell)
+//
+// The hosted-mode shell at its smallest. Two states:
+//   $Prompting — accepting input
+//   $Exiting   — terminal, the host loop should stop after seeing is_done() == true
+//
+// Future milestones extend this system rather than replacing it:
+//   H1 adds $Parsing and $RunningBuiltin, plus more transitions out of $Prompting
+//   H2 adds $RunningExternal
+//   H3 adds $Suspended for job control
+//
+// The actions delegate all I/O to native Rust (print_prompt, print_goodbye,
+// print_unknown). The Frame source only describes which transitions are legal
+// when, and what each handler does at the state-machine level.
+
+@@[target("rust")]
+
+@@system Shell {
+    interface:
+        line(input: &str)
+        interrupt()
+        is_done(): bool = false
+
+    machine:
+        $Prompting {
+            $>() {
+                self.print_prompt();
+            }
+
+            line(input: &str) {
+                let trimmed = input.trim();
+                if trimmed == "exit" || trimmed == "quit" {
+                    -> $Exiting
+                } else if trimmed.is_empty() {
+                    self.print_prompt();
+                } else {
+                    self.print_unknown(trimmed);
+                    self.print_prompt();
+                }
+            }
+
+            // H0 behavior: Ctrl-C at the prompt exits cleanly. In H2 this
+            // handler will be split — $Prompting.interrupt() will clear the
+            // line and stay, while $RunningExternal.interrupt() will kill
+            // the child. The fact that the same event will dispatch
+            // differently per state is the Frame argument; H0 establishes
+            // the event in the interface so H2 only adds a state.
+            interrupt() {
+                -> $Exiting
+            }
+
+            is_done(): bool {
+                @@:(false)
+            }
+        }
+
+        $Exiting {
+            $>() {
+                self.print_goodbye();
+            }
+
+            line(input: &str) {
+                // Already exiting; ignore further input.
+            }
+
+            interrupt() {
+                // Already exiting; further interrupts are no-ops.
+            }
+
+            is_done(): bool {
+                @@:(true)
+            }
+        }
+
+    actions:
+        print_prompt() {
+            use std::io::Write;
+            print!("frame-os> ");
+            let _ = std::io::stdout().flush();
+        }
+
+        print_goodbye() {
+            println!("goodbye");
+        }
+
+        print_unknown(cmd: &str) {
+            println!("unknown command: {} (try 'exit')", cmd);
+        }
+}

@@ -1,0 +1,11 @@
+[package]
+name = "frame-os-shared"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+description = "Frame OS — shared types used by both shell and kernel"
+
+[lib]
+path = "src/lib.rs"

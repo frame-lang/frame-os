@@ -1,0 +1,9 @@
+# Cargo configuration for the workspace.
+#
+# The xtask alias is the convention for project-internal build orchestration in
+# Rust workspaces. With this alias, `cargo xtask <subcommand>` is equivalent to
+# `cargo run -p xtask -- <subcommand>`. See the xtask crate for available
+# subcommands.
+
+[alias]
+xtask = "run -p xtask --"

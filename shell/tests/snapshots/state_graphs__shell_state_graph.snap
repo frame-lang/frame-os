@@ -1,0 +1,34 @@
+---
+source: shell/tests/state_graphs.rs
+expression: dot
+---
+digraph Shell {
+    compound=true
+    node [color="deepskyblue4" style="rounded, filled" fillcolor="azure"]
+    edge[color="red"]
+
+    Entry[width=0.2 shape="circle" style="filled" fillcolor="black" label=""]
+    Entry -> Prompting
+
+    Prompting [label = <
+        <table CELLBORDER="0" CELLPADDING="5" style="rounded">
+            <tr><td><b>Prompting</b></td></tr>
+            <hr/>
+            <tr><td align="left"><font point-size="10">
+$&gt;()<br ALIGN="LEFT"/>line(input: &amp;str)<br ALIGN="LEFT"/>interrupt()<br ALIGN="LEFT"/>is_done()<br ALIGN="LEFT"/>
+            </font></td></tr>
+        </table>
+    > margin=0 shape=none]
+    Exiting [label = <
+        <table CELLBORDER="0" CELLPADDING="5" style="rounded">
+            <tr><td><b>Exiting</b></td></tr>
+            <hr/>
+            <tr><td align="left"><font point-size="10">
+$&gt;()<br ALIGN="LEFT"/>line(input: &amp;str)<br ALIGN="LEFT"/>interrupt()<br ALIGN="LEFT"/>is_done()<br ALIGN="LEFT"/>
+            </font></td></tr>
+        </table>
+    > margin=0 shape=none]
+
+    Prompting -> Exiting [label=" line "]
+    Prompting -> Exiting [label=" interrupt "]
+}

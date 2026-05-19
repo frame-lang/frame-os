@@ -1,0 +1,26 @@
+[package]
+name = "frame-os-shell"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+description = "Frame OS — hosted-mode shell"
+
+[[bin]]
+name = "frame-os-shell"
+path = "src/main.rs"
+
+[dependencies]
+# Line editing + Ctrl-C / Ctrl-D handling at the prompt (H0).
+# ctrlc / signal-hook are deferred to H2, where Ctrl-C must also kill
+# a running external child process — rustyline alone covers the H0 scope.
+rustyline = { workspace = true }
+
+[dev-dependencies]
+insta = { workspace = true }
+assert_cmd = { workspace = true }
+predicates = { workspace = true }
+
+[build-dependencies]
+anyhow = { workspace = true }

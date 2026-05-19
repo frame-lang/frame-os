@@ -1,0 +1,19 @@
+[package]
+name = "frame-os-kernel"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+description = "Frame OS — bare-metal kernel"
+
+[lib]
+path = "src/lib.rs"
+
+# This crate is excluded from the workspace's `default-members` because it
+# needs a bare-metal target (`x86_64-unknown-none`) and won't build on the
+# host. Build explicitly with:
+#   cargo build -p frame-os-kernel --target x86_64-unknown-none
+# Until B0 lands, this crate is intentionally empty.
+
+[dependencies]
