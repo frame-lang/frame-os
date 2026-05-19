@@ -79,7 +79,7 @@
 
         $Parsing {
             $>() {
-                let mut p = Parser::__create();
+                let mut p = @@Parser();
                 for c in self.current_line.chars() {
                     p.consume(c);
                 }
