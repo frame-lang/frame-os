@@ -1,0 +1,313 @@
+// frame/job.frs
+//
+// Job — per-instance lifecycle for a spawned external process (H3).
+//
+// Each Job tracks one OS process from spawn through its eventual exit
+// (or kill). `JobControl` (separate Frame system, H3 Step 2) holds a
+// Vec<Job> as its domain and orchestrates them.
+//
+// State graph:
+//
+//   ┌──────────────┐    spawn(cmd, args) — success
+//   │   $Created   │ ─────────────────────────────────┐
+//   │   (initial)  │                                  │
+//   └──────┬───────┘                                  │
+//          │ spawn — failure                          ▼
+//          │ (e.g. NotFound)                  ┌──────────────┐
+//          │ (jumps directly to $Done with    │ $Foreground  │ ◄──┐
+//          │  spawn_error set)                └──────┬───┬───┘    │
+//          │                                         │   │        │
+//          │   to_background()  ◄────────────────────┘   │        │ to_foreground()
+//          │                                              │        │ (resumes if was stopped)
+//          ▼                                              │        │
+//      ┌────────┐                              ┌──────────┴─────┐  │
+//      │ $Done  │                              │ $Background    │ ─┤
+//      │(term)  │                              └──────┬─────────┘  │
+//      └────────┘                                     │            │
+//          ▲                                          │ stop()     │
+//          │ poll() detects exit  OR  kill()          │ (SIGTSTP)  │
+//          │ (from any of $Foreground / $Background / │            │
+//          │  $Stopped)                               │            │
+//          │                                          ▼            │
+//          │                                  ┌──────────────┐     │
+//          └──────────────────────────────────│   $Stopped   │ ────┘
+//                                             └──────────────┘
+//                                                  to_foreground() OR to_background()
+//                                                  (sends SIGCONT, then transitions)
+//
+// Frame argument: `kill()` and `poll()` mean the same thing in every
+// non-terminal state — all transition to $Done. But `to_foreground()`,
+// `to_background()`, and `stop()` are only valid from certain states, and
+// `to_foreground()` from $Stopped specifically requires SIGCONT before
+// the transition. Per-state handlers make these legal-move boundaries
+// structural rather than conditional.
+//
+// PID-only design: the OS-level handle stored in domain is just the u32
+// PID, not std::process::Child. We use raw libc::kill / libc::waitpid
+// for signal delivery and exit detection. The child *is* spawned via
+// std::process::Command in the spawn() handler (for the convenience of
+// PATH lookup and the OsString plumbing), but its `Child` handle is held
+// in an Option in the action, not in long-term domain. See actions.rs
+// (TODO H3 Step 2) for the wait-handle wrapper.
+
+@@[target("rust")]
+
+@@system Job(id: u32) {
+    interface:
+        spawn(cmd: String, args: Vec<String>)
+        stop()
+        to_foreground()
+        to_background()
+        kill()
+        poll()
+        id(): u32 = 0
+        pid(): u32 = 0
+        cmd_str(): String
+        state_name(): String
+        exit_code(): i32 = 0
+        is_done(): bool = false
+
+    machine:
+        $Created {
+            spawn(cmd: String, args: Vec<String>) {
+                self.cmd = cmd;
+                self.args = args;
+                match std::process::Command::new(&self.cmd)
+                    .args(&self.args)
+                    .spawn()
+                {
+                    Ok(child) => {
+                        self.pid = child.id();
+                        self.child = Some(child);
+                        -> $Foreground
+                    }
+                    Err(e) => {
+                        self.spawn_error = e.to_string();
+                        -> $Done
+                    }
+                }
+            }
+
+            id(): u32 { @@:(self.id) }
+            pid(): u32 { @@:(0) }
+            cmd_str(): String { @@:(self.format_cmd()) }
+            state_name(): String { @@:("Pending".to_string()) }
+            exit_code(): i32 { @@:(0) }
+            is_done(): bool { @@:(false) }
+
+            // No-op handlers for events not valid from $Created:
+            stop() { }
+            to_foreground() { }
+            to_background() { }
+            kill() { }
+            poll() { }
+        }
+
+        $Foreground {
+            poll() {
+                if self.try_reap() {
+                    -> $Done
+                }
+            }
+
+            stop() {
+                self.send_signal_stop();
+                -> $Stopped
+            }
+
+            to_background() {
+                -> $Background
+            }
+
+            kill() {
+                self.send_signal_kill();
+                let _ = self.try_reap();
+                -> $Done
+            }
+
+            // From $Foreground these are no-ops (already in target state):
+            spawn(cmd: String, args: Vec<String>) { }
+            to_foreground() { }
+
+            id(): u32 { @@:(self.id) }
+            pid(): u32 { @@:(self.pid) }
+            cmd_str(): String { @@:(self.format_cmd()) }
+            state_name(): String { @@:("Running".to_string()) }
+            exit_code(): i32 { @@:(0) }
+            is_done(): bool { @@:(false) }
+        }
+
+        $Background {
+            poll() {
+                if self.try_reap() {
+                    -> $Done
+                }
+            }
+
+            stop() {
+                self.send_signal_stop();
+                -> $Stopped
+            }
+
+            to_foreground() {
+                -> $Foreground
+            }
+
+            kill() {
+                self.send_signal_kill();
+                let _ = self.try_reap();
+                -> $Done
+            }
+
+            spawn(cmd: String, args: Vec<String>) { }
+            to_background() { }
+
+            id(): u32 { @@:(self.id) }
+            pid(): u32 { @@:(self.pid) }
+            cmd_str(): String { @@:(self.format_cmd()) }
+            state_name(): String { @@:("Running".to_string()) }
+            exit_code(): i32 { @@:(0) }
+            is_done(): bool { @@:(false) }
+        }
+
+        $Stopped {
+            to_foreground() {
+                self.send_signal_continue();
+                -> $Foreground
+            }
+
+            to_background() {
+                self.send_signal_continue();
+                -> $Background
+            }
+
+            kill() {
+                // Stopped processes still need SIGCONT to deliver SIGKILL
+                // reliably on some platforms; send CONT first, then KILL.
+                self.send_signal_continue();
+                self.send_signal_kill();
+                let _ = self.try_reap();
+                -> $Done
+            }
+
+            poll() {
+                // A stopped process can still report its status via
+                // waitpid(WUNTRACED) but we don't auto-transition out of
+                // $Stopped on poll(). Callers explicitly resume.
+            }
+
+            spawn(cmd: String, args: Vec<String>) { }
+            stop() { }
+
+            id(): u32 { @@:(self.id) }
+            pid(): u32 { @@:(self.pid) }
+            cmd_str(): String { @@:(self.format_cmd()) }
+            state_name(): String { @@:("Stopped".to_string()) }
+            exit_code(): i32 { @@:(0) }
+            is_done(): bool { @@:(false) }
+        }
+
+        $Done {
+            // Terminal — all events are no-ops. Queries return the final
+            // state information.
+            spawn(cmd: String, args: Vec<String>) { }
+            stop() { }
+            to_foreground() { }
+            to_background() { }
+            kill() { }
+            poll() { }
+
+            id(): u32 { @@:(self.id) }
+            pid(): u32 { @@:(self.pid) }
+            cmd_str(): String { @@:(self.format_cmd()) }
+
+            state_name(): String {
+                // Distinguish failed-to-spawn from completed cleanly.
+                if !self.spawn_error.is_empty() {
+                    @@:(format!("Failed ({})", self.spawn_error))
+                } else {
+                    @@:("Done".to_string())
+                }
+            }
+
+            exit_code(): i32 { @@:(self.exit_code) }
+            is_done(): bool { @@:(true) }
+        }
+
+    actions:
+        // Non-blocking reap. Returns true if the child has exited and
+        // stores the exit code in domain. On Unix uses waitpid(WNOHANG);
+        // on Windows uses std::process::Child::try_wait (the Child handle
+        // is kept in domain specifically so we can call try_wait against
+        // it; raw libc::waitpid on the PID alone would also work on Unix
+        // but the Child path is cross-platform).
+        try_reap(): bool {
+            if let Some(ref mut c) = self.child {
+                match c.try_wait() {
+                    Ok(Some(status)) => {
+                        self.exit_code = status.code().unwrap_or(-1);
+                        self.child = None;
+                        return true;
+                    }
+                    Ok(None) => {
+                        return false;
+                    }
+                    Err(_) => {
+                        // Treat unknown wait errors as terminal too — we
+                        // can't recover, so clear the child handle.
+                        self.exit_code = -1;
+                        self.child = None;
+                        return true;
+                    }
+                }
+            }
+            // No child handle (already reaped, or spawn failed). Done.
+            true
+        }
+
+        // Send SIGTSTP to the job's PID. Unix-only — Windows H3 doesn't
+        // support stop/resume (cleanly omitted at the JobControl layer).
+        send_signal_stop() {
+            #[cfg(unix)]
+            unsafe {
+                libc::kill(self.pid as i32, libc::SIGTSTP);
+            }
+        }
+
+        send_signal_continue() {
+            #[cfg(unix)]
+            unsafe {
+                libc::kill(self.pid as i32, libc::SIGCONT);
+            }
+        }
+
+        send_signal_kill() {
+            #[cfg(unix)]
+            unsafe {
+                libc::kill(self.pid as i32, libc::SIGKILL);
+            }
+            #[cfg(not(unix))]
+            {
+                if let Some(ref mut c) = self.child {
+                    let _ = c.kill();
+                }
+            }
+        }
+
+        format_cmd(): String {
+            if self.args.is_empty() {
+                @@:(self.cmd.clone())
+            } else {
+                @@:(format!("{} {}", self.cmd, self.args.join(" ")))
+            }
+        }
+
+    domain:
+        id: u32 = id
+        cmd: String = String::new()
+        args: Vec<String> = Vec::new()
+        pid: u32 = 0
+        child: Option<std::process::Child> = None
+        exit_code: i32 = 0
+        spawn_error: String = String::new()
+}

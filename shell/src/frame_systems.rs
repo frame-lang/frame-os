@@ -22,3 +22,4 @@ use crate::builtin::{classify, execute, is_unknown, Builtin};
 
 include!(concat!(env!("OUT_DIR"), "/shell.rs"));
 include!(concat!(env!("OUT_DIR"), "/parser.rs"));
+include!(concat!(env!("OUT_DIR"), "/job.rs"));

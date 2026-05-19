@@ -23,7 +23,11 @@ use anyhow::{anyhow, Context, Result};
 // (module_name, source_filename_relative_to_frame_dir)
 //
 // module_name determines the generated .rs filename in OUT_DIR.
-const FRAME_SYSTEMS: &[(&str, &str)] = &[("shell", "shell.frs"), ("parser", "parser.frs")];
+const FRAME_SYSTEMS: &[(&str, &str)] = &[
+    ("shell", "shell.frs"),
+    ("parser", "parser.frs"),
+    ("job", "job.frs"),
+];
 
 fn main() -> Result<()> {
     let manifest_dir = PathBuf::from(env_var("CARGO_MANIFEST_DIR")?);

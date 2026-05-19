@@ -76,3 +76,11 @@ fn parser_state_graph_snapshot() {
     };
     insta::assert_snapshot!("parser_state_graph", dot);
 }
+
+#[test]
+fn job_state_graph_snapshot() {
+    let Some(dot) = frame_to_dot("job.frs") else {
+        return; // framec unavailable; test skipped
+    };
+    insta::assert_snapshot!("job_state_graph", dot);
+}

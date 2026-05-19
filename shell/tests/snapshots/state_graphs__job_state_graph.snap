@@ -1,0 +1,72 @@
+---
+source: shell/tests/state_graphs.rs
+expression: dot
+---
+digraph Job {
+    compound=true
+    node [color="deepskyblue4" style="rounded, filled" fillcolor="azure"]
+    edge[color="red"]
+
+    Entry[width=0.2 shape="circle" style="filled" fillcolor="black" label=""]
+    Entry -> Created
+
+    Created [label = <
+        <table CELLBORDER="0" CELLPADDING="5" style="rounded">
+            <tr><td><b>Created</b></td></tr>
+            <hr/>
+            <tr><td align="left"><font point-size="10">
+spawn(cmd: String, args: Vec&lt;String&gt;)<br ALIGN="LEFT"/>id()<br ALIGN="LEFT"/>pid()<br ALIGN="LEFT"/>cmd_str()<br ALIGN="LEFT"/>state_name()<br ALIGN="LEFT"/>exit_code()<br ALIGN="LEFT"/>is_done()<br ALIGN="LEFT"/>stop()<br ALIGN="LEFT"/>to_foreground()<br ALIGN="LEFT"/>to_background()<br ALIGN="LEFT"/>kill()<br ALIGN="LEFT"/>poll()<br ALIGN="LEFT"/>
+            </font></td></tr>
+        </table>
+    > margin=0 shape=none]
+    Foreground [label = <
+        <table CELLBORDER="0" CELLPADDING="5" style="rounded">
+            <tr><td><b>Foreground</b></td></tr>
+            <hr/>
+            <tr><td align="left"><font point-size="10">
+poll()<br ALIGN="LEFT"/>stop()<br ALIGN="LEFT"/>to_background()<br ALIGN="LEFT"/>kill()<br ALIGN="LEFT"/>spawn(cmd: String, args: Vec&lt;String&gt;)<br ALIGN="LEFT"/>to_foreground()<br ALIGN="LEFT"/>id()<br ALIGN="LEFT"/>pid()<br ALIGN="LEFT"/>cmd_str()<br ALIGN="LEFT"/>state_name()<br ALIGN="LEFT"/>exit_code()<br ALIGN="LEFT"/>is_done()<br ALIGN="LEFT"/>
+            </font></td></tr>
+        </table>
+    > margin=0 shape=none]
+    Background [label = <
+        <table CELLBORDER="0" CELLPADDING="5" style="rounded">
+            <tr><td><b>Background</b></td></tr>
+            <hr/>
+            <tr><td align="left"><font point-size="10">
+poll()<br ALIGN="LEFT"/>stop()<br ALIGN="LEFT"/>to_foreground()<br ALIGN="LEFT"/>kill()<br ALIGN="LEFT"/>spawn(cmd: String, args: Vec&lt;String&gt;)<br ALIGN="LEFT"/>to_background()<br ALIGN="LEFT"/>id()<br ALIGN="LEFT"/>pid()<br ALIGN="LEFT"/>cmd_str()<br ALIGN="LEFT"/>state_name()<br ALIGN="LEFT"/>exit_code()<br ALIGN="LEFT"/>is_done()<br ALIGN="LEFT"/>
+            </font></td></tr>
+        </table>
+    > margin=0 shape=none]
+    Stopped [label = <
+        <table CELLBORDER="0" CELLPADDING="5" style="rounded">
+            <tr><td><b>Stopped</b></td></tr>
+            <hr/>
+            <tr><td align="left"><font point-size="10">
+to_foreground()<br ALIGN="LEFT"/>to_background()<br ALIGN="LEFT"/>kill()<br ALIGN="LEFT"/>poll()<br ALIGN="LEFT"/>spawn(cmd: String, args: Vec&lt;String&gt;)<br ALIGN="LEFT"/>stop()<br ALIGN="LEFT"/>id()<br ALIGN="LEFT"/>pid()<br ALIGN="LEFT"/>cmd_str()<br ALIGN="LEFT"/>state_name()<br ALIGN="LEFT"/>exit_code()<br ALIGN="LEFT"/>is_done()<br ALIGN="LEFT"/>
+            </font></td></tr>
+        </table>
+    > margin=0 shape=none]
+    Done [label = <
+        <table CELLBORDER="0" CELLPADDING="5" style="rounded">
+            <tr><td><b>Done</b></td></tr>
+            <hr/>
+            <tr><td align="left"><font point-size="10">
+spawn(cmd: String, args: Vec&lt;String&gt;)<br ALIGN="LEFT"/>stop()<br ALIGN="LEFT"/>to_foreground()<br ALIGN="LEFT"/>to_background()<br ALIGN="LEFT"/>kill()<br ALIGN="LEFT"/>poll()<br ALIGN="LEFT"/>id()<br ALIGN="LEFT"/>pid()<br ALIGN="LEFT"/>cmd_str()<br ALIGN="LEFT"/>state_name()<br ALIGN="LEFT"/>exit_code()<br ALIGN="LEFT"/>is_done()<br ALIGN="LEFT"/>
+            </font></td></tr>
+        </table>
+    > margin=0 shape=none]
+
+    Created -> Foreground [label=" spawn "]
+    Created -> Done [label=" spawn "]
+    Foreground -> Done [label=" poll "]
+    Foreground -> Stopped [label=" stop "]
+    Foreground -> Background [label=" to_background "]
+    Foreground -> Done [label=" kill "]
+    Background -> Done [label=" poll "]
+    Background -> Stopped [label=" stop "]
+    Background -> Foreground [label=" to_foreground "]
+    Background -> Done [label=" kill "]
+    Stopped -> Foreground [label=" to_foreground "]
+    Stopped -> Background [label=" to_background "]
+    Stopped -> Done [label=" kill "]
+}
