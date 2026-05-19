@@ -29,6 +29,7 @@ rust-version = "1.75"
 # Hosted-shell dependencies
 rustyline = "14"
 ctrlc = "3"
+libc = "0.2"
 
 # Testing
 insta = "1.40"

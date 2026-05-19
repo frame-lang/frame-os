@@ -12,10 +12,15 @@ name = "frame-os-shell"
 path = "src/main.rs"
 
 [dependencies]
-# Line editing + Ctrl-C / Ctrl-D handling at the prompt (H0).
-# ctrlc / signal-hook are deferred to H2, where Ctrl-C must also kill
-# a running external child process — rustyline alone covers the H0 scope.
+# Line editing + Ctrl-C / Ctrl-D handling at the prompt.
 rustyline = { workspace = true }
+
+# Used by Shell.$RunningExternal at H2 to install a SIG_IGN handler so the
+# shell survives Ctrl-C while a child process is running (the child still
+# receives the signal via the terminal foreground process group and dies
+# naturally). Unix-only; the corresponding Windows path is future polish.
+[target.'cfg(unix)'.dependencies]
+libc = { workspace = true }
 
 [dev-dependencies]
 insta = { workspace = true }

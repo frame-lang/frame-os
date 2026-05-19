@@ -1,15 +1,15 @@
 # `Shell`
 
-> The hosted-mode Frame OS shell: prompts the user, reads input, tokenizes it via the `Parser` system, classifies into a `Builtin`, executes, and loops. At H1 (Step 2) the state graph is `$Prompting → $Parsing → $RunningBuiltin → $Prompting`, with `$Exiting` as a terminal sink reachable from `$Prompting` via the `exit`/`quit` keywords or `interrupt()`.
+> The hosted-mode Frame OS shell: prompts the user, reads input, tokenizes via `Parser`, classifies into a `Builtin`, dispatches to either `$RunningBuiltin` (known builtins) or `$RunningExternal` (host-OS commands via `std::process::Command`), and loops. `$Exiting` is the terminal sink, reached from `$Prompting` via the `exit`/`quit` keywords or via `eof()` (Ctrl-D).
 
 | Property | Value |
 |---|---|
-| Track | Hosted (will be reused in Bare-metal at B2) |
+| Track | Hosted (will be reused in Bare-metal at B2 with different actions; the bare-metal version omits $RunningExternal because there's no host OS to shell out to) |
 | Milestone introduced | H0 |
 | Source file | [`../../frame/shell.frs`](../../frame/shell.frs) |
 | State diagram | [`shell.svg`](shell.svg) |
 | Instances at runtime | Exactly one per process |
-| Status | In progress (H1 — all 8 builtins implemented) |
+| Status | In progress (H2 — external commands + state-dependent Ctrl-C) |
 
 ## State diagram
 
@@ -21,28 +21,31 @@ Regenerate via `cargo xtask regen-diagrams` after any `.frs` change. The SVG is 
 
 ### `$Prompting`
 
-The shell is waiting for user input. The first prompt is printed by the state's `$>` enter handler at construction time. Subsequent prompts are printed on each re-entry from `$RunningBuiltin` (the cycle's natural completion point).
+The shell is waiting for user input. The first prompt is printed by the state's `$>` enter handler at construction time. Subsequent prompts are printed on each re-entry from `$RunningBuiltin` / `$RunningExternal` (the cycle's natural completion point) or after an interrupted line.
 
 **Transitions out:**
 - `line(input)` → `$Exiting` — when `input.trim()` is `"exit"` or `"quit"` (fast path; doesn't go through the parser)
 - `line(input)` → `$Parsing` — for any other non-empty input; the line is stashed in `domain.current_line` for `$Parsing.$>` to read
-- `interrupt()` → `$Exiting` — Ctrl-C or Ctrl-D from the host loop
+- `eof()` → `$Exiting` — Ctrl-D from the host loop
 
 **Events handled (no transition):**
 - `line(input)` — stays in `$Prompting` for empty/whitespace-only input; re-prints the prompt
+- `interrupt()` — H2 behavior: "abort this input." Stays in `$Prompting` and re-prints the prompt. Rustyline has already cleared the line buffer by the time we get here. H0/H1 had this transition to `$Exiting`; that's gone — Ctrl-C no longer exits at H2, Ctrl-D does.
 - `is_done()` → returns `false`
 
 ### `$Parsing`
 
-Transient. Drives `Parser` synchronously to tokenize `domain.current_line`, classifies the resulting tokens into a `Builtin`, and transitions to either `$RunningBuiltin` (parse succeeded) or back to `$Prompting` (parse error — prints a message first).
+Transient. Drives `Parser` synchronously to tokenize `domain.current_line`, classifies the resulting tokens into a `Builtin`, and transitions to one of three destinations.
 
 **Transitions out:**
-- `$>()` → `$RunningBuiltin` — when `Parser` reaches `$Done`; the classified `Builtin` is in `domain.current_builtin`
 - `$>()` → `$Prompting` — when `Parser` reaches `$Failed` (e.g. unterminated quote); the parse-error message is printed
+- `$>()` → `$RunningBuiltin` — when parse succeeded and the classified `Builtin` is a known variant (`Cd`, `Pwd`, `Ls`, `Cat`, `Echo`, `History`, `Help`, `Empty`)
+- `$>()` → `$RunningExternal` — when parse succeeded and the classified `Builtin` is `Unknown(cmd, args)`. H2 added this branch; H1 had `Unknown` go to `$RunningBuiltin` where `execute()` printed a "unknown command" message
 
 **Events handled (no transition):**
-- `line(input)` — defensively declared, unreachable in practice (the `$>` handler runs synchronously and transitions out within the same `shell.line()` call)
-- `interrupt()` → `$Prompting` — defensive; same reasoning
+- `line(input)` — defensively declared, unreachable in practice
+- `interrupt()` → `$Prompting` — defensive
+- `eof()` → `$Prompting` — defensive
 - `is_done()` → returns `false`
 
 ### `$RunningBuiltin`
@@ -54,7 +57,21 @@ Transient. Executes the classified `Builtin` (mutating `domain.cwd` if `cd`, rea
 
 **Events handled (no transition):**
 - `line(input)` — defensively declared, unreachable
-- `interrupt()` → `$Prompting` — defensive (H2 will add `$RunningExternal` where `interrupt()` actually matters)
+- `interrupt()` → `$Prompting` — defensive
+- `eof()` → `$Prompting` — defensive
+- `is_done()` → returns `false`
+
+### `$RunningExternal` (new at H2)
+
+Transient. Spawns the classified `Builtin::Unknown(cmd, args)` via `std::process::Command`, installs `SIG_IGN` for `SIGINT` so the shell survives Ctrl-C while the child receives the signal naturally (terminal foreground group), waits for the child to exit, restores the prior SIGINT disposition, surfaces a non-zero exit code if any, appends the input to history, and returns to `$Prompting`.
+
+**Transitions out:**
+- `$>()` → `$Prompting` — always, after `child.wait()` returns
+
+**Events handled (no transition or defensive):**
+- `interrupt()` → `$Prompting` — calls `kill_child()` action then transitions. Reachable only by tests that manipulate `domain.current_child_pid` directly; through the normal flow the `$>` handler blocks in `child.wait()` and SIGINT is delivered at the OS level (see "Native action implementations" below).
+- `line(input)` — defensively declared, unreachable
+- `eof()` → `$Prompting` — defensive
 - `is_done()` → returns `false`
 
 ### `$Exiting`
@@ -66,6 +83,7 @@ Terminal state. The shell's `$>` enter handler prints "goodbye". The host loop s
 **Events handled (no transition):**
 - `line(input)` — ignored
 - `interrupt()` — ignored
+- `eof()` — ignored
 - `is_done()` → returns `true`
 
 ## Interface
@@ -73,25 +91,37 @@ Terminal state. The shell's `$>` enter handler prints "goodbye". The host loop s
 | Method | Parameters | Returns | Purpose |
 |---|---|---|---|
 | `line` | `input: &str` | `()` | Process one line of input from the user |
-| `interrupt` | `()` | `()` | Process a Ctrl-C / Ctrl-D / SIGINT-equivalent signal from the host loop |
+| `interrupt` | `()` | `()` | Process a Ctrl-C / SIGINT-equivalent abort signal from the host loop. State-dependent dispatch (the Frame argument) — see below. |
+| `eof` | `()` | `()` | Process Ctrl-D / EOF from the host loop. Distinct from `interrupt()` since H2. |
 | `is_done` | `()` | `bool` | Query whether the shell is in `$Exiting` and the host loop should stop |
-
-The interface is unchanged from H0. H1 added states and transitions but kept the same three public methods, so the host loop in `shell/src/main.rs` is unaffected by the H1 extension.
 
 `line(input)` in `$Prompting` decides based on `input.trim()`: empty → stay (re-prompt), `"exit"`/`"quit"` → `$Exiting`, otherwise → `$Parsing` (with the line stashed in `domain.current_line`). In all other states `line` is defensively declared (transient states never receive line() in practice; $Exiting ignores it).
 
-`interrupt()` semantics: H1 maps it to `$Exiting` from `$Prompting` (same as H0). H2 will revise — `$Prompting.interrupt()` will clear the line and stay, `$RunningExternal.interrupt()` will SIGKILL the child. The state-dependent dispatch is the Frame argument.
+`interrupt()` at H2 — **the Frame argument:** Same event, state-dependent dispatch.
 
-`is_done()` is the host loop's only state observation. Transient states (`$Parsing`, `$RunningBuiltin`) return `false`; `$Exiting` returns `true`.
+| State | `interrupt()` behavior |
+|---|---|
+| `$Prompting` | No-op — rustyline already cleared the line buffer; re-prompt and stay |
+| `$Parsing` | Defensive `→ $Prompting` (unreachable; `$>` is synchronous) |
+| `$RunningBuiltin` | Defensive `→ $Prompting` (unreachable; `$>` is synchronous) |
+| `$RunningExternal` | Kill the child PID, then `→ $Prompting` |
+| `$Exiting` | Ignored |
+
+There is no `if shell.state() == X` branching in `main.rs`. The host loop calls `shell.interrupt()` unconditionally and Frame dispatches. Adding the SIGSTOP-handling `$Suspended` state for H3 will be a localized change: add the state and its `interrupt()` handler, framec regenerates dispatch, host loop is untouched.
+
+`eof()` is new at H2. The H0/H1 design collapsed Ctrl-C and Ctrl-D both into `interrupt()`, with `$Prompting.interrupt()` going to `$Exiting`. H2 separates the two intents: Ctrl-C is "abort current input" (stay at the prompt), Ctrl-D is "I'm done" (exit). The host loop maps `ReadlineError::Interrupted` → `shell.interrupt()`, `ReadlineError::Eof` → `shell.eof()`.
+
+`is_done()` is the host loop's only state observation. Transient states return `false`; `$Exiting` returns `true`.
 
 ## Domain
 
 | Field | Type | Initial value | Purpose | Lifetime |
 |---|---|---|---|---|
 | `current_line` | `String` | `String::new()` | The line being processed, set on `$Prompting → $Parsing` so `$Parsing.$>` can read it | One-shot per cycle |
-| `current_builtin` | `Builtin` | `Builtin::Empty` | The classified result from `$Parsing.$>`, consumed by `$RunningBuiltin.$>` | One-shot per cycle |
+| `current_builtin` | `Builtin` | `Builtin::Empty` | The classified result from `$Parsing.$>`, consumed by `$RunningBuiltin.$>` or `$RunningExternal.$>` | One-shot per cycle |
+| `current_child_pid` | `Option<u32>` | `None` | PID of the currently-running external child, set during `$RunningExternal.run_external()`'s `child.wait()` window. Used by `$RunningExternal.interrupt()`'s `kill_child` action. | Lifetime of one child process |
 | `cwd` | `std::path::PathBuf` | `std::env::current_dir().unwrap_or_default()` | Shell's tracked working directory | System lifetime — updated by the `cd` builtin |
-| `history` | `Vec<String>` | `Vec::new()` | Lines that resulted in a builtin execution | System lifetime — appended in `$RunningBuiltin.$>` |
+| `history` | `Vec<String>` | `Vec::new()` | Lines that resulted in a builtin or external execution | System lifetime — appended in `$RunningBuiltin.$>` and `$RunningExternal.$>` |
 
 ## Why a state machine
 
@@ -225,3 +255,5 @@ Filesystem paths from the user are resolved through a single `resolve(path, &cwd
 - **2026-05-19** — added `interrupt()` event for Ctrl-C / Ctrl-D handling, completing H0 scope per `docs/roadmap.md`. State graph adds `Prompting -> Exiting [label=interrupt]` edge. Three new behavioral tests cover the new state-event pairs.
 - **2026-05-19** — H1 Step 2: added `$Parsing` and `$RunningBuiltin` transient states, four domain fields (`current_line`, `current_builtin`, `cwd`, `history`), and the native `Builtin` enum + `classify` / `execute` dispatch in `shell/src/builtin.rs`. State graph now has 9 edges. `print_unknown` moved from `actions:` into `execute()` so unknown commands flow through the standard `$Parsing → $RunningBuiltin` cycle. All H0 behavioral and E2E tests still pass unchanged. The 8 builtin variants currently have placeholder `(todo: <name>)` bodies; Step 3 fills in real behavior.
 - **2026-05-19** — H1 Step 3: filled in all seven builtin executions (`cd`/`pwd`/`ls`/`cat`/`echo`/`history`/`help`; `exit` is the fast-path keyword in `$Prompting`). Added 20 Level-6 E2E tests in `shell/tests/builtins_e2e.rs`, each tied to a specific roadmap exit-criterion row. Filesystem-touching tests use `tempfile::TempDir` for isolated state. The `tempfile` crate is now a workspace dev-dep. No `.frs` changes; this commit is pure native data work — exactly the split the architecture doc commits to. Total test count: 85.
+- **2026-05-19** — H1 followup: switched `$Parsing.$>` from `Parser::__create()` (Rust-target-specific) to `@@Parser()` (Frame-portable per RFC-0024). Unblocked by framec Issue #29 fix.
+- **2026-05-19** — H2: added `$RunningExternal` state and `eof()` event. `$Parsing.$>` now routes `Builtin::Unknown` to `$RunningExternal` (was: through `$RunningBuiltin`'s execute() as a print-only "unknown command" message). `$RunningExternal.$>` calls the new `run_external` action which spawns the child via `std::process::Command`, installs `SIG_IGN` for SIGINT so the shell survives Ctrl-C while the child receives the signal naturally, waits, restores the prior SIGINT disposition, and surfaces non-zero exit codes. `interrupt()` semantics change: `$Prompting.interrupt()` is now a no-op (was: → $Exiting); `$RunningExternal.interrupt()` calls `kill_child` and → $Prompting. The new `eof()` event handles Ctrl-D / EOF (was: collapsed into `interrupt()`). 9 new Level-6 E2E tests in `shell/tests/external_e2e.rs` (Unix-only, marked `#![cfg(unix)]` because they invoke POSIX absolute-path binaries). `libc` added as a Unix-only dependency. Total test count: 94.

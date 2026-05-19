@@ -1,46 +1,29 @@
 // frame/shell.frs
 //
-// Frame OS Shell — H1 (builtins).
+// Frame OS Shell — H2 (external command execution).
 //
-// State graph:
+// State graph at H2 — 5 states, plus Entry → $Prompting:
 //
-//   ┌──────────────────────────────────────────────────────┐
-//   │  $Prompting  (initial — waiting for input)           │
-//   └──────────────────────────────────────────────────────┘
-//        │                       │                  │
-//        │ line("exit"/"quit")   │ line(non-empty,  │ interrupt()
-//        │ or line(empty)        │ non-exit)        │ (Ctrl-C / Ctrl-D)
-//        │                       │                  │
-//        ▼                       ▼                  ▼
-//   ┌──────────┐            ┌──────────┐       ┌──────────┐
-//   │ $Exiting │ ◄──────────│ $Parsing │       │ $Exiting │
-//   │(terminal)│            │          │       │(terminal)│
-//   └──────────┘            └──────────┘       └──────────┘
-//      goodbye                  │
-//                               │ parse error → $Prompting
-//                               │ parse ok → $RunningBuiltin
-//                               ▼
-//                         ┌───────────────────┐
-//                         │ $RunningBuiltin   │
-//                         └───────────────────┘
-//                               │
-//                               │ (always returns to $Prompting at H1;
-//                               │ H2 will add transition to $Exiting
-//                               │ for an `exit` builtin if we move it
-//                               │ behind the parser)
-//                               ▼
-//                         (back to $Prompting)
+//   $Prompting ── line(exit/quit) ──────────────────────────► $Exiting
+//                                                              (terminal)
+//   $Prompting ── line(builtin) ──► $Parsing ──► $RunningBuiltin ──► $Prompting
+//   $Prompting ── line(external) ─► $Parsing ──► $RunningExternal ─► $Prompting
+//   $Prompting ── eof() ────────────────────────────────────► $Exiting
+//   $Prompting ── interrupt() ──► $Prompting   (stay — line was cleared by rustyline)
 //
-// Two states added at H1: $Parsing and $RunningBuiltin. Both are
-// transient — they enter, run their $> handler synchronously, and
-// transition out. There are no user-facing events that arrive in
-// these states except interrupt() (defensively handled).
+//   $RunningExternal ── interrupt() ──► $Prompting   (kills the child process)
 //
-// The Frame argument at H1 strengthens vs. H0: line() now has
-// three meaningfully different outcomes (exit, parse, ignore) and
-// the per-state interrupt() handlers prefigure H2's per-state
-// signal dispatch (interrupt() in $RunningExternal will SIGKILL
-// the child, not return to the prompt).
+// H0 had `interrupt() → $Exiting` from $Prompting. H2 inverts that: at the
+// prompt, Ctrl-C is "abort this input," not "exit." Ctrl-D / EOF still
+// exits, but it gets its own event (`eof()`) so the two intent paths
+// stay distinct.
+//
+// The Frame argument lands here: the SAME `interrupt()` event has
+// different effects per state. In `$Prompting` it's a no-op (rustyline
+// already cleared the line; we just stay). In `$RunningExternal` it kills
+// the running child and returns to the prompt. There is no
+// `if shell.state() == ...` in the host loop — main.rs calls
+// `shell.interrupt()` unconditionally, and Frame dispatches.
 
 @@[target("rust")]
 
@@ -48,6 +31,7 @@
     interface:
         line(input: &str)
         interrupt()
+        eof()
         is_done(): bool = false
 
     machine:
@@ -69,6 +53,14 @@
             }
 
             interrupt() {
+                // H2: Ctrl-C at the prompt is "abort this input." Rustyline
+                // already cleared the line buffer; we just print a fresh
+                // prompt and stay in $Prompting. To exit, use Ctrl-D, exit,
+                // or quit.
+                self.print_prompt();
+            }
+
+            eof() {
                 -> $Exiting
             }
 
@@ -89,19 +81,29 @@
                     -> $Prompting
                 } else {
                     self.current_builtin = classify(p.tokens());
-                    -> $RunningBuiltin
+                    // H2 split: route unknown commands to $RunningExternal
+                    // (try as host-OS command). Known builtins go to
+                    // $RunningBuiltin as before.
+                    if is_unknown(&self.current_builtin) {
+                        -> $RunningExternal
+                    } else {
+                        -> $RunningBuiltin
+                    }
                 }
             }
 
             line(input: &str) {
-                // $Parsing is transient — the $> handler runs synchronously
-                // and transitions out within a single shell.line() call.
-                // This handler exists for interface completeness; it's
-                // unreachable in practice.
+                // Transient state — $> runs synchronously and transitions
+                // out before the host loop can deliver another event.
             }
 
             interrupt() {
-                // Same — transient state, defensively handled.
+                // Defensive; unreachable in practice.
+                -> $Prompting
+            }
+
+            eof() {
+                // Defensive; unreachable in practice.
                 -> $Prompting
             }
 
@@ -118,13 +120,53 @@
             }
 
             line(input: &str) {
-                // Transient state — see $Parsing's note.
+                // Transient state.
             }
 
             interrupt() {
-                // H1 builtins are synchronous and brief; nothing to abort.
-                // H2 will add $RunningExternal where interrupt() actually
-                // matters (SIGKILL the child).
+                // Builtins are synchronous and brief; defensive transition.
+                -> $Prompting
+            }
+
+            eof() {
+                // Defensive.
+                -> $Prompting
+            }
+
+            is_done(): bool {
+                @@:(false)
+            }
+        }
+
+        $RunningExternal {
+            $>() {
+                self.run_external();
+                self.history.push(self.current_line.clone());
+                -> $Prompting
+            }
+
+            line(input: &str) {
+                // Transient state — $> blocks in child.wait().
+            }
+
+            interrupt() {
+                // The actual SIGINT delivery during child.wait() is handled
+                // at the OS / libc level (see run_external action below):
+                // the shell installs SIG_IGN, the child inherits the
+                // terminal foreground group and dies naturally on Ctrl-C,
+                // child.wait() returns, and we transition to $Prompting
+                // via the $> handler's normal flow.
+                //
+                // This interrupt() handler is reachable only by tests that
+                // manipulate domain state directly (or by future async
+                // designs). It defensively attempts to kill the child by
+                // PID and transitions back to $Prompting.
+                self.kill_child();
+                -> $Prompting
+            }
+
+            eof() {
+                // Defensive.
                 -> $Prompting
             }
 
@@ -139,11 +181,15 @@
             }
 
             line(input: &str) {
-                // Already exiting; ignore further input.
+                // Already exiting; ignore.
             }
 
             interrupt() {
-                // Already exiting; further interrupts are no-ops.
+                // Already exiting; ignore.
+            }
+
+            eof() {
+                // Already exiting; ignore.
             }
 
             is_done(): bool {
@@ -162,20 +208,96 @@
             println!("goodbye");
         }
 
+        // Spawn the classified external command, install SIG_IGN for the
+        // duration of child.wait() so the shell survives Ctrl-C while the
+        // child handles SIGINT naturally (or other signals), then restore
+        // the previous SIGINT disposition. On Unix only — Windows takes a
+        // different path that's not yet implemented (see shell/Cargo.toml).
+        run_external() {
+            let (cmd, args) = match &self.current_builtin {
+                Builtin::Unknown(c, a) => (c.clone(), a.clone()),
+                // Defensive: $RunningExternal shouldn't be entered for any
+                // other Builtin variant. Just bail.
+                _ => return,
+            };
+
+            let mut command = std::process::Command::new(&cmd);
+            command.args(&args);
+
+            let mut child = match command.spawn() {
+                Ok(c) => c,
+                Err(e) => {
+                    if e.kind() == std::io::ErrorKind::NotFound {
+                        println!("{cmd}: command not found");
+                    } else {
+                        println!("{cmd}: {e}");
+                    }
+                    return;
+                }
+            };
+
+            self.current_child_pid = Some(child.id());
+
+            // Install SIG_IGN for SIGINT so the shell survives Ctrl-C while
+            // the child runs. Save the previous handler so we can restore.
+            #[cfg(unix)]
+            let prev_handler = unsafe {
+                libc::signal(libc::SIGINT, libc::SIG_IGN)
+            };
+
+            let status = child.wait();
+
+            #[cfg(unix)]
+            unsafe {
+                libc::signal(libc::SIGINT, prev_handler);
+            }
+
+            self.current_child_pid = None;
+
+            // Surface non-zero exit codes for the user. Signal-killed
+            // processes have code() == None on Unix; print nothing in that
+            // case, like bash.
+            match status {
+                Ok(s) if !s.success() => {
+                    if let Some(code) = s.code() {
+                        println!("[exit code: {code}]");
+                    }
+                }
+                Ok(_) => {}
+                Err(e) => println!("wait failed: {e}"),
+            }
+        }
+
+        // Attempt to kill the currently-running external child by PID.
+        // Reachable only via the $RunningExternal.interrupt() handler,
+        // which itself is unreachable through normal flow because $> is
+        // synchronous. Documented for the state-event interface contract
+        // and exercised by behavioral tests that drive interrupt() against
+        // a domain manually seeded with a running child.
+        kill_child() {
+            if let Some(pid) = self.current_child_pid {
+                #[cfg(unix)]
+                unsafe {
+                    libc::kill(pid as i32, libc::SIGINT);
+                }
+                let _ = pid;
+            }
+        }
+
     domain:
-        // The most recent line being processed. Stored when transitioning
-        // out of $Prompting so $Parsing's $> can read it from domain.
+        // The most recent line being processed.
         current_line: String = String::new()
 
-        // The classified Builtin from the most recent parse, populated by
-        // $Parsing's $> and consumed by $RunningBuiltin's $>.
+        // The classified Builtin from the most recent parse.
         current_builtin: Builtin = Builtin::Empty
 
-        // Current working directory. Initialized to the process's CWD at
-        // shell construction; subsequent `cd` builtins update it.
+        // PID of the currently-running external child, set while
+        // $RunningExternal.run_external() is in child.wait().
+        current_child_pid: Option<u32> = None
+
+        // Shell's tracked working directory.
         cwd: std::path::PathBuf = std::env::current_dir().unwrap_or_default()
 
-        // Command history — every line that resulted in a builtin execution
-        // (success or unknown). Read by the `history` builtin.
+        // Command history.
         history: Vec<String> = Vec::new()
 }

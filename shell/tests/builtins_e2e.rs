@@ -278,14 +278,20 @@ fn empty_history_prints_nothing_extra() {
 }
 
 // ---------------------------------------------------------------------------
-// Sanity: H0/H1 unknown-command path still works through the new dispatch
+// Sanity: with H2, unknown commands now route to $RunningExternal which
+// tries to spawn them as host-OS processes. Coverage for that path lives
+// in external_e2e.rs; the regression here just confirms the cycle still
+// returns to the prompt cleanly.
 // ---------------------------------------------------------------------------
 
 #[test]
-fn unknown_command_still_prints_unknown() {
+fn nonexistent_input_returns_to_prompt() {
     let tmp = TempDir::new().unwrap();
+    // xyzzy is not a known builtin and not on PATH; H2 routes it to
+    // $RunningExternal which tries `Command::new("xyzzy").spawn()`, hits
+    // ErrorKind::NotFound, prints a message, and returns to $Prompting.
     shell_at(tmp.path(), "xyzzy\nexit\n")
         .success()
-        .stdout(contains("unknown command"))
-        .stdout(contains("xyzzy"));
+        .stdout(contains("xyzzy"))
+        .stdout(contains("goodbye"));
 }

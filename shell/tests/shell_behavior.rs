@@ -3,21 +3,21 @@
 // Level 3 (behavioral) tests for the Shell Frame system.
 //
 // These tests construct the Shell directly and exercise its interface
-// methods. They verify the committed state-event pairs:
+// methods. They verify the committed state-event pairs.
 //
-//   $Prompting + line("exit")    → $Exiting       (is_done becomes true)
-//   $Prompting + line("quit")    → $Exiting       (is_done becomes true)
-//   $Prompting + line("")        → stays in $Prompting (is_done stays false)
-//   $Prompting + line("xyzzy")   → stays in $Prompting (unknown-command path)
-//   $Prompting + interrupt()     → $Exiting       (Ctrl-C / Ctrl-D path)
-//   $Exiting   + line(anything)  → stays in $Exiting   (is_done remains true)
-//   $Exiting   + interrupt()     → stays in $Exiting   (already done)
+// H2 semantic changes (inverted from H0/H1):
+//   - interrupt() in $Prompting STAYS in $Prompting (was: → $Exiting).
+//     The "abort this input" interpretation; rustyline cleared the line
+//     and we just re-prompt.
+//   - The new eof() event is what transitions $Prompting → $Exiting
+//     (Ctrl-D path); host loop routes ReadlineError::Eof here.
 //
 // What we DON'T test here:
-//   - Output text (prompt formatting, goodbye message). That's E2E territory
-//     and lives in shell/tests/e2e.rs.
-//   - Generated state graph structure. That's a snapshot test and lives in
-//     shell/tests/state_graphs.rs.
+//   - Output text (prompt formatting, goodbye message). That's E2E territory.
+//   - Generated state graph structure. That's a snapshot test.
+//   - External-command execution. That's E2E in builtins_e2e.rs and
+//     external_e2e.rs; running subprocesses is slow and not the point of
+//     behavioral tests.
 
 use frame_os_shell::Shell;
 
@@ -107,15 +107,28 @@ fn exiting_state_ignores_further_lines() {
 }
 
 #[test]
-fn interrupt_in_prompting_transitions_to_exiting() {
-    // H0 success criterion: Ctrl-C exits cleanly. The host loop maps
-    // ReadlineError::Interrupted to shell.interrupt(); we test the
-    // transition here without involving rustyline.
+fn interrupt_in_prompting_stays_prompting() {
+    // H2: Ctrl-C at the prompt is "abort this input" — Frame stays in
+    // $Prompting. The host loop's main.rs maps ReadlineError::Interrupted
+    // to shell.interrupt(); rustyline has already cleared the line buffer
+    // by the time we get here.
     let mut shell = Shell::__create();
     shell.interrupt();
     assert!(
+        !shell.is_done(),
+        "interrupt in $Prompting should stay in $Prompting (not transition to $Exiting)"
+    );
+}
+
+#[test]
+fn eof_in_prompting_transitions_to_exiting() {
+    // H2: Ctrl-D / EOF is what transitions to $Exiting. Host loop maps
+    // ReadlineError::Eof to shell.eof().
+    let mut shell = Shell::__create();
+    shell.eof();
+    assert!(
         shell.is_done(),
-        "interrupt in $Prompting should transition to $Exiting"
+        "eof in $Prompting should transition to $Exiting"
     );
 }
 
@@ -135,23 +148,35 @@ fn interrupt_in_exiting_is_idempotent() {
 }
 
 #[test]
-fn interrupt_after_unknown_commands_still_exits() {
+fn eof_in_exiting_is_idempotent() {
     let mut shell = Shell::__create();
-    shell.line("foo");
-    shell.line("bar");
-    assert!(!shell.is_done(), "should still be in $Prompting");
-    shell.interrupt();
-    assert!(
-        shell.is_done(),
-        "interrupt after unknown commands should exit"
-    );
+    shell.line("exit");
+    assert!(shell.is_done());
+    shell.eof();
+    assert!(shell.is_done(), "redundant eof in $Exiting is a no-op");
 }
 
 #[test]
-fn many_unknown_commands_before_exit() {
-    // Stress-ish: confirm we can stay in $Prompting indefinitely.
+fn interrupt_repeats_at_prompting_dont_exit() {
+    // Stress: Ctrl-C several times in a row should never accidentally exit.
     let mut shell = Shell::__create();
-    for cmd in ["foo", "bar", "baz", "", "  ", "what", "help"] {
+    for _ in 0..5 {
+        shell.interrupt();
+        assert!(!shell.is_done());
+    }
+    shell.eof();
+    assert!(shell.is_done(), "eof eventually exits cleanly");
+}
+
+#[test]
+fn many_known_builtins_before_exit() {
+    // Stress: stay in $Prompting through many known-builtin invocations.
+    // (Unknown commands would now spawn subprocesses via $RunningExternal,
+    // which is slow and not the point of behavioral tests — we use known
+    // builtins here so the cycle is `$Prompting → $Parsing → $RunningBuiltin
+    // → $Prompting` purely in-process.)
+    let mut shell = Shell::__create();
+    for cmd in ["pwd", "help", "echo foo", "echo bar", "history"] {
         shell.line(cmd);
         assert!(!shell.is_done(), "should still be prompting after '{cmd}'");
     }

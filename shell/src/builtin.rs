@@ -39,6 +39,14 @@ pub enum Builtin {
     Unknown(String, Vec<String>),
 }
 
+/// True iff the classified command was not matched against any known builtin.
+/// Used by `$Parsing.$>` to route to `$RunningExternal` instead of
+/// `$RunningBuiltin`. Lifted out as a function so the .frs handler body
+/// stays a single-line condition.
+pub fn is_unknown(b: &Builtin) -> bool {
+    matches!(b, Builtin::Unknown(_, _))
+}
+
 /// Classify a token vector into a Builtin.
 ///
 /// Tokens come from Parser. The first token is the command name; the rest
@@ -84,8 +92,15 @@ pub fn execute(builtin: &Builtin, cwd: &mut PathBuf, history: &[String]) {
             // empty-trim check in $Prompting). Documented as a deliberate
             // no-op so future readers don't add an error path.
         }
-        Builtin::Unknown(cmd, _) => {
-            println!("unknown command: {cmd} (try 'exit')");
+        Builtin::Unknown(_, _) => {
+            // Unreachable: $Parsing routes Builtin::Unknown to
+            // $RunningExternal at H2, which handles it via
+            // Shell::run_external(). The dispatcher here is the
+            // $RunningBuiltin code path, so this arm should never be hit.
+            // Kept as a defensive panic so a future refactor that
+            // accidentally routes Unknown back through $RunningBuiltin
+            // surfaces immediately.
+            unreachable!("Builtin::Unknown should be handled by $RunningExternal, not execute()");
         }
     }
 }

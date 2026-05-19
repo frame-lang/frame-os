@@ -32,8 +32,8 @@ use rustyline::DefaultEditor;
 fn main() -> ExitCode {
     // Banner — printed once at startup, before the Shell prints its first
     // prompt. (Shell::__create() runs $Prompting.$> which prints "frame-os> ".)
-    println!("Frame OS shell — H1");
-    println!("type 'exit' or 'quit' to leave (Ctrl-C or Ctrl-D also work)");
+    println!("Frame OS shell — H2");
+    println!("type 'exit' or 'quit' to leave (Ctrl-D also exits; Ctrl-C cancels current input)");
 
     let mut shell = Shell::__create();
 
@@ -48,15 +48,23 @@ fn main() -> ExitCode {
     while !shell.is_done() {
         // Pass empty prompt to rustyline — the Shell's print_prompt() action
         // already wrote "frame-os> " to stdout. Rustyline still handles line
-        // editing, history, and Ctrl-C/Ctrl-D interception.
+        // editing, history, and Ctrl-C / Ctrl-D interception.
+        //
+        // H2 split: Ctrl-C and Ctrl-D map to different Shell events. Ctrl-C
+        // is "abort this input" (interrupt — stays at the prompt); Ctrl-D
+        // is "I'm done" (eof — transitions to $Exiting).
         match editor.readline("") {
             Ok(line) => {
                 shell.line(&line);
             }
-            Err(ReadlineError::Interrupted | ReadlineError::Eof) => {
-                // Newline so "goodbye" isn't glued to the abandoned prompt.
+            Err(ReadlineError::Interrupted) => {
+                // Newline so "frame-os> " isn't glued to the half-typed line.
                 println!();
                 shell.interrupt();
+            }
+            Err(ReadlineError::Eof) => {
+                println!();
+                shell.eof();
             }
             Err(err) => {
                 eprintln!("read error: {err}");
