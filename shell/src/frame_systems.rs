@@ -9,7 +9,8 @@
 // another system as a domain field — for H0 there's just one, so no ordering
 // concern yet.
 //
-// To regenerate: edit frame/shell.frs in the workspace, then `cargo build`.
-// The build script will re-run framec.
+// To regenerate: edit the .frs files in the workspace's frame/ directory,
+// then `cargo build`. The build script will re-run framec on each.
 
 include!(concat!(env!("OUT_DIR"), "/shell.rs"));
+include!(concat!(env!("OUT_DIR"), "/parser.rs"));

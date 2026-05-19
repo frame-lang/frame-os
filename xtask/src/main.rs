@@ -141,7 +141,7 @@ enum DiagramMode {
 }
 
 /// (frs_filename_relative_to_frame_dir, output_svg_relative_to_docs_systems_dir)
-const DIAGRAMS: &[(&str, &str)] = &[("shell.frs", "shell.svg")];
+const DIAGRAMS: &[(&str, &str)] = &[("shell.frs", "shell.svg"), ("parser.frs", "parser.svg")];
 
 fn diagrams(mode: DiagramMode) -> Result<()> {
     let workspace_root = workspace_root()?;

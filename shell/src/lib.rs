@@ -12,4 +12,4 @@
 
 pub mod frame_systems;
 
-pub use frame_systems::Shell;
+pub use frame_systems::{Parser, Shell};

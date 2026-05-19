@@ -1,0 +1,236 @@
+// frame/parser.frs
+//
+// Parser — H1 (command-line tokenizer)
+//
+// Per-character event-driven scanner. The consumer feeds chars via
+// consume(c) one at a time; the current state decides what each char
+// means. The state machine handles whitespace separation and quoted
+// substrings (both " and ' work, treated identically — Frame OS has
+// no variable substitution so there's nothing to distinguish them).
+//
+// Tokenization rules at H1:
+//   - Whitespace (space, tab) separates tokens.
+//   - A run of non-whitespace, non-quote chars is one token.
+//   - "..." or '...' wraps a token that may contain whitespace.
+//   - Quotes are only special at token boundaries (in $ReadingWord).
+//     Inside $InWord they're treated as regular characters. This is a
+//     simplification vs. bash, where mid-word `hello"world"` becomes
+//     `helloworld` as one token. We don't do mid-word concatenation
+//     at H1 — defer to a later milestone if it becomes necessary.
+//   - No escape character processing (`\`). Quoted strings are literal.
+//   - An unterminated quoted string is a parse error.
+//
+// State graph (consume events shown; finalize() is the only path to a
+// terminal state):
+//
+//   ┌───────────────────────────────────────────────────────────────┐
+//   │              $ReadingWord  (initial — between tokens)         │
+//   │              skips whitespace, accumulates nothing             │
+//   └───────────────────────────────────────────────────────────────┘
+//          │ws=stay      │ "/' --> $InQuotedString    │ other char
+//          │              │                            │
+//          │              ▼                            ▼
+//          │      ┌──────────────────┐         ┌──────────────┐
+//          │      │ $InQuotedString  │         │   $InWord    │
+//          │      │ accumulating     │         │ accumulating │
+//          │      └──────────────────┘         └──────────────┘
+//          │            │                          │
+//          │            │ matching quote           │ ws (push token,
+//          │            │ (push token,             │  → $ReadingWord)
+//          │            │  → $ReadingWord)         │ char (append, stay)
+//          │            │ other (append, stay)     │
+//          │            │                          │
+//          │            ▼                          ▼
+//          │       (back to $ReadingWord)     (back to $ReadingWord)
+//          │
+//          │ finalize() from any non-terminal state:
+//          │   - $ReadingWord     -> $Done
+//          │   - $InWord          -> push current, $Done
+//          │   - $InQuotedString  -> $Failed (unterminated quote)
+//          │
+//          ▼                       ▼
+//      ┌────────┐               ┌─────────┐
+//      │ $Done  │               │ $Failed │
+//      └────────┘               └─────────┘
+//      tokens()                 tokens() (partial)
+//      is_complete() = true     is_complete() = true
+//                               error() = "unterminated quote..."
+//
+// Why a state machine: tokenization is the textbook FSM. Each char's
+// effect depends on which mode (state) the scanner is in: a space is a
+// token separator in $InWord but a no-op in $ReadingWord and part of
+// the token in $InQuotedString. As plain Rust this would be a giant
+// match-on-state inside a for-each-char loop. As Frame it's three
+// scanning states with explicit transitions and the diagram is
+// directly readable as the scanner's mode graph.
+
+@@[target("rust")]
+
+@@system Parser {
+    interface:
+        consume(c: char)
+        finalize()
+        tokens(): Vec<String>
+        error(): String
+        is_complete(): bool = false
+
+    machine:
+        $ReadingWord {
+            consume(c: char) {
+                if c == '"' || c == '\'' {
+                    self.open_quote = c;
+                    -> $InQuotedString
+                } else if c.is_whitespace() {
+                    // Skip whitespace between tokens.
+                } else {
+                    self.current.push(c);
+                    -> $InWord
+                }
+            }
+
+            finalize() {
+                -> $Done
+            }
+
+            tokens(): Vec<String> {
+                @@:(self.tokens.clone())
+            }
+
+            error(): String {
+                @@:(String::new())
+            }
+
+            is_complete(): bool {
+                @@:(false)
+            }
+        }
+
+        $InWord {
+            consume(c: char) {
+                if c.is_whitespace() {
+                    self.tokens.push(self.current.clone());
+                    self.current.clear();
+                    -> $ReadingWord
+                } else {
+                    // Note: quotes mid-word are treated as ordinary chars
+                    // at H1. See header for the rationale.
+                    self.current.push(c);
+                }
+            }
+
+            finalize() {
+                self.tokens.push(self.current.clone());
+                self.current.clear();
+                -> $Done
+            }
+
+            tokens(): Vec<String> {
+                @@:(self.tokens.clone())
+            }
+
+            error(): String {
+                @@:(String::new())
+            }
+
+            is_complete(): bool {
+                @@:(false)
+            }
+        }
+
+        $InQuotedString {
+            consume(c: char) {
+                if c == self.open_quote {
+                    self.tokens.push(self.current.clone());
+                    self.current.clear();
+                    self.open_quote = '\0';
+                    -> $ReadingWord
+                } else {
+                    // Any other char — including the *other* quote
+                    // character and whitespace — is part of the token.
+                    self.current.push(c);
+                }
+            }
+
+            finalize() {
+                self.error_msg = format!(
+                    "unterminated quoted string: missing closing {}",
+                    self.open_quote
+                );
+                -> $Failed
+            }
+
+            tokens(): Vec<String> {
+                @@:(self.tokens.clone())
+            }
+
+            error(): String {
+                @@:(String::new())
+            }
+
+            is_complete(): bool {
+                @@:(false)
+            }
+        }
+
+        $Done {
+            consume(c: char) {
+                // Terminal — further chars after finalize() are ignored.
+            }
+
+            finalize() {
+                // Idempotent — second finalize() is a no-op.
+            }
+
+            tokens(): Vec<String> {
+                @@:(self.tokens.clone())
+            }
+
+            error(): String {
+                @@:(String::new())
+            }
+
+            is_complete(): bool {
+                @@:(true)
+            }
+        }
+
+        $Failed {
+            consume(c: char) {
+                // Terminal — further chars after the failure are ignored.
+            }
+
+            finalize() {
+                // Idempotent — second finalize() is a no-op.
+            }
+
+            tokens(): Vec<String> {
+                // Returns whatever was successfully tokenized before the
+                // failure. Callers should check error() first.
+                @@:(self.tokens.clone())
+            }
+
+            error(): String {
+                @@:(self.error_msg.clone())
+            }
+
+            is_complete(): bool {
+                @@:(true)
+            }
+        }
+
+    domain:
+        // Tokens accumulated so far. Consumer reads via tokens() after
+        // is_complete() returns true.
+        tokens: Vec<String> = Vec::new()
+
+        // The token being built up character by character.
+        current: String = String::new()
+
+        // Tracks which quote character opened $InQuotedString, so the
+        // matching close quote terminates the token. '\0' when not in
+        // a quoted string.
+        open_quote: char = '\0'
+
+        // Error message set on transition to $Failed. Empty otherwise.
+        error_msg: String = String::new()
+}
