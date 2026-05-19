@@ -1,0 +1,282 @@
+// frame/job_control.frs
+//
+// JobControl — manager FSM for the hosted shell's job table (H3 Step 2).
+//
+// Holds Vec<Job> in domain and orchestrates per-job operations. There's
+// at most one foreground job at a time; everything else is background or
+// stopped. JobControl tracks the foreground via `foreground_id` and
+// switches between $Idle (no foreground; Shell can prompt) and
+// $RunningForeground (Shell.$RunningForeground.$> calls wait_foreground
+// here, which polls until the foreground exits or is stopped, then
+// returns to $Idle).
+//
+// State graph:
+//
+//   ┌─────────┐  spawn_foreground(cmd, args)         ┌────────────────────┐
+//   │  $Idle  │ ───────────────────────────────────► │ $RunningForeground │
+//   │ (init)  │                                       │                    │
+//   │         │ ◄──── wait_foreground completes ──── │                    │
+//   │         │      (job exits or is stopped)        │                    │
+//   └────┬────┘                                       └─────────┬──────────┘
+//        │                                                      │
+//        │ spawn_background(cmd, args) — stays in $Idle         │ stop_foreground()
+//        │ tick() — reap done jobs, stays in $Idle              │   (SIGTSTP fg)
+//        │ bg(id) — resume stopped job in BG, stays in $Idle    │   → $Idle
+//        │                                                      │
+//        │ fg(id) — bring stopped or BG job to FG ──────────────┘
+//
+// "Manager + N instances" is a pattern that recurs at B4 with
+// ProcessTable + Process. JobControl is the H3 instance.
+
+@@[target("rust")]
+
+@@system JobControl {
+    interface:
+        spawn_foreground(cmd: String, args: Vec<String>)
+        spawn_background(cmd: String, args: Vec<String>)
+        wait_foreground()
+        stop_foreground()
+        fg(id: u32)
+        bg(id: u32)
+        kill_job(id: u32)
+        wait_for(id: u32)
+        tick()
+        jobs(): Vec<JobSummary>
+        foreground_id(): u32
+        next_job_id(): u32
+        is_idle(): bool = true
+        is_running_foreground(): bool = false
+
+    machine:
+        $Idle {
+            spawn_foreground(cmd: String, args: Vec<String>) {
+                let mut job = @@Job(self.next_id);
+                job.spawn(cmd, args);
+                if job.is_done() {
+                    // Spawn failure (e.g. NotFound). Add to list as Done;
+                    // stay in $Idle. Caller will see the failure via
+                    // jobs() listing.
+                    self.jobs.push(job);
+                    self.next_id += 1;
+                    return;
+                }
+                self.foreground_id = Some(self.next_id);
+                self.jobs.push(job);
+                self.next_id += 1;
+                -> $RunningForeground
+            }
+
+            spawn_background(cmd: String, args: Vec<String>) {
+                let mut job = @@Job(self.next_id);
+                job.spawn(cmd, args);
+                if !job.is_done() {
+                    job.to_background();
+                }
+                self.jobs.push(job);
+                self.next_id += 1;
+            }
+
+            fg(id: u32) {
+                // Find the job; if found and not Done, bring it to FG.
+                let mut found = false;
+                for j in self.jobs.iter_mut() {
+                    if j.id() == id && !j.is_done() {
+                        j.to_foreground();
+                        found = true;
+                        break;
+                    }
+                }
+                if found {
+                    self.foreground_id = Some(id);
+                    -> $RunningForeground
+                }
+            }
+
+            bg(id: u32) {
+                for j in self.jobs.iter_mut() {
+                    if j.id() == id && !j.is_done() {
+                        j.to_background();
+                        return;
+                    }
+                }
+            }
+
+            kill_job(id: u32) {
+                for j in self.jobs.iter_mut() {
+                    if j.id() == id {
+                        j.kill();
+                        return;
+                    }
+                }
+            }
+
+            wait_for(id: u32) {
+                // $Idle: just poll-loop on the specified job until it
+                // reaches $Done. Doesn't change JobControl's state.
+                self.poll_until_done(id);
+            }
+
+            tick() {
+                // Reap any done background jobs by polling each.
+                for j in self.jobs.iter_mut() {
+                    if !j.is_done() {
+                        j.poll();
+                    }
+                }
+            }
+
+            // Events that are only meaningful from $RunningForeground are
+            // no-ops here:
+            wait_foreground() { }
+            stop_foreground() { }
+
+            jobs(): Vec<JobSummary> { @@:(self.job_summaries()) }
+            foreground_id(): u32 { @@:(self.foreground_id.unwrap_or(0)) }
+            next_job_id(): u32 { @@:(self.next_id) }
+            is_idle(): bool { @@:(true) }
+            is_running_foreground(): bool { @@:(false) }
+        }
+
+        $RunningForeground {
+            wait_foreground() {
+                // Poll the foreground job in a small loop. The loop exits
+                // when the job is $Done OR has been moved to $Stopped
+                // (e.g. by stop_foreground() called from a signal
+                // handler). Either way, we transition back to $Idle.
+                self.drive_foreground_to_idle();
+                self.foreground_id = None;
+                -> $Idle
+            }
+
+            stop_foreground() {
+                // Called externally (typically from a SIGTSTP handler at
+                // H3 Step 3). Sends SIGTSTP to the foreground job, which
+                // transitions it to $Stopped; this causes
+                // wait_foreground's loop to exit on its next iteration.
+                // We transition back to $Idle here too — the shell can
+                // resume prompting.
+                if let Some(fid) = self.foreground_id {
+                    for j in self.jobs.iter_mut() {
+                        if j.id() == fid && !j.is_done() {
+                            j.stop();
+                            break;
+                        }
+                    }
+                }
+                self.foreground_id = None;
+                -> $Idle
+            }
+
+            kill_job(id: u32) {
+                let was_foreground = self.foreground_id == Some(id);
+                for j in self.jobs.iter_mut() {
+                    if j.id() == id {
+                        j.kill();
+                        break;
+                    }
+                }
+                if was_foreground {
+                    self.foreground_id = None;
+                    -> $Idle
+                }
+            }
+
+            tick() {
+                // Same as $Idle.tick(): poll non-done jobs.
+                for j in self.jobs.iter_mut() {
+                    if !j.is_done() {
+                        j.poll();
+                    }
+                }
+            }
+
+            // Spawning a NEW job while another is foreground isn't
+            // supported in H3 (real shells handle it; we don't). Both
+            // spawn paths defensively no-op here.
+            spawn_foreground(cmd: String, args: Vec<String>) { }
+            spawn_background(cmd: String, args: Vec<String>) { }
+            fg(id: u32) { }
+            bg(id: u32) { }
+            wait_for(id: u32) { self.poll_until_done(id); }
+
+            jobs(): Vec<JobSummary> { @@:(self.job_summaries()) }
+            foreground_id(): u32 { @@:(self.foreground_id.unwrap_or(0)) }
+            next_job_id(): u32 { @@:(self.next_id) }
+            is_idle(): bool { @@:(false) }
+            is_running_foreground(): bool { @@:(true) }
+        }
+
+    actions:
+        // Drive the foreground job's poll() in a loop until it reaches a
+        // resting state (Done or Stopped). Sleeps briefly between polls
+        // to avoid pegging a CPU.
+        drive_foreground_to_idle() {
+            let fid = match self.foreground_id {
+                Some(id) => id,
+                None => return,
+            };
+            loop {
+                let mut resting = true;
+                let mut idx: Option<usize> = None;
+                for (i, j) in self.jobs.iter().enumerate() {
+                    if j.id == fid {
+                        idx = Some(i);
+                        break;
+                    }
+                }
+                let i = match idx {
+                    Some(i) => i,
+                    None => return,
+                };
+                self.jobs[i].poll();
+                if self.jobs[i].is_done() {
+                    break;
+                }
+                if self.jobs[i].state_name() == "Stopped" {
+                    break;
+                }
+                let _ = resting;
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+        }
+
+        // Poll a specific job until it reaches $Done. Used by wait_for.
+        poll_until_done(id: u32) {
+            loop {
+                let mut idx: Option<usize> = None;
+                for (i, j) in self.jobs.iter().enumerate() {
+                    if j.id == id {
+                        idx = Some(i);
+                        break;
+                    }
+                }
+                let i = match idx {
+                    Some(i) => i,
+                    None => return,
+                };
+                self.jobs[i].poll();
+                if self.jobs[i].is_done() {
+                    return;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+        }
+
+        // Build the snapshot list returned by jobs(). Caller iterates.
+        job_summaries(): Vec<JobSummary> {
+            let mut out: Vec<JobSummary> = Vec::new();
+            for j in self.jobs.iter_mut() {
+                out.push(JobSummary {
+                    id: j.id(),
+                    state: j.state_name(),
+                    cmd: j.cmd_str(),
+                });
+            }
+            @@:(out)
+        }
+
+    domain:
+        jobs: Vec<Job> = Vec::new()
+        next_id: u32 = 1
+        foreground_id: Option<u32> = None
+}

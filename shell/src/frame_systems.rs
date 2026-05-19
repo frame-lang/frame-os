@@ -19,7 +19,9 @@
 // here so the generated module can see it.
 
 use crate::builtin::{classify, execute, is_unknown, Builtin};
+use crate::job_summary::JobSummary;
 
 include!(concat!(env!("OUT_DIR"), "/shell.rs"));
 include!(concat!(env!("OUT_DIR"), "/parser.rs"));
 include!(concat!(env!("OUT_DIR"), "/job.rs"));
+include!(concat!(env!("OUT_DIR"), "/job_control.rs"));

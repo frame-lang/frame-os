@@ -27,6 +27,7 @@ const FRAME_SYSTEMS: &[(&str, &str)] = &[
     ("shell", "shell.frs"),
     ("parser", "parser.frs"),
     ("job", "job.frs"),
+    ("job_control", "job_control.frs"),
 ];
 
 fn main() -> Result<()> {
