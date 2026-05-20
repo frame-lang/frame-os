@@ -204,10 +204,10 @@ H3 is the H-track's final committed milestone. Further H-track work (a configura
 
 | # | Exit criterion | Validating test(s) |
 |---|---|---|
-| B0-1 | `Kernel` state graph matches committed design (HSM with `$Booting` parent, init-phase children, `$Running`, `$Halting`) | Snapshot `kernel_state_graph_snapshot` |
-| B0-2 | `SerialDriver` state graph matches committed design (`$Idle → $Transmitting → $Draining → $Idle`) | Snapshot `serial_driver_state_graph_snapshot` |
-| B0-3 | `Kernel` boot HSM correctly progresses through init phases | Behavioral tests in `kernel/tests/kernel_behavior.rs` covering each init phase transition; runs as host-build tests, not in QEMU |
-| B0-4 | `Kernel.panic_event()` from any boot child forwards to `$Booting` parent's panic handler (HSM forwarding test) | Behavioral `panic_in_init_memory_forwards_to_booting_parent`, `panic_in_init_idt_forwards_to_booting_parent`, etc. — one per child |
+| B0-1 | `Kernel` state graph matches committed design (HSM with `$Booting` parent, init-phase children, `$Running`, `$Halted`) | Snapshot `kernel_state_graph_snapshot` in `kernel-tests/tests/state_graphs.rs` — **done at Step 2** |
+| B0-2 | `SerialDriver` state graph matches committed design (`$Idle → $Transmitting → $Draining → $Idle`) | Snapshot `serial_driver_state_graph_snapshot` — lands at Step 3 |
+| B0-3 | `Kernel` boot HSM correctly progresses through init phases | Behavioral `boot_chain_prints_all_phases_in_order` + `fresh_kernel_runs_boot_chain_to_running_not_done` in `kernel-tests/tests/kernel_behavior.rs` (host build); also `boot_hsm_runs_init_chain_b0` QEMU smoke — **done at Step 2** |
+| B0-4 | `Kernel.kernel_panic()` dispatches per-state (Frame argument) | `$Running`'s variant covered by `panic_in_running_prints_runtime_message_and_halts` + `runtime_panic_uses_running_variant_not_boot_variant`. **Boot-child forwarding (`=> $^`) is not externally observable** with the synchronous boot chain — `__create()` runs the chain to `$Running` so no external event reaches a boot child. Recorded as an Open question in `docs/systems/kernel.md`; testing it directly needs a fault-injection hook or an event-stepped boot chain (design decision, deferred to when a boot phase first actually fails) |
 | B0-5 | `SerialDriver` correctly transitions on `write_byte` events | Behavioral tests in `kernel/tests/serial_driver_behavior.rs` |
 | B0-6 | `cargo xtask qemu` boots the kernel image in QEMU x86_64 (no automated assertion; manual smoke) | **Manual** — maintainer runs the command, observes banner on serial console, halts cleanly |
 | B0-7 | `cargo xtask qemu-test` runs the kernel image in QEMU, captures serial output, and exits 0 on success / non-zero on assertion failure | `cargo xtask qemu-test` itself, exercised in CI on Linux only (QEMU is most reliable there) — **done at Step 4** |
@@ -222,10 +222,10 @@ H3 is the H-track's final committed milestone. Further H-track work (a configura
 
 **Status:** In progress.
 - **Step 1 (boots and halts):** Done. Kernel boots in QEMU via Limine UEFI, prints banner to COM1 serial, halts. See commit `e8828fb`.
-- **Step 2 (Kernel HSM):** Done. `frame/kernel.frs` compiles into the `no_std` kernel (framec issue #31, which had hardcoded `std::` paths, is fixed — framec now emits `alloc::`/`core::`). `kmain` calls `Kernel::__create()`, which synchronously drives the boot chain through all five init phases to `$Running`. Validated end-to-end by the `boot_hsm_runs_init_chain_b0` QEMU smoke test. Per-system doc and SVG committed. **Remaining for full B0-1/B0-3/B0-4 closure:** host-target behavioral + snapshot tests, which need a separate test crate (the kernel bin can't host `cargo test`).
-- **Step 3 (SerialDriver FSM):** Not started. Will replace the inline `serial::*` calls in `Kernel`'s actions with a `SerialDriver` Frame system; another `no_std` Frame system, now unblocked.
+- **Step 2 (Kernel HSM):** Done. `frame/kernel.frs` compiles into the `no_std` kernel (framec issue #31, which had hardcoded `std::` paths, is fixed — framec now emits `alloc::`/`core::`). `kmain` calls `Kernel::__create()`, which synchronously drives the boot chain through all five init phases to `$Running`. Validated end-to-end by the `boot_hsm_runs_init_chain_b0` QEMU smoke test **and** host-target tests in the new `frame-os-kernel-tests` crate (snapshot B0-1; behavioral B0-3 + `$Running` panic variant). Per-system doc and SVG committed. **Caveat on B0-4:** boot-child panic-forwarding isn't externally observable with the synchronous boot chain (see B0-4 row + the kernel doc's Open questions); deferred, not faked.
+- **Step 3 (SerialDriver FSM):** Not started. Will replace the inline `serial::*` calls in `Kernel`'s actions with a `SerialDriver` Frame system; another `no_std` Frame system, now unblocked. Brings B0-2 + B0-5.
 - **Step 4 (QEMU smoke test harness):** Done. `cargo xtask qemu-test` boots the kernel headlessly, captures serial to file, asserts substrings appear and no panic markers do. Two tests: `boot_prints_banner_b0` (banner) and `boot_hsm_runs_init_chain_b0` (full HSM chain in order). Wired into CI as a Linux-only `qemu-test` job.
-- B0 is **not complete** until Steps 2–3 land their host-target behavioral + snapshot tests (B0-1..B0-5) and Step 3's `SerialDriver`.
+- B0 is **not complete** until Step 3's `SerialDriver` lands (B0-2, B0-5) with its own snapshot + behavioral tests.
 
 ### B1 — multitasking scheduler
 

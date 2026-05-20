@@ -140,21 +140,49 @@ The Frame argument here is real but compact — the kernel HSM is small (5 init 
 
 ## Testing
 
-**State graph snapshot (Level 2):**
-- Not yet present. Lands with B0 Step 2 codegen.
-- Will be: `kernel/tests/state_graphs.rs` snapshot file once the kernel crate can host tests.
+The kernel crate (`[[bin]]` + `#![no_std]` + `#![no_main]` for
+`x86_64-unknown-none`) can't host host-target `cargo test` integration
+tests. Behavioral and snapshot tests therefore live in a sibling host
+crate, **`frame-os-kernel-tests`** (`kernel-tests/`), which compiles the
+*same* `frame/kernel.frs` for the host and supplies a *capturing* `serial`
+module (thread-local buffer) instead of COM1 port I/O. This is the same
+"shared `.frs`, different action implementations per target" pattern the
+roadmap calls for at B2 — proven early here.
 
-**Behavioral tests (Level 3):**
-- Not yet present. The kernel crate at B0 Step 1 is `[[bin]]` + `#![no_std]` + `#![no_main]` for `x86_64-unknown-none` and can't host normal `cargo test` integration tests against the host. Once framec #31 lands and the Frame system generates `no_std`-compatible code, a separate host-target test crate (likely `kernel-tests/`) will exercise behavioral tests against the generated state machine independent of the bare-metal target.
-- Planned tests, one per committed state-event pair:
-  - `panic_in_init_memory_forwards_to_booting_parent`
-  - `panic_in_init_idt_forwards_to_booting_parent`
-  - `panic_in_init_timer_forwards_to_booting_parent`
-  - `panic_in_init_console_forwards_to_booting_parent`
-  - `panic_in_launch_init_forwards_to_booting_parent`
-  - `panic_in_running_uses_runtime_handler`
-  - `boot_chain_progresses_through_all_init_phases`
-  - `is_done_is_false_in_booting`, `is_done_is_false_in_running`, `is_done_is_true_in_halted`
+**State graph snapshot (Level 2):** present.
+- `kernel-tests/tests/state_graphs.rs::kernel_state_graph_snapshot` —
+  snapshots `framec -l graphviz` output via insta.
+  Snapshot: `kernel-tests/tests/snapshots/state_graphs__kernel_state_graph.snap`.
+
+**Behavioral tests (Level 3):** present, in
+`kernel-tests/tests/kernel_behavior.rs`.
+- `fresh_kernel_runs_boot_chain_to_running_not_done` — after `__create()`
+  the kernel rests in `$Running`; `is_done()` is `false`.
+- `boot_chain_prints_all_phases_in_order` — the captured serial output
+  contains all five `[boot] <phase>` banners followed by `[run] kernel
+  running`, **in order**. This is the host-side analog of the
+  `boot_hsm_runs_init_chain_b0` QEMU smoke test.
+- `panic_in_running_prints_runtime_message_and_halts` — `kernel_panic()`
+  in `$Running` prints the *runtime* message and transitions to `$Halted`
+  (`is_done()` becomes `true`).
+- `runtime_panic_uses_running_variant_not_boot_variant` — the same
+  `kernel_panic()` event uses `$Running`'s handler, never `$Booting`'s.
+  This is the per-state-dispatch (Frame argument) assertion.
+- `is_done_only_after_panic` — `is_done()` is `false` in `$Running`,
+  idempotent across reads, and stably `true` once in `$Halted`.
+
+**Not testable via the public interface — and why:** the
+panic-*forwarding* path (`=> $^` from a boot child to `$Booting`'s
+handler) can't be exercised from outside. `Kernel::__create()` runs the
+*entire* boot chain synchronously — each init child's `$>` immediately
+transitions to the next — so the boot children are transient and control
+never returns to the caller mid-chain. An external `kernel_panic()` can
+only ever land in `$Running`. The forwarding is real and would fire if a
+boot phase's own `$>` handler called `self.kernel_panic(...)` (a phase
+failing its init work), but the B0 stubs never self-panic. See the Open
+questions section — testing forwarding directly needs either a
+fault-injection hook or an event-stepped boot chain, which is a design
+decision, not something to fake in a test.
 
 **Integration tests (Level 4):**
 - Not yet applicable; Kernel doesn't compose with other Frame systems until B0 Step 3 introduces `SerialDriver`. Then `kernel_console_init_drives_serial_driver_to_idle` will assert the composition.
@@ -179,6 +207,7 @@ When real init work lands, the pattern will be: `actions:` block delegates each 
 - **Where should the panic-handler-to-Kernel routing live?** Rust's `#[panic_handler]` is a global function — it has no `&mut Kernel` to dispatch on. Options: a `static Mutex<Option<&'static Kernel>>` set during `kmain`, a global event queue the panic handler pushes to and the kernel drains, or keeping the panic path entirely in the native panic handler (printing to serial and halting) without going through the Frame state machine. The third is what B0 Step 1 already does; B0 Step 2 likely keeps it that way until there's a compelling reason to thread panics through the Frame layer. Decision deferred to the first time a panic needs to do anything more than print-and-halt.
 - **Should `$Running` actually be one state or split into `$Idle` (no work pending) and `$Processing` (handling an interrupt)?** Today's `$Running` is a sink; B1's needs are unclear. Will be revisited when `Scheduler.tick()` lands.
 - **Should the boot chain be reorderable?** Currently each child's `$>` hardcodes its next phase via `-> $NextPhase`. An alternative is a domain-level "next phase" pointer that the parent advances. The hardcoded chain is simpler and the order is genuinely fixed (memory before IDT, IDT before timer, etc.); the indirection would only pay off if phases became optional, which they aren't.
+- **Should the boot chain be synchronous (current) or event-stepped?** Today `__create()` drives the whole chain to `$Running` in one synchronous burst — each phase's `$>` transitions straight to the next. This is the simplest expression of "boot is a fixed sequence," but it has a testing consequence: the boot children are never externally observable, so the `=> $^` panic-forwarding from a boot child can't be exercised by a behavioral test (an external `kernel_panic()` only ever lands in `$Running`). An event-stepped alternative — a `step()` event that advances one phase at a time, with `__create()` leaving the kernel in `$InitMemory` — would make each child observable between steps and let a test fire `kernel_panic()` while in a boot child to assert forwarding. The cost is that `kmain` would have to pump `step()` in a loop instead of letting construction do it, and the "boot is one atomic sequence" intent would be slightly diluted. Deferred: the forwarding code is correct by construction (it's the only way `=> $^` can be expressed), the happy path is covered by both host and QEMU tests, and B1's scheduler may reshape `$Running`/boot interaction anyway. Revisit when a boot phase first needs to actually fail (e.g. `$InitMemory` finding no usable RAM region), since that's also the first time forwarding does real work.
 
 ## Related documents
 
@@ -191,3 +220,4 @@ When real init work lands, the pattern will be: `actions:` block delegates each 
 
 - **2026-05-19** — initial doc; HSM designed and SVG committed; Rust codegen pending framec #31.
 - **2026-05-20** — framec #31 fixed; B0 Step 2 landed. Kernel HSM now compiles into the `no_std` kernel and boots in QEMU; `boot_hsm_runs_init_chain_b0` smoke test validates the full boot chain.
+- **2026-05-20** — added the `frame-os-kernel-tests` host crate: state-graph snapshot (B0-1) + behavioral tests (B0-3 and `$Running`'s panic variant). Recorded that boot-child panic-forwarding isn't externally observable with the synchronous boot chain (Open questions).

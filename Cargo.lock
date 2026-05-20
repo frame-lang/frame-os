@@ -265,6 +265,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "frame-os-kernel-tests"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "insta",
+]
+
+[[package]]
 name = "frame-os-shared"
 version = "0.1.0"
 

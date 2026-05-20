@@ -1,0 +1,38 @@
+[package]
+name = "frame-os-kernel-tests"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+description = "Frame OS — host-target behavioral + snapshot tests for the kernel's Frame systems"
+
+# Why this crate exists:
+#
+# The `frame-os-kernel` crate is a `[[bin]]` that's `#![no_std]` +
+# `#![no_main]` and only builds for `x86_64-unknown-none`. It therefore
+# can't host normal `cargo test` integration tests (they compile for the
+# host, which has no bare-metal entry point and no `std`).
+#
+# This crate compiles the *same* `frame/kernel.frs` source for the host
+# (std) target and exercises the generated `Kernel` system directly. It
+# supplies its own `serial` module that *captures* output into a
+# thread-local buffer instead of writing to COM1 — the same "shared .frs,
+# different action implementations per target" pattern the roadmap calls
+# for when `Shell`/`Parser` are reused in the kernel at B2.
+#
+# framec's generated code is target-agnostic (it uses alloc::/core:: paths
+# that resolve under both std and no_std), so the only difference between
+# this crate's `Kernel` and the kernel bin's `Kernel` is which `serial`
+# the actions call.
+
+[lib]
+path = "src/lib.rs"
+
+[build-dependencies]
+# build.rs invokes framec on frame/kernel.frs, mirroring the kernel and
+# shell crates.
+anyhow = { workspace = true }
+
+[dev-dependencies]
+insta = { workspace = true }
