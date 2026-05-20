@@ -96,6 +96,7 @@
 
                 self.current_builtin = classify(tokens);
                 let unknown = is_unknown(&self.current_builtin);
+                let fg = is_fg(&self.current_builtin);
 
                 if unknown && background {
                     // Background external command. Spawn and stay $Prompting.
@@ -109,10 +110,37 @@
                     self.job_control.spawn_foreground(cmd, args);
                     self.last_foreground_id = self.job_control.foreground_id();
                     -> $RunningForeground
+                } else if fg && background {
+                    // `fg &` is meaningless; reject.
+                    println!("fg: cannot run fg in the background");
+                    -> $Prompting
+                } else if fg {
+                    // `fg <id>` resumes a stopped or background job into
+                    // the foreground, then waits on it. Has its own
+                    // dispatch because it must transition to
+                    // $RunningForeground (not $RunningBuiltin).
+                    let arg = match &self.current_builtin {
+                        Builtin::Fg(a) => a.clone(),
+                        _ => None,
+                    };
+                    if let Some(id) = arg.as_deref().and_then(|s| s.parse::<u32>().ok()) {
+                        self.job_control.fg(id);
+                        if self.job_control.is_running_foreground() {
+                            self.last_foreground_id = self.job_control.foreground_id();
+                            self.history.push(self.current_line.clone());
+                            -> $RunningForeground
+                        } else {
+                            println!("fg: no such job: {}", id);
+                            -> $Prompting
+                        }
+                    } else {
+                        println!("fg: missing or invalid job id");
+                        self.history.push(self.current_line.clone());
+                        -> $Prompting
+                    }
                 } else if background {
-                    // Background builtin — H3 doesn't support it.
-                    // Real bash runs `pwd &` as a one-shot sub-shell; we
-                    // don't. Print a message and skip the run.
+                    // Background builtin (other than fg/bg/wait/kill which
+                    // wouldn't make sense backgrounded anyway). Reject.
                     println!("frame-os: background builtins are not supported");
                     -> $Prompting
                 } else {
@@ -141,7 +169,12 @@
 
         $RunningBuiltin {
             $>() {
-                execute(&self.current_builtin, &mut self.cwd, &self.history);
+                execute(
+                    &self.current_builtin,
+                    &mut self.cwd,
+                    &self.history,
+                    &mut self.job_control,
+                );
                 self.history.push(self.current_line.clone());
                 -> $Prompting
             }

@@ -14,6 +14,7 @@
 // $Prompting). This split keeps the Frame system focused on lifecycle
 // dispatch and leaves the data work to ordinary Rust.
 
+use crate::JobControl;
 use std::path::{Path, PathBuf};
 
 /// A classified user command, ready for execution.
@@ -22,10 +23,13 @@ use std::path::{Path, PathBuf};
 /// only" — the classifier returns `Empty` rather than panicking on an
 /// empty token list.
 ///
-/// `Unknown` carries the original command name (for the error message)
-/// and the args. At H1 it just prints "unknown command: <name>". At H2
-/// it will hand `(name, args)` to `std::process::Command` for external
-/// execution.
+/// `Unknown(name, args)` carries the original command and is routed by
+/// Shell.$Parsing.$> to JobControl.spawn_foreground or
+/// JobControl.spawn_background (depending on trailing `&`) at H2+.
+///
+/// `Jobs`/`Fg`/`Bg`/`Wait`/`Kill` arrived at H3 Step 4. They take an
+/// `Option<String>` for the job id arg so `execute_*` can parse and
+/// surface usage errors uniformly.
 #[derive(Debug, Clone)]
 pub enum Builtin {
     Cd(Option<String>),
@@ -35,6 +39,11 @@ pub enum Builtin {
     Echo(Vec<String>),
     History,
     Help,
+    Jobs,
+    Fg(Option<String>),
+    Bg(Option<String>),
+    Wait(Option<String>),
+    Kill(Option<String>),
     Empty,
     Unknown(String, Vec<String>),
 }
@@ -77,16 +86,38 @@ pub fn classify(tokens: Vec<String>) -> Builtin {
         "echo" => Builtin::Echo(args),
         "history" => Builtin::History,
         "help" => Builtin::Help,
+        "jobs" => Builtin::Jobs,
+        "fg" => Builtin::Fg(first_arg()),
+        "bg" => Builtin::Bg(first_arg()),
+        "wait" => Builtin::Wait(first_arg()),
+        "kill" => Builtin::Kill(first_arg()),
         _ => Builtin::Unknown(cmd, args),
     }
 }
 
+/// True iff this builtin is the foreground-resuming kind that needs Shell
+/// to transition into `$RunningForeground` to wait on it. Currently just
+/// `Fg`. Used by Shell.$Parsing.$> to gate the special-case routing for
+/// resumed-foreground builtins; everything else flows through `execute()`
+/// and the normal `$RunningBuiltin` → `$Prompting` cycle.
+pub fn is_fg(b: &Builtin) -> bool {
+    matches!(b, Builtin::Fg(_))
+}
+
 /// Execute a Builtin.
 ///
-/// `cwd` is mutable because `Cd` updates it. `history` is read-only
-/// because the `History` builtin only displays it — appending happens
-/// in Shell's `$RunningBuiltin.$>` after `execute()` returns.
-pub fn execute(builtin: &Builtin, cwd: &mut PathBuf, history: &[String]) {
+/// `cwd` is mutable because `Cd` updates it. `history` is read-only —
+/// appending happens in Shell's `$RunningBuiltin.$>` after `execute()`
+/// returns. `job_control` is mutable because the H3 Step 4 builtins
+/// (`jobs`, `bg`, `wait`, `kill`) operate against it. `Fg` is NOT
+/// dispatched here — it has its own path in Shell.$Parsing.$> because
+/// it needs to transition Shell to `$RunningForeground`.
+pub fn execute(
+    builtin: &Builtin,
+    cwd: &mut PathBuf,
+    history: &[String],
+    job_control: &mut JobControl,
+) {
     match builtin {
         Builtin::Cd(path) => execute_cd(path.as_deref(), cwd),
         Builtin::Pwd => println!("{}", cwd.display()),
@@ -95,21 +126,26 @@ pub fn execute(builtin: &Builtin, cwd: &mut PathBuf, history: &[String]) {
         Builtin::Echo(args) => println!("{}", args.join(" ")),
         Builtin::History => execute_history(history),
         Builtin::Help => execute_help(),
+        Builtin::Jobs => execute_jobs(job_control),
+        Builtin::Bg(arg) => execute_bg(arg.as_deref(), job_control),
+        Builtin::Wait(arg) => execute_wait(arg.as_deref(), job_control),
+        Builtin::Kill(arg) => execute_kill(arg.as_deref(), job_control),
         Builtin::Empty => {
             // Nothing to do. Reached when the user input parsed to zero
             // tokens (e.g. whitespace-only that somehow got past the
             // empty-trim check in $Prompting). Documented as a deliberate
             // no-op so future readers don't add an error path.
         }
+        Builtin::Fg(_) => {
+            // Unreachable: $Parsing.$> special-cases Builtin::Fg before
+            // routing through $RunningBuiltin. It calls JobControl.fg(id)
+            // directly and either transitions to $RunningForeground or
+            // prints a usage error and stays $Prompting. If we got here,
+            // something is mis-wired.
+            unreachable!("Builtin::Fg should be handled by Shell.$Parsing.$>, not execute()");
+        }
         Builtin::Unknown(_, _) => {
-            // Unreachable: $Parsing routes Builtin::Unknown to
-            // $RunningExternal at H2, which handles it via
-            // Shell::run_external(). The dispatcher here is the
-            // $RunningBuiltin code path, so this arm should never be hit.
-            // Kept as a defensive panic so a future refactor that
-            // accidentally routes Unknown back through $RunningBuiltin
-            // surfaces immediately.
-            unreachable!("Builtin::Unknown should be handled by $RunningExternal, not execute()");
+            unreachable!("Builtin::Unknown should be handled by $RunningForeground, not execute()");
         }
     }
 }
@@ -206,9 +242,8 @@ fn execute_history(history: &[String]) {
 }
 
 fn execute_help() {
-    // Keep this list in sync with the Builtin enum variants. Order is the
-    // order a reader is likely to need them: navigation, listing, reading,
-    // output, history, meta.
+    // Keep this list in sync with the Builtin enum variants. Order is
+    // navigation → listing → reading → output → history → job control → meta.
     println!("Available commands:");
     println!("  cd [path]      change directory (defaults to $HOME)");
     println!("  pwd            print current working directory");
@@ -216,8 +251,73 @@ fn execute_help() {
     println!("  cat <file>     print file contents");
     println!("  echo <args...> print arguments separated by spaces");
     println!("  history        show command history");
+    println!("  jobs           list running, stopped, and completed jobs");
+    println!("  fg <id>        bring job <id> to the foreground");
+    println!("  bg <id>        resume stopped job <id> in the background");
+    println!("  wait <id>      block until job <id> completes");
+    println!("  kill <id>      SIGKILL job <id>");
     println!("  help           show this list");
     println!("  exit | quit    leave the shell");
+    println!();
+    println!("Append `&` to any external command to launch it in the background.");
+}
+
+fn execute_jobs(job_control: &mut JobControl) {
+    let summaries = job_control.jobs();
+    if summaries.is_empty() {
+        return;
+    }
+    for s in summaries.iter() {
+        // bash-ish layout: "[N]  State  cmd". State column is fixed-width
+        // for alignment across rows.
+        println!("[{}]  {:<10}  {}", s.id, s.state, s.cmd);
+    }
+}
+
+/// Parse a "fg/bg/wait/kill <id>" argument string. Returns the id on
+/// success; prints a usage/error message and returns None on failure.
+fn parse_job_id(arg: Option<&str>, builtin_name: &str) -> Option<u32> {
+    let raw = match arg {
+        Some(s) => s,
+        None => {
+            println!("{builtin_name}: missing job id");
+            return None;
+        }
+    };
+    match raw.parse::<u32>() {
+        Ok(id) => Some(id),
+        Err(_) => {
+            println!("{builtin_name}: invalid job id: {raw}");
+            None
+        }
+    }
+}
+
+fn execute_bg(arg: Option<&str>, job_control: &mut JobControl) {
+    let id = match parse_job_id(arg, "bg") {
+        Some(id) => id,
+        None => return,
+    };
+    job_control.bg(id);
+    // JobControl.bg is a no-op if id doesn't exist or is Done. We can't
+    // distinguish "resumed" from "no-op" without checking; for H3 minimum
+    // we don't bother — user can run `jobs` to see the current state.
+}
+
+fn execute_wait(arg: Option<&str>, job_control: &mut JobControl) {
+    let id = match parse_job_id(arg, "wait") {
+        Some(id) => id,
+        None => return,
+    };
+    job_control.wait_for(id);
+}
+
+fn execute_kill(arg: Option<&str>, job_control: &mut JobControl) {
+    let id = match parse_job_id(arg, "kill") {
+        Some(id) => id,
+        None => return,
+    };
+    job_control.kill_job(id);
 }
 
 #[cfg(test)]
@@ -307,5 +407,59 @@ mod tests {
             }
             other => panic!("expected Unknown, got {other:?}"),
         }
+    }
+
+    // H3 Step 4 — job-control builtin variants
+
+    #[test]
+    fn classifies_jobs() {
+        assert!(matches!(classify(toks(&["jobs"])), Builtin::Jobs));
+    }
+
+    #[test]
+    fn classifies_fg_with_id() {
+        match classify(toks(&["fg", "3"])) {
+            Builtin::Fg(Some(id)) => assert_eq!(id, "3"),
+            other => panic!("expected Fg(Some), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classifies_fg_no_arg() {
+        assert!(matches!(classify(toks(&["fg"])), Builtin::Fg(None)));
+    }
+
+    #[test]
+    fn classifies_bg_with_id() {
+        match classify(toks(&["bg", "2"])) {
+            Builtin::Bg(Some(id)) => assert_eq!(id, "2"),
+            other => panic!("expected Bg(Some), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classifies_wait_with_id() {
+        match classify(toks(&["wait", "5"])) {
+            Builtin::Wait(Some(id)) => assert_eq!(id, "5"),
+            other => panic!("expected Wait(Some), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classifies_kill_with_id() {
+        match classify(toks(&["kill", "1"])) {
+            Builtin::Kill(Some(id)) => assert_eq!(id, "1"),
+            other => panic!("expected Kill(Some), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn is_fg_distinguishes_fg_from_other_builtins() {
+        assert!(is_fg(&Builtin::Fg(Some("1".to_string()))));
+        assert!(is_fg(&Builtin::Fg(None)));
+        assert!(!is_fg(&Builtin::Bg(None)));
+        assert!(!is_fg(&Builtin::Jobs));
+        assert!(!is_fg(&Builtin::Pwd));
+        assert!(!is_fg(&Builtin::Unknown("x".to_string(), vec![])));
     }
 }
