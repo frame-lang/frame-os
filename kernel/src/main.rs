@@ -34,6 +34,7 @@ mod interrupts;
 mod io;
 mod pic;
 mod pit;
+mod sched;
 mod sched_demo;
 mod serial;
 
@@ -121,9 +122,13 @@ unsafe extern "C" fn kmain() -> ! {
 
     // B1 Step 2: demonstrate the native cooperative context switch — two
     // kernel threads ping-pong on independent stacks and hand control back.
-    // Transitional; Step 3 replaces this with the timer ISR driving the
-    // Frame Scheduler for real preemption.
+    // Transitional; superseded by the preemptive scheduler below.
     sched_demo::run();
+
+    // B1 Step 3c: real preemption. Two threads busy-loop and print without
+    // ever yielding; the timer ISR preempts them round-robin. Both digits
+    // appearing proves preemption works.
+    sched::run();
 
     halt_forever();
 }

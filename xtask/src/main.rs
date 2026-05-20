@@ -454,6 +454,21 @@ const SMOKE_TESTS: &[SmokeTest] = &[
         expect_absent: &["KERNEL PANIC", "triple fault"],
         timeout_secs: 20,
     },
+    SmokeTest {
+        // B1 Step 3c: preemptive multitasking. Two threads busy-loop and
+        // print '1'/'2' WITHOUT ever yielding — the only thing that can let
+        // both make progress is the timer ISR preempting them. "1212"
+        // (repeated alternation) is the proof; a single thread monopolizing
+        // the CPU (no preemption) would print only one digit.
+        name: "preemption_b1",
+        expect_contains: &[
+            "[preempt] starting two non-yielding threads",
+            "1212",
+            "[preempt] done",
+        ],
+        expect_absent: &["KERNEL EXCEPTION", "KERNEL PANIC", "triple fault"],
+        timeout_secs: 20,
+    },
 ];
 
 fn run_qemu_test() -> Result<()> {

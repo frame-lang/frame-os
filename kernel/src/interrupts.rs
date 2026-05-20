@@ -119,28 +119,50 @@ global_asm!(
     "  pop rcx",
     "  pop rax",
     "  iretq",
-    // Timer IRQ0 (vector 32): save caller-saved GPRs, tick + EOI, restore,
-    // iretq. Sub-step 3b counts only (no thread switch yet).
+    // Timer IRQ0 (vector 32), full-frame preemptive switch (3c). Save ALL
+    // 15 GPRs on top of the CPU's iretq frame, pass rsp to `schedule`,
+    // switch rsp to whatever `schedule` returns (the next thread, or the
+    // same context when preemption is inactive), restore the 15 GPRs,
+    // iretq. `schedule` does the tick count + PIC EOI.
+    //
+    // The interrupted rsp is arbitrary, so `and rsp, -16` aligns the stack
+    // for the SysV `call` (schedule's Rust frame may use SSE). rdi already
+    // holds the real rsp; we overwrite rsp with schedule's return anyway.
     ".global isr_timer",
     "isr_timer:",
     "  push rax",
+    "  push rbx",
     "  push rcx",
     "  push rdx",
     "  push rsi",
     "  push rdi",
+    "  push rbp",
     "  push r8",
     "  push r9",
     "  push r10",
     "  push r11",
-    "  call timer_tick",
+    "  push r12",
+    "  push r13",
+    "  push r14",
+    "  push r15",
+    "  mov rdi, rsp", // arg0 = current rsp (points at saved r15)
+    "  and rsp, -16", // align for the call
+    "  call schedule",
+    "  mov rsp, rax", // switch to the chosen thread's stack
+    "  pop r15",
+    "  pop r14",
+    "  pop r13",
+    "  pop r12",
     "  pop r11",
     "  pop r10",
     "  pop r9",
     "  pop r8",
+    "  pop rbp",
     "  pop rdi",
     "  pop rsi",
     "  pop rdx",
     "  pop rcx",
+    "  pop rbx",
     "  pop rax",
     "  iretq",
 );
@@ -161,8 +183,10 @@ extern "C" fn breakpoint_handler() {
     serial::write_str("[int3 ok]");
 }
 
-#[no_mangle]
-extern "C" fn timer_tick() {
+/// Record a timer tick and acknowledge the PIC. Called by `schedule` (the
+/// timer ISR's Rust half) on every IRQ0, whether or not a thread switch
+/// happens.
+pub fn record_tick() {
     TICKS.fetch_add(1, Ordering::Relaxed);
     crate::pic::eoi_master();
 }
