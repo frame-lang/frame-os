@@ -195,7 +195,7 @@ H3 is the H-track's final committed milestone. Further H-track work (a configura
 - Host-side QEMU test driver that invokes QEMU, captures serial output, parses markers
 
 **Test infrastructure added at B0:**
-- `kernel/tests/qemu_smoke.rs` with QEMU smoke tests (Level 7)
+- QEMU smoke tests (Level 7) driven by `cargo xtask qemu-test`. The smoke tests live in the xtask harness (`xtask/src/main.rs`, the `SMOKE_TESTS` table + `run_smoke_test`) rather than a `kernel/tests/qemu_smoke.rs` integration-test file. The kernel crate is `[[bin]] + #![no_std] + #![no_main]` for `x86_64-unknown-none` and can't host host-target `cargo test` integration tests, so the smoke runner is an xtask subcommand that boots QEMU, captures serial to a file, and asserts on substrings. (The original roadmap named `kernel/tests/qemu_smoke.rs`; that location doesn't work given the bare-metal crate constraints, so the harness moved to xtask. The behavior — boot, capture, assert — is unchanged.)
 - `cargo xtask qemu-test` subcommand wired in (was a stub)
 - State-graph snapshot tests for `Kernel` and `SerialDriver`
 - Per-system docs for `Kernel` and `SerialDriver` written from the template
@@ -210,15 +210,22 @@ H3 is the H-track's final committed milestone. Further H-track work (a configura
 | B0-4 | `Kernel.panic_event()` from any boot child forwards to `$Booting` parent's panic handler (HSM forwarding test) | Behavioral `panic_in_init_memory_forwards_to_booting_parent`, `panic_in_init_idt_forwards_to_booting_parent`, etc. — one per child |
 | B0-5 | `SerialDriver` correctly transitions on `write_byte` events | Behavioral tests in `kernel/tests/serial_driver_behavior.rs` |
 | B0-6 | `cargo xtask qemu` boots the kernel image in QEMU x86_64 (no automated assertion; manual smoke) | **Manual** — maintainer runs the command, observes banner on serial console, halts cleanly |
-| B0-7 | `cargo xtask qemu-test` runs the kernel image in QEMU, parses pass/fail markers from serial output, and exits 0 on success | `cargo xtask qemu-test` itself, exercised in CI on Linux only (QEMU is most reliable there) |
-| B0-8 | The kernel banner appears on serial output during a QEMU boot | QEMU smoke test `boot_prints_banner_b0` (Level 7, [`kernel/tests/qemu_smoke.rs`](../kernel/tests/qemu_smoke.rs)) |
-| B0-9 | The kernel halts cleanly (returns to `hlt` loop) after init | QEMU smoke test `kernel_halts_cleanly_b0` (uses `isa-debug-exit` to surface the exit code) |
-| B0-10 | The boot sequence is the HSM, not a script of init calls (Frame argument check) | Code review: `kernel/src/boot.rs` calls `kernel.boot()` and lets the HSM drive; no manual sequence of init steps |
-| B0-11 | `Kernel` and `SerialDriver` SVG diagrams committed and current | `cargo xtask check-diagrams` |
-| B0-12 | Per-system docs for `Kernel` and `SerialDriver` exist and follow the template | Review check |
-| B0-13 | All CI quality gates pass, plus `cargo xtask qemu-test` on Linux | Full CI matrix + new Linux-only kernel CI job |
+| B0-7 | `cargo xtask qemu-test` runs the kernel image in QEMU, captures serial output, and exits 0 on success / non-zero on assertion failure | `cargo xtask qemu-test` itself, exercised in CI on Linux only (QEMU is most reliable there) — **done at Step 4** |
+| B0-8 | The kernel banner appears on serial output during a QEMU boot | QEMU smoke test `boot_prints_banner_b0` (Level 7, in `xtask/src/main.rs`'s `SMOKE_TESTS` table) — **done at Step 4** |
+| B0-9 | The kernel halts cleanly (returns to `hlt` loop) after init | Covered indirectly: the smoke tests assert the boot chain completes (`[run] kernel running`) with no panic/triple-fault markers, and QEMU stays alive (it's SIGKILLed at timeout, not crashed). A dedicated `kernel_halts_cleanly_b0` with `isa-debug-exit` exit-code assertion lands once a `smoke-test` Cargo feature gates the kernel's `isa-debug-exit` path (deferred — see the smoke-test module comment in `xtask/src/main.rs`) |
+| B0-10 | The boot sequence is the HSM, not a script of init calls (Frame argument check) | Code review: `kmain` calls `Kernel::__create()` and lets the HSM drive; no manual sequence of init steps. **Done at Step 2** — `kernel/src/main.rs` has no init-call script; the `-> $NextPhase` transitions in `frame/kernel.frs` encode the order |
+| B0-11 | `Kernel` (and later `SerialDriver`) SVG diagrams committed and current | `cargo xtask check-diagrams` — `kernel.svg` **done**; `serial_driver.svg` lands at Step 3 |
+| B0-12 | Per-system docs for `Kernel` (and later `SerialDriver`) exist and follow the template | Review check — `docs/systems/kernel.md` **done**; `serial_driver.md` lands at Step 3 |
+| B0-13 | All CI quality gates pass, plus `cargo xtask qemu-test` on Linux | Full CI matrix + Linux-only `qemu-test` CI job — **done at Step 4** |
 
 **Estimated effort:** Three to four weeks. The boot stub, Limine integration, *and* the QEMU test plumbing are the biggest risks. Plan for the QEMU test infrastructure to take a meaningful slice of the milestone — it's reused for every later kernel milestone, so investing in it once pays off.
+
+**Status:** In progress.
+- **Step 1 (boots and halts):** Done. Kernel boots in QEMU via Limine UEFI, prints banner to COM1 serial, halts. See commit `e8828fb`.
+- **Step 2 (Kernel HSM):** Done. `frame/kernel.frs` compiles into the `no_std` kernel (framec issue #31, which had hardcoded `std::` paths, is fixed — framec now emits `alloc::`/`core::`). `kmain` calls `Kernel::__create()`, which synchronously drives the boot chain through all five init phases to `$Running`. Validated end-to-end by the `boot_hsm_runs_init_chain_b0` QEMU smoke test. Per-system doc and SVG committed. **Remaining for full B0-1/B0-3/B0-4 closure:** host-target behavioral + snapshot tests, which need a separate test crate (the kernel bin can't host `cargo test`).
+- **Step 3 (SerialDriver FSM):** Not started. Will replace the inline `serial::*` calls in `Kernel`'s actions with a `SerialDriver` Frame system; another `no_std` Frame system, now unblocked.
+- **Step 4 (QEMU smoke test harness):** Done. `cargo xtask qemu-test` boots the kernel headlessly, captures serial to file, asserts substrings appear and no panic markers do. Two tests: `boot_prints_banner_b0` (banner) and `boot_hsm_runs_init_chain_b0` (full HSM chain in order). Wired into CI as a Linux-only `qemu-test` job.
+- B0 is **not complete** until Steps 2–3 land their host-target behavioral + snapshot tests (B0-1..B0-5) and Step 3's `SerialDriver`.
 
 ### B1 — multitasking scheduler
 

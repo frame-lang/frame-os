@@ -1,0 +1,138 @@
+// frame/kernel.frs
+//
+// Kernel — top-level boot / run / halt lifecycle (B0 Step 2).
+//
+// First hierarchical state machine (HSM) in the project. `$Booting` is
+// a parent state with five init-phase children; `$Running` is a peer;
+// `$Halted` is the terminal sink.
+//
+// State graph (parent boxes shown with their children):
+//
+//   ┌─────────────────────────────────────────────┐
+//   │ $Booting                                    │
+//   │                                             │
+//   │   $InitMemory ──$>──► $InitIDT ──$>──►      │
+//   │   $InitTimer ──$>──► $InitConsole ──$>──►   │
+//   │   $LaunchInit                               │
+//   │                                             │
+//   └─────────────────────────────────────────────┘
+//                            │ $LaunchInit.$> finishes
+//                            ▼
+//                    ┌──────────────┐
+//                    │   $Running   │
+//                    └──────────────┘
+//                            │ panic OR explicit halt
+//                            ▼
+//                    ┌──────────────┐
+//                    │   $Halted    │  (terminal)
+//                    └──────────────┘
+//
+// The Frame argument here: kernel_panic(msg) is a single event with
+// state-dependent handling. From any boot child it forwards (via the
+// state-level `=> $^`) to $Booting's handler which prints "PANIC during
+// boot: ..." and transitions to $Halted. From $Running it has its own
+// handler that prints "PANIC during runtime: ..." and transitions. The
+// SAME event, dispatched differently per state — without the HSM
+// forwarding we'd duplicate the panic-handler in five init-child
+// implementations.
+//
+// At B0 Step 2 the init phases are stubs that just print their name to
+// serial and transition to the next phase. Real init work (paging,
+// GDT/IDT, timer setup, UART config) lands at B1+ when the scheduler
+// needs it. This commit demonstrates the HSM scaffold; the work the
+// scaffold orchestrates is future.
+
+@@[target("rust")]
+
+@@system Kernel {
+    interface:
+        // Manually-firable panic event (Rust's #[panic_handler] is global
+        // and can't easily route here without a global Kernel reference;
+        // we'll wire that at a later step). For now this is reachable via
+        // direct calls from any code that holds a &mut Kernel.
+        kernel_panic(msg: String)
+        is_done(): bool = false
+
+    machine:
+        // Boot chain children. Each phase's $> handler is the init work
+        // for that phase + the transition to the next phase. The
+        // state-level `=> $^` forwards any non-$> events (specifically
+        // kernel_panic) to $Booting's handler.
+
+        $InitMemory => $Booting {
+            $>() {
+                serial::writeln("[boot] init memory");
+                -> $InitIDT
+            }
+            => $^
+        }
+
+        $InitIDT => $Booting {
+            $>() {
+                serial::writeln("[boot] init IDT");
+                -> $InitTimer
+            }
+            => $^
+        }
+
+        $InitTimer => $Booting {
+            $>() {
+                serial::writeln("[boot] init timer");
+                -> $InitConsole
+            }
+            => $^
+        }
+
+        $InitConsole => $Booting {
+            $>() {
+                serial::writeln("[boot] init console");
+                -> $LaunchInit
+            }
+            => $^
+        }
+
+        $LaunchInit => $Booting {
+            $>() {
+                serial::writeln("[boot] launching init");
+                -> $Running
+            }
+            => $^
+        }
+
+        // The parent. Has the panic handler that init children forward to.
+        $Booting {
+            kernel_panic(msg: String) {
+                serial::write_str("\nKERNEL PANIC during boot: ");
+                serial::writeln(&msg);
+                -> $Halted
+            }
+        }
+
+        // Peer state. After boot we sit here forever (B0 Step 2 doesn't
+        // have a scheduler yet). Panic during runtime has its own handler
+        // distinct from $Booting's — same event, different per-state
+        // dispatch: this is the Frame argument made concretely.
+        $Running {
+            $>() {
+                serial::writeln("[run] kernel running");
+            }
+
+            kernel_panic(msg: String) {
+                serial::write_str("\nKERNEL PANIC during runtime: ");
+                serial::writeln(&msg);
+                -> $Halted
+            }
+        }
+
+        // Terminal. is_done is the only override; kmain checks this and
+        // calls halt_forever() when true. (Could also call halt from
+        // $Halted.$>, but keeping the halt in main.rs lets the kernel
+        // be unit-testable in a future host-side test harness.)
+        $Halted {
+            $>() {
+                serial::writeln("[halted]");
+            }
+
+            is_done(): bool { @@:(true) }
+        }
+}

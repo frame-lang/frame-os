@@ -57,8 +57,7 @@ jobs:
         run: cargo test --workspace --exclude frame-os-kernel
 
   # Kernel cross-build: ensures the bare-metal kernel compiles for its
-  # target. Doesn't actually boot it (that would need QEMU + Limine, which
-  # is covered by `xtask qemu-test` once that lands at B0 Step 4).
+  # target. Doesn't actually boot it; that's the qemu-test job below.
   kernel-build:
     name: kernel build (x86_64-unknown-none)
     runs-on: ubuntu-latest
@@ -78,6 +77,51 @@ jobs:
           key: ${{ runner.os }}-kernel-cargo-${{ hashFiles('**/Cargo.lock') }}
       - name: Build kernel
         run: cargo build -p frame-os-kernel --target x86_64-unknown-none
+
+  # QEMU smoke tests — boot the kernel under headless QEMU UEFI, assert
+  # the captured serial output contains the expected banner and no
+  # panic markers. Runs only on Linux because QEMU is most reliable
+  # there in CI (macOS would need OVMF firmware paths from brew, which
+  # GitHub's macOS runners don't ship by default). The xtask
+  # subcommand fetches Limine binaries on first run and caches them.
+  qemu-test:
+    name: qemu smoke tests
+    runs-on: ubuntu-latest
+    needs: kernel-build
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-none
+      - name: Install QEMU + OVMF + mtools
+        # qemu-system-x86 ships qemu-system-x86_64; ovmf provides
+        # /usr/share/OVMF/OVMF_CODE.fd + OVMF_VARS.fd which find_ovmf
+        # discovers via the /usr/share/OVMF candidate path.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y qemu-system-x86 ovmf mtools
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-qemu-test-${{ hashFiles('**/Cargo.lock') }}
+      - name: Cache Limine binaries
+        uses: actions/cache@v4
+        with:
+          path: target/limine
+          key: limine-v11.x-binary
+      - name: Run QEMU smoke tests
+        run: cargo xtask qemu-test
+      - name: Upload serial captures on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: qemu-smoke-serial-logs
+          path: target/qemu-smoke/*.log
 
   # Diagram drift check — runs only on Linux because GraphViz is easiest to
   # install there in CI. The check is the same on every platform, so this

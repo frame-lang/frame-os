@@ -10,15 +10,17 @@
 //   check-diagrams    — regenerate state-graph SVGs and assert no drift
 //   regen-diagrams    — regenerate state-graph SVGs (commits the new content)
 //   qemu              — boot the bare-metal kernel in QEMU x86_64 via Limine UEFI
-//   qemu-test         — run kernel QEMU smoke tests (stub until B0 Step 4)
+//   qemu-test         — run kernel QEMU smoke tests (B0 Step 4+)
 //
 // Adding a new subcommand:
 //   1. Add a variant to the Subcommand enum
 //   2. Add its handler match arm in main()
 //   3. Document it in the doc comment above
 
+use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Context, Result};
 use clap::{Parser, Subcommand};
@@ -55,10 +57,14 @@ enum SubCmd {
     /// Run this locally after intentional .frs changes, then commit the new SVGs.
     RegenDiagrams,
 
-    /// Boot the bare-metal kernel in QEMU. (Stub until B0 lands.)
+    /// Boot the bare-metal kernel in QEMU x86_64 via Limine UEFI.
+    /// Serial is routed to stdio; Ctrl-A x quits QEMU.
     Qemu,
 
-    /// Run the bare-metal kernel's QEMU smoke tests. (Stub until B0 lands.)
+    /// Run the bare-metal kernel's QEMU smoke tests headlessly.
+    /// Each test boots the kernel, captures serial output to file,
+    /// and asserts expected substrings appear (and panic markers
+    /// do not). Fails the whole run non-zero if any test fails.
     QemuTest,
 }
 
@@ -146,6 +152,7 @@ const DIAGRAMS: &[(&str, &str)] = &[
     ("parser.frs", "parser.svg"),
     ("job.frs", "job.svg"),
     ("job_control.frs", "job_control.svg"),
+    ("kernel.frs", "kernel.svg"),
 ];
 
 fn diagrams(mode: DiagramMode) -> Result<()> {
@@ -261,41 +268,75 @@ fn is_dot_installed() -> bool {
 const LIMINE_BINARY_BRANCH: &str = "v11.x-binary";
 const LIMINE_REPO: &str = "https://github.com/limine-bootloader/limine.git";
 
-fn run_qemu() -> Result<()> {
-    let workspace = workspace_root()?;
+/// Artifacts needed by every QEMU invocation: built kernel ELF, OVMF
+/// firmware (read-only code + writable NVRAM vars copy), and the ESP
+/// disk image that Limine boots from. Produced once per `cargo xtask`
+/// run and reused across each smoke test in a `qemu-test` batch.
+struct QemuArtifacts {
+    esp_img: PathBuf,
+    ovmf_code: PathBuf,
+    /// A writable copy of QEMU's read-only vars template. QEMU needs
+    /// this writable because UEFI mutates NVRAM during boot.
+    ovmf_vars: PathBuf,
+}
 
-    let kernel_elf = build_kernel(&workspace)?;
-    let limine_dir = ensure_limine_binaries(&workspace)?;
-    let esp_img = build_esp_image(&workspace, &kernel_elf, &limine_dir)?;
+fn prepare_qemu_artifacts(workspace: &Path) -> Result<QemuArtifacts> {
+    let kernel_elf = build_kernel(workspace)?;
+    let limine_dir = ensure_limine_binaries(workspace)?;
+    let esp_img = build_esp_image(workspace, &kernel_elf, &limine_dir)?;
 
     let (ovmf_code, ovmf_vars_template) = find_ovmf()?;
     let ovmf_vars = workspace.join("target").join("qemu").join("ovmf-vars.fd");
     std::fs::create_dir_all(ovmf_vars.parent().unwrap())?;
     if !ovmf_vars.exists() {
-        // OVMF vars file must be writable; copy QEMU's read-only template.
         std::fs::copy(&ovmf_vars_template, &ovmf_vars)
             .with_context(|| format!("failed to copy {}", ovmf_vars_template.display()))?;
     }
 
-    eprintln!("booting kernel in QEMU (Ctrl-C or Ctrl-A x to quit)...");
-    let status = Command::new("qemu-system-x86_64")
-        .args(["-machine", "q35", "-cpu", "qemu64", "-m", "256M"])
+    Ok(QemuArtifacts {
+        esp_img,
+        ovmf_code,
+        ovmf_vars,
+    })
+}
+
+/// Build a QEMU `Command` with the standard machine + firmware + disk
+/// arguments. Callers add the serial routing they want
+/// (`-serial stdio` for interactive, `-serial file:<path>` for smoke
+/// tests) and then either spawn or run.
+fn qemu_base_command(artifacts: &QemuArtifacts) -> Command {
+    let mut cmd = Command::new("qemu-system-x86_64");
+    cmd.args(["-machine", "q35", "-cpu", "qemu64", "-m", "256M"])
         // UEFI firmware (split into read-only code + writable NVRAM).
         .args(["-drive"])
         .arg(format!(
             "if=pflash,format=raw,readonly=on,file={}",
-            ovmf_code.display()
+            artifacts.ovmf_code.display()
         ))
         .args(["-drive"])
-        .arg(format!("if=pflash,format=raw,file={}", ovmf_vars.display()))
+        .arg(format!(
+            "if=pflash,format=raw,file={}",
+            artifacts.ovmf_vars.display()
+        ))
         // Boot drive — real FAT image with our ESP layout.
         .args(["-drive"])
-        .arg(format!("format=raw,file={}", esp_img.display()))
-        // No graphical window; serial to stdio so the kernel banner
-        // appears in the terminal where xtask ran.
-        .args(["-display", "none", "-serial", "stdio"])
-        // Don't reboot on triple fault; hold QEMU open after halt.
-        .args(["-no-reboot", "-no-shutdown"])
+        .arg(format!("format=raw,file={}", artifacts.esp_img.display()))
+        .args(["-display", "none"])
+        // Don't reboot on triple fault; hold QEMU open after halt so
+        // smoke tests can read the full serial log instead of racing
+        // QEMU's exit.
+        .args(["-no-reboot", "-no-shutdown"]);
+    cmd
+}
+
+fn run_qemu() -> Result<()> {
+    let workspace = workspace_root()?;
+    let artifacts = prepare_qemu_artifacts(&workspace)?;
+
+    eprintln!("booting kernel in QEMU (Ctrl-C or Ctrl-A x to quit)...");
+    let mut cmd = qemu_base_command(&artifacts);
+    cmd.args(["-serial", "stdio"]);
+    let status = cmd
         .status()
         .context("failed to invoke qemu-system-x86_64")?;
 
@@ -305,8 +346,199 @@ fn run_qemu() -> Result<()> {
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// QEMU smoke tests (B0 Step 4)
+//
+// The kernel boots, the Kernel HSM drives its init chain to $Running,
+// then kmain parks the CPU in a `hlt` loop — there's no `isa-debug-exit`
+// plumbing yet because adding that would require feature-gating the
+// kernel, and it isn't needed to validate B0's "boots, runs the boot
+// HSM, and rests" contract. Each smoke test launches QEMU, waits a fixed
+// timeout (plenty: boot → HSM chain → halt finishes in well under a
+// second), then SIGKILLs QEMU and reads the serial capture file.
+// Assertions are substring matches against the captured output.
+//
+// When B-track milestones land that need a clean pass/fail signal from
+// inside the kernel (e.g. behavioral tests of the boot HSM running in
+// QEMU), we'll add an `isa-debug-exit` path gated behind a `smoke-test`
+// Cargo feature on the kernel crate, and replace the timeout-and-kill
+// here with "wait for QEMU to exit; assert exit code". Deferring that
+// keeps Step 4 minimal: no kernel changes, just an xtask subcommand
+// that proves the smoke test infrastructure works.
+// ---------------------------------------------------------------------------
+
+/// A single QEMU smoke test. Each test runs the same kernel image (we
+/// have only one bare-metal binary) and checks that the captured serial
+/// output contains specific substrings. Substrings are checked in the
+/// order listed — a missing earlier substring stops the test there with
+/// a clear message.
+struct SmokeTest {
+    name: &'static str,
+    /// Substrings that MUST appear in the captured serial output.
+    /// Checked in order.
+    expect_contains: &'static [&'static str],
+    /// Substrings that MUST NOT appear. Useful for catching panics or
+    /// triple-faults that wouldn't fail an `expect_contains` check on
+    /// their own.
+    expect_absent: &'static [&'static str],
+    /// Wall-clock seconds to let QEMU run before killing it and
+    /// reading the serial capture. Should comfortably exceed the
+    /// kernel's expected runtime to print everything it'll print.
+    timeout_secs: u64,
+}
+
+const SMOKE_TESTS: &[SmokeTest] = &[
+    SmokeTest {
+        name: "boot_prints_banner_b0",
+        // The em dash is `\u{2014}` in the kernel source (bytes
+        // 0xe2 0x80 0x94 in the UTF-8 serial stream); literal here.
+        expect_contains: &["Frame OS kernel \u{2014} B0 Step 2", "entering boot HSM..."],
+        expect_absent: &["KERNEL PANIC", "triple fault"],
+        // 5s is plenty: kernel boots and prints in well under 1s; we
+        // pad heavily so a slow CI runner doesn't false-fail.
+        timeout_secs: 5,
+    },
+    SmokeTest {
+        // The Step 2 payload: the Kernel HSM drives the boot chain.
+        // Each `[boot] <phase>` line is one init child's `$>` enter
+        // handler firing, in transition order; `[run] kernel running`
+        // is `$Running`'s enter handler. Asserting them in order
+        // proves the whole HSM chain executed on bare metal, not just
+        // that the kernel booted.
+        name: "boot_hsm_runs_init_chain_b0",
+        expect_contains: &[
+            "[boot] init memory",
+            "[boot] init IDT",
+            "[boot] init timer",
+            "[boot] init console",
+            "[boot] launching init",
+            "[run] kernel running",
+        ],
+        expect_absent: &["KERNEL PANIC", "triple fault"],
+        timeout_secs: 5,
+    },
+];
+
 fn run_qemu_test() -> Result<()> {
-    bail!("cargo xtask qemu-test — not implemented yet (lands at B0 Step 4)");
+    let workspace = workspace_root()?;
+    let artifacts = prepare_qemu_artifacts(&workspace)?;
+
+    let serial_dir = workspace.join("target").join("qemu-smoke");
+    std::fs::create_dir_all(&serial_dir)
+        .with_context(|| format!("failed to create {}", serial_dir.display()))?;
+
+    let mut failures: Vec<String> = Vec::new();
+    let total = SMOKE_TESTS.len();
+
+    for test in SMOKE_TESTS {
+        eprintln!("smoke: {} ...", test.name);
+        let serial_path = serial_dir.join(format!("{}.log", test.name));
+        // Truncate any previous run's log; QEMU appends with `-serial
+        // file:`, which we want fresh per run.
+        if serial_path.exists() {
+            std::fs::remove_file(&serial_path).with_context(|| {
+                format!("failed to clear previous log {}", serial_path.display())
+            })?;
+        }
+
+        match run_smoke_test(test, &artifacts, &serial_path) {
+            Ok(()) => eprintln!("  PASS"),
+            Err(err) => {
+                eprintln!("  FAIL: {err}");
+                failures.push(format!("{}: {err}", test.name));
+            }
+        }
+    }
+
+    if failures.is_empty() {
+        eprintln!("\nqemu-test: {total}/{total} passed");
+        Ok(())
+    } else {
+        let passed = total - failures.len();
+        eprintln!("\nqemu-test: {passed}/{total} passed");
+        for line in &failures {
+            eprintln!("  - {line}");
+        }
+        bail!("{} smoke test(s) failed", failures.len());
+    }
+}
+
+fn run_smoke_test(test: &SmokeTest, artifacts: &QemuArtifacts, serial_path: &Path) -> Result<()> {
+    // Spawn QEMU with serial routed to a file so we can read it after
+    // the timeout. `-display none` (set in qemu_base_command) keeps it
+    // headless. We discard QEMU's own stdout/stderr — the interesting
+    // stream is the captured serial output.
+    let mut cmd = qemu_base_command(artifacts);
+    cmd.args(["-serial"])
+        .arg(format!("file:{}", serial_path.display()))
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .stdin(Stdio::null());
+
+    let mut child = cmd.spawn().context("failed to invoke qemu-system-x86_64")?;
+
+    // Poll for QEMU's natural exit, otherwise force-kill at timeout.
+    // The kernel sits in `hlt` forever at B0 Step 1 so the natural
+    // exit basically never happens — but checking anyway lets us
+    // shorten future tests once `isa-debug-exit` is wired up.
+    let deadline = Instant::now() + Duration::from_secs(test.timeout_secs);
+    loop {
+        match child.try_wait().context("failed to poll qemu process")? {
+            Some(status) => {
+                if !status.success() {
+                    return Err(anyhow!("qemu exited non-zero: {status}"));
+                }
+                break;
+            }
+            None => {
+                if Instant::now() >= deadline {
+                    // Force-kill QEMU. SIGKILL guarantees exit even if
+                    // QEMU's monitor is wedged; we don't need a clean
+                    // shutdown because we already captured serial to
+                    // file synchronously as the kernel wrote it.
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        }
+    }
+
+    // Read the captured serial output.
+    let mut captured = String::new();
+    std::fs::File::open(serial_path)
+        .with_context(|| format!("failed to open serial capture {}", serial_path.display()))?
+        .read_to_string(&mut captured)
+        .with_context(|| format!("failed to read serial capture {}", serial_path.display()))?;
+
+    // Required substrings, in order.
+    let mut search_from = 0usize;
+    for needle in test.expect_contains {
+        match captured[search_from..].find(needle) {
+            Some(rel) => search_from += rel + needle.len(),
+            None => {
+                return Err(anyhow!(
+                    "missing expected substring {:?} in serial output. \
+                     Full capture follows:\n---\n{captured}\n---",
+                    needle
+                ));
+            }
+        }
+    }
+
+    // Forbidden substrings, anywhere.
+    for needle in test.expect_absent {
+        if captured.contains(needle) {
+            return Err(anyhow!(
+                "forbidden substring {:?} appeared in serial output. \
+                 Full capture follows:\n---\n{captured}\n---",
+                needle
+            ));
+        }
+    }
+
+    Ok(())
 }
 
 /// Build kernel.elf via `cargo build -p frame-os-kernel --target x86_64-unknown-none`.
@@ -462,30 +694,52 @@ serial: yes
 }
 
 /// Locate QEMU's bundled OVMF UEFI firmware. Returns (code, vars-template).
+///
+/// Distros and packagers disagree on filenames:
+///   - QEMU Homebrew (macOS) ships `edk2-x86_64-code.fd` + `edk2-i386-vars.fd`
+///     under `<prefix>/share/qemu/`
+///   - Ubuntu's `ovmf` package ships `OVMF_CODE.fd` + `OVMF_VARS.fd` under
+///     `/usr/share/OVMF/`
+///   - Fedora / Arch use similar `OVMF_CODE.fd` naming with their own paths
+///
+/// We scan a small candidate matrix of (dir, code-name, vars-name) tuples
+/// and return the first hit. Adding a new distro = adding a row.
 fn find_ovmf() -> Result<(PathBuf, PathBuf)> {
-    // Standard QEMU Homebrew layout:
-    //   /usr/local/Cellar/qemu/<ver>/share/qemu/edk2-x86_64-code.fd
-    //   /usr/local/Cellar/qemu/<ver>/share/qemu/edk2-i386-vars.fd
-    // OR /opt/homebrew/Cellar/qemu/... on Apple Silicon.
-    // Linux package layouts vary; we'd extend this later.
-    let candidate_dirs = [
-        "/usr/local/share/qemu",
-        "/opt/homebrew/share/qemu",
-        "/usr/share/qemu",
-        "/usr/share/OVMF",
+    // (search_dir, code_filename, vars_filename)
+    const CANDIDATES: &[(&str, &str, &str)] = &[
+        // QEMU brew (Intel macOS) and Linux QEMU bundled firmware
+        (
+            "/usr/local/share/qemu",
+            "edk2-x86_64-code.fd",
+            "edk2-i386-vars.fd",
+        ),
+        (
+            "/opt/homebrew/share/qemu",
+            "edk2-x86_64-code.fd",
+            "edk2-i386-vars.fd",
+        ),
+        (
+            "/usr/share/qemu",
+            "edk2-x86_64-code.fd",
+            "edk2-i386-vars.fd",
+        ),
+        // Ubuntu / Debian `ovmf` package
+        ("/usr/share/OVMF", "OVMF_CODE.fd", "OVMF_VARS.fd"),
+        // Fedora / Arch `edk2-ovmf` package
+        ("/usr/share/edk2/ovmf", "OVMF_CODE.fd", "OVMF_VARS.fd"),
     ];
 
-    // Prefer the brew-bundled paths; fall back to scanning the candidates.
-    for dir in candidate_dirs {
-        let code = PathBuf::from(dir).join("edk2-x86_64-code.fd");
-        let vars = PathBuf::from(dir).join("edk2-i386-vars.fd");
+    for (dir, code_name, vars_name) in CANDIDATES {
+        let code = PathBuf::from(dir).join(code_name);
+        let vars = PathBuf::from(dir).join(vars_name);
         if code.exists() && vars.exists() {
             return Ok((code, vars));
         }
     }
 
     // Try to discover via brew (Homebrew installs into /usr/local/Cellar on
-    // Intel and /opt/homebrew/Cellar on Apple Silicon).
+    // Intel and /opt/homebrew/Cellar on Apple Silicon). Brew always uses
+    // QEMU's `edk2-x86_64-code.fd` + `edk2-i386-vars.fd` naming.
     if let Ok(out) = Command::new("brew").args(["--prefix", "qemu"]).output() {
         if out.status.success() {
             let prefix = String::from_utf8_lossy(&out.stdout).trim().to_string();
@@ -499,8 +753,10 @@ fn find_ovmf() -> Result<(PathBuf, PathBuf)> {
     }
 
     bail!(
-        "could not locate OVMF UEFI firmware (edk2-x86_64-code.fd + edk2-i386-vars.fd). \
-         On macOS install via `brew install qemu`; on Linux install the `ovmf` package."
+        "could not locate OVMF UEFI firmware. Tried QEMU's edk2-* layout and \
+         the OVMF_*.fd layout in standard system paths. On macOS install via \
+         `brew install qemu`; on Ubuntu/Debian install the `ovmf` package; on \
+         Fedora/Arch install `edk2-ovmf`."
     );
 }
 

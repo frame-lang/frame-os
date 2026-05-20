@@ -27,3 +27,15 @@ path = "src/main.rs"
 # (The x86_64-unknown-none target spec already sets panic-strategy = abort
 # by default — we don't need to override it in this crate's profile.)
 limine = "0.5"
+
+# Global heap allocator for the kernel. The Frame-generated `Kernel` code
+# allocates (String/Vec/Rc for event + compartment plumbing), so we need a
+# `#[global_allocator]` live before `Kernel::__create()`. `linked_list_allocator`
+# manages a fixed static buffer at B0; B1's memory manager will hand it a
+# real mapped region instead. See src/allocator.rs.
+linked_list_allocator = "0.10"
+
+[build-dependencies]
+# build.rs invokes framec on frame/kernel.frs and uses anyhow for error
+# context, mirroring the shell crate's build script.
+anyhow = { workspace = true }
