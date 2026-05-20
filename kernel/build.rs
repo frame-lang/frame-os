@@ -19,7 +19,10 @@ use anyhow::{anyhow, Context, Result};
 // module_name determines the generated .rs filename in OUT_DIR; it must
 // match the input stem (kernel.frs -> kernel.rs) and the `include!` in
 // src/frame_systems.rs.
-const FRAME_SYSTEMS: &[(&str, &str)] = &[("kernel", "kernel.frs")];
+const FRAME_SYSTEMS: &[(&str, &str)] = &[
+    ("serial_driver", "serial_driver.frs"),
+    ("kernel", "kernel.frs"),
+];
 
 fn main() -> Result<()> {
     let manifest = PathBuf::from(env_var("CARGO_MANIFEST_DIR")?);

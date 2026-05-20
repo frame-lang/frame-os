@@ -12,7 +12,10 @@ use std::process::Command;
 use anyhow::{anyhow, Context, Result};
 
 // (module_name, source_filename_relative_to_frame_dir)
-const FRAME_SYSTEMS: &[(&str, &str)] = &[("kernel", "kernel.frs")];
+const FRAME_SYSTEMS: &[(&str, &str)] = &[
+    ("serial_driver", "serial_driver.frs"),
+    ("kernel", "kernel.frs"),
+];
 
 fn main() -> Result<()> {
     let manifest = PathBuf::from(env_var("CARGO_MANIFEST_DIR")?);

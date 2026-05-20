@@ -83,9 +83,17 @@
             => $^
         }
 
+        // The console phase brings up the real serial driver. Up to here,
+        // the [boot] diagnostics used the raw `serial::*` bootstrap console
+        // (the UART works on QEMU without programming, and real kernels
+        // print early-boot diagnostics before the console driver registers
+        // — Linux's earlyprintk). This phase announces itself on the
+        // bootstrap console, then runs the driver's init handshake; from
+        // $LaunchInit on, output routes through the SerialDriver.
         $InitConsole => $Booting {
             $>() {
                 serial::writeln("[boot] init console");
+                self.console.init();
                 -> $LaunchInit
             }
             => $^
@@ -93,7 +101,7 @@
 
         $LaunchInit => $Booting {
             $>() {
-                serial::writeln("[boot] launching init");
+                self.console.write_line("[boot] launching init".to_string());
                 -> $Running
             }
             => $^
@@ -114,9 +122,13 @@
         // dispatch: this is the Frame argument made concretely.
         $Running {
             $>() {
-                serial::writeln("[run] kernel running");
+                self.console.write_line("[run] kernel running".to_string());
             }
 
+            // Panic messages use the raw bootstrap console, not the
+            // SerialDriver: a panic is an emergency context where the
+            // driver may be in any state (e.g. a boot panic before the
+            // console was initialized), so we must not depend on it.
             kernel_panic(msg: String) {
                 serial::write_str("\nKERNEL PANIC during runtime: ");
                 serial::writeln(&msg);
@@ -128,6 +140,12 @@
         // calls halt_forever() when true. (Could also call halt from
         // $Halted.$>, but keeping the halt in main.rs lets the kernel
         // be unit-testable in a future host-side test harness.)
+        //
+        // $Halted prints via the raw bootstrap console too: it's reachable
+        // from a boot-phase panic *before* $InitConsole ran the driver
+        // init, so routing "[halted]" through SerialDriver would be
+        // silently dropped (the $Uninitialized write gate). The emergency
+        // console always works.
         $Halted {
             $>() {
                 serial::writeln("[halted]");
@@ -135,4 +153,10 @@
 
             is_done(): bool { @@:(true) }
         }
+
+    domain:
+        // The serial console driver. Constructed in $Uninitialized;
+        // $InitConsole.$> runs its init() handshake to $Ready, after which
+        // $LaunchInit and $Running route their output through it.
+        console: SerialDriver = @@SerialDriver()
 }

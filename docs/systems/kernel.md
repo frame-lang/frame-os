@@ -55,20 +55,20 @@ Third child. Stub: prints `[boot] init timer` and transitions to `$InitConsole`.
 
 ### `$InitConsole`
 
-Fourth child. Stub: prints `[boot] init console` and transitions to `$LaunchInit`. At B0 Step 3 this is where the `SerialDriver` FSM is constructed and made the destination for `serial::*` writes (replacing the current direct port-IO).
+Fourth child. Prints `[boot] init console` on the bootstrap console, then runs the real console driver's init handshake — `self.console.init()`, bringing the [`SerialDriver`](serial_driver.md) from `$Uninitialized` to `$Ready` — and transitions to `$LaunchInit`. This is the boundary: phases before here use raw `serial::*` (bootstrap console, pre-driver); `$LaunchInit` and `$Running` route their output through the now-`$Ready` `SerialDriver`.
 
 **Transitions out:**
-- `$>` (enter) — prints phase banner; transitions to `$LaunchInit`
+- `$>` (enter) — prints phase banner (raw), runs `self.console.init()`, transitions to `$LaunchInit`
 
 **Forwarding:**
 - `=> $^` — forwards `kernel_panic()` to `$Booting`.
 
 ### `$LaunchInit`
 
-Fifth and final child. Stub: prints `[boot] launching init` and transitions to `$Running`. At B1+ this constructs the initial task set (`BlinkerTask`, `ConsoleTask`, `WatchdogTask`) and hands control to `Scheduler` for the first dispatch.
+Fifth and final child. Prints `[boot] launching init` **through the `SerialDriver`** (`self.console.write_line(...)`) — the console is `$Ready` by now — and transitions to `$Running`. At B1+ this constructs the initial task set (`BlinkerTask`, `ConsoleTask`, `WatchdogTask`) and hands control to `Scheduler` for the first dispatch.
 
 **Transitions out:**
-- `$>` (enter) — prints phase banner; transitions to `$Running`
+- `$>` (enter) — prints phase banner via `self.console.write_line(...)`; transitions to `$Running`
 
 **Forwarding:**
 - `=> $^` — forwards `kernel_panic()` to `$Booting`.
@@ -85,8 +85,8 @@ The HSM parent over the five init phases. Does no work itself; exists to host th
 The kernel is live. Reached from `$LaunchInit.$>`. At B0 the kernel has no scheduler, so `$Running` is a terminal sink that `kmain` polls for `is_done()` (returning `false`) and then halts the CPU. At B1, `$Running` gains a `tick()` event that drives `Scheduler.tick()`, and the kernel becomes interrupt-driven.
 
 **Transitions out:**
-- `kernel_panic(msg)` → `$Halted` — runtime panic path. Distinct from `$Booting`'s handler: prints `KERNEL PANIC during runtime: <msg>` instead.
-- `$>` (enter) — prints `[run] kernel running`.
+- `kernel_panic(msg)` → `$Halted` — runtime panic path. Distinct from `$Booting`'s handler: prints `KERNEL PANIC during runtime: <msg>` instead. Uses the raw bootstrap console (emergency path), not the `SerialDriver`.
+- `$>` (enter) — prints `[run] kernel running` through the `SerialDriver` (`self.console.write_line(...)`).
 
 ### `$Halted`
 
@@ -109,7 +109,11 @@ Both interface methods use Frame's default-value syntax in the interface declara
 
 ## Domain
 
-No domain block. At B0 the kernel has no per-instance persistent data — all state is implicit in which state is active. B1 adds a domain field for the scheduler reference; B2 adds one for the console driver reference.
+| Field | Type | Initial value | Purpose | Lifetime |
+|---|---|---|---|---|
+| `console` | `SerialDriver` | `@@SerialDriver()` | The serial console driver. Constructed in `$Uninitialized`; `$InitConsole.$>` runs its `init()` handshake to `$Ready`, after which `$LaunchInit` and `$Running` route output through it. | System lifetime |
+
+B1 will add a domain field for the scheduler reference.
 
 ## Why a state machine
 
@@ -129,14 +133,15 @@ The Frame argument here is real but compact — the kernel HSM is small (5 init 
 ## Composition
 
 **Calls into:**
-- `serial::writeln(&str)` / `serial::write_str(&str)` — every state's `$>` handler prints a phase banner. (At B0 Step 3 this becomes calls into a `SerialDriver` FSM instead of direct port-IO.)
+- [`SerialDriver`](serial_driver.md) — held in the `console` domain field. `$InitConsole.$>` calls `self.console.init()`; `$LaunchInit.$>` and `$Running.$>` call `self.console.write_line(...)`. This is the real console path, post-init.
+- `serial::writeln(&str)` / `serial::write_str(&str)` — raw bootstrap/emergency console, used directly (bypassing `SerialDriver`) by: the early-boot phases `$InitMemory`..`$InitConsole`'s own banner (before the driver is up), and the panic/halt paths in `$Booting`, `$Running`, and `$Halted` (which must not depend on driver state).
 
 **Called from:**
 - `kmain` in `kernel/src/main.rs` — calls `Kernel::__create()` once at boot. The `__create` synchronously drives the boot chain (each phase's `$>` runs the next phase's enter) and returns once the kernel has reached `$Running` or `$Halted`. `kmain` then polls `is_done()` and calls `halt_forever()` when true.
 - Future: `panic_handler` in `kernel/src/main.rs` will fire `kernel_panic()` on the global Kernel reference. At B0 this isn't wired up yet (Rust's `#[panic_handler]` is global and routing it to a Frame instance needs a `static Mutex<Option<Kernel>>` or similar; that lands when the panic handler can usefully access kernel state).
 
 **Native modules used by actions:**
-- `crate::serial` — the byte-level UART writer at port 0x3F8
+- `crate::serial` — the byte-level UART layer (port I/O, 16550 init, THRE-polled writes) at port 0x3F8. Both `Kernel`'s raw calls and `SerialDriver`'s actions bottom out here.
 
 ## Testing
 
@@ -185,7 +190,7 @@ fault-injection hook or an event-stepped boot chain, which is a design
 decision, not something to fake in a test.
 
 **Integration tests (Level 4):**
-- Not yet applicable; Kernel doesn't compose with other Frame systems until B0 Step 3 introduces `SerialDriver`. Then `kernel_console_init_drives_serial_driver_to_idle` will assert the composition.
+- `Kernel` composes with [`SerialDriver`](serial_driver.md) as of B0 Step 3. The composition is covered transitively by `boot_chain_prints_all_phases_in_order`: the `[boot] launching init` and `[run] kernel running` lines it asserts are emitted *through* `self.console` (the `SerialDriver`) after `$InitConsole` runs `init()`. If the wiring or the driver's gate regressed, those lines would be missing and the test would fail.
 
 **QEMU smoke tests (Level 7):**
 - `cargo xtask qemu-test` runs the smoke test suite (in the `SMOKE_TESTS` table in [`../../xtask/src/main.rs`](../../xtask/src/main.rs)). Two tests cover this system:
@@ -221,3 +226,4 @@ When real init work lands, the pattern will be: `actions:` block delegates each 
 - **2026-05-19** — initial doc; HSM designed and SVG committed; Rust codegen pending framec #31.
 - **2026-05-20** — framec #31 fixed; B0 Step 2 landed. Kernel HSM now compiles into the `no_std` kernel and boots in QEMU; `boot_hsm_runs_init_chain_b0` smoke test validates the full boot chain.
 - **2026-05-20** — added the `frame-os-kernel-tests` host crate: state-graph snapshot (B0-1) + behavioral tests (B0-3 and `$Running`'s panic variant). Recorded that boot-child panic-forwarding isn't externally observable with the synchronous boot chain (Open questions).
+- **2026-05-20** — B0 Step 3: integrated [`SerialDriver`](serial_driver.md) as the `console` domain field. `$InitConsole` runs `console.init()`; `$LaunchInit`/`$Running` route output through it; early-boot + panic/halt stay on the raw bootstrap/emergency console. State graph unchanged (domain + action-body change only).

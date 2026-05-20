@@ -58,3 +58,11 @@ fn kernel_state_graph_snapshot() {
     };
     insta::assert_snapshot!("kernel_state_graph", dot);
 }
+
+#[test]
+fn serial_driver_state_graph_snapshot() {
+    let Some(dot) = frame_to_dot("serial_driver.frs") else {
+        return; // framec unavailable; test skipped
+    };
+    insta::assert_snapshot!("serial_driver_state_graph", dot);
+}

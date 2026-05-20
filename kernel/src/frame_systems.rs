@@ -20,9 +20,14 @@ pub use alloc::boxed::Box;
 pub use alloc::string::{String, ToString};
 pub use alloc::vec::Vec;
 
-// The generated `Kernel` actions call `serial::writeln(...)` /
-// `serial::write_str(...)`. The glob import in the generated module
-// resolves `serial` through this private `use`.
+// The generated `Kernel` and `SerialDriver` actions call `serial::*`
+// (writeln / write_str / write_byte / init_uart). The glob import in each
+// generated module resolves `serial` through this private `use`.
 use crate::serial;
 
+// SerialDriver first: the Kernel holds a `SerialDriver` in its domain
+// (`console: SerialDriver = @@SerialDriver()`). Rust items are
+// order-independent within a module, but generating the dependency first
+// keeps the include order matching the dependency direction.
+include!(concat!(env!("OUT_DIR"), "/serial_driver.rs"));
 include!(concat!(env!("OUT_DIR"), "/kernel.rs"));

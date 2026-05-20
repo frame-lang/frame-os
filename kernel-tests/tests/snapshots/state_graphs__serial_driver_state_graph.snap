@@ -1,0 +1,33 @@
+---
+source: kernel-tests/tests/state_graphs.rs
+expression: dot
+---
+digraph SerialDriver {
+    compound=true
+    node [color="deepskyblue4" style="rounded, filled" fillcolor="azure"]
+    edge[color="red"]
+
+    Entry[width=0.2 shape="circle" style="filled" fillcolor="black" label=""]
+    Entry -> Uninitialized
+
+    Uninitialized [label = <
+        <table CELLBORDER="0" CELLPADDING="5" style="rounded">
+            <tr><td><b>Uninitialized</b></td></tr>
+            <hr/>
+            <tr><td align="left"><font point-size="10">
+init()<br ALIGN="LEFT"/>
+            </font></td></tr>
+        </table>
+    > margin=0 shape=none]
+    Ready [label = <
+        <table CELLBORDER="0" CELLPADDING="5" style="rounded">
+            <tr><td><b>Ready</b></td></tr>
+            <hr/>
+            <tr><td align="left"><font point-size="10">
+write_byte(b: u8)<br ALIGN="LEFT"/>write_line(s: String)<br ALIGN="LEFT"/>is_ready()<br ALIGN="LEFT"/>
+            </font></td></tr>
+        </table>
+    > margin=0 shape=none]
+
+    Uninitialized -> Ready [label=" init "]
+}

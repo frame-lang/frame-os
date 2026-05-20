@@ -153,6 +153,7 @@ const DIAGRAMS: &[(&str, &str)] = &[
     ("job.frs", "job.svg"),
     ("job_control.frs", "job_control.svg"),
     ("kernel.frs", "kernel.svg"),
+    ("serial_driver.frs", "serial_driver.svg"),
 ];
 
 fn diagrams(mode: DiagramMode) -> Result<()> {

@@ -27,6 +27,12 @@ pub mod serial {
         static CAPTURED: RefCell<String> = const { RefCell::new(String::new()) };
     }
 
+    /// Host stand-in for the 16550 init sequence. No UART on the host, so
+    /// this is a no-op — SerialDriver's $Uninitialized → $Ready transition
+    /// still happens; we just don't program nonexistent hardware. (If a
+    /// test ever needs to assert init ran, capture a marker here.)
+    pub fn init_uart() {}
+
     /// Append a single byte (interpreted as an ASCII/Latin-1 char). The
     /// kernel's panic handler uses this for the `:` separator and digits.
     pub fn write_byte(b: u8) {
@@ -60,6 +66,8 @@ pub mod serial {
     }
 }
 
-// Pull in the framec-generated Kernel. `pub use _kernel_framec::*;` at the
-// end of the generated file re-exports `Kernel` at this crate's root.
+// Pull in the framec-generated systems. Each generated file ends with
+// `pub use _<name>_framec::*;`, re-exporting `SerialDriver` / `Kernel` at
+// this crate's root. SerialDriver first (Kernel holds one in its domain).
+include!(concat!(env!("OUT_DIR"), "/serial_driver.rs"));
 include!(concat!(env!("OUT_DIR"), "/kernel.rs"));

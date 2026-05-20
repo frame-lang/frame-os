@@ -1,0 +1,79 @@
+// frame/serial_driver.frs
+//
+// SerialDriver — COM1 console lifecycle (B0 Step 3).
+//
+// A deliberately small state machine: two states modeling the one real
+// invariant a serial console has at B0 — you must program the UART
+// (baud rate, line format, FIFO) before you transmit, or output is
+// garbage. The machine makes "init before write" structural: writes are
+// only handled in $Ready, and the only way to reach $Ready is through
+// init().
+//
+//   ┌────────────────┐   init()              ┌──────────┐
+//   │ $Uninitialized │ ────────────────────► │  $Ready  │
+//   │   (initial)    │   serial::init_uart()  │          │
+//   └────────────────┘                        └────┬─────┘
+//        write_*: ignored                          │ write_byte / write_line
+//        (gate: can't write before init)           ▼  serial::* (THRE-polled)
+//                                              (stays $Ready)
+//
+// Why only two states (and not the $Idle→$Transmitting→$Draining graph a
+// fuller UART driver might have): at B0 the target is QEMU, where COM1
+// writes are synchronous — there is no asynchronous transmit/drain phase
+// to model, no TX interrupt, no FIFO-drain wait beyond the THRE poll in
+// serial::write_byte. Inventing $Transmitting/$Draining states with no
+// behavior behind them would be ceremony, not modeling. When this driver
+// runs on real hardware with interrupt-driven TX (a later, hardware
+// track), those states become real and get added then. The honest B0
+// machine is the init handshake — and that's genuinely worth a state
+// machine because "wrote before init" is a real, easy-to-make bug.
+//
+// The byte mechanics (port I/O, the 16550 init sequence, THRE polling)
+// live in the native serial module (kernel/src/serial.rs for the kernel,
+// a capturing stub for host tests). SerialDriver owns the *lifecycle*;
+// `serial::*` owns the *mechanism*.
+
+@@[target("rust")]
+
+@@system SerialDriver {
+    interface:
+        init()
+        write_byte(b: u8)
+        write_line(s: String)
+        // Default: not ready. Only $Ready overrides to true. Callers can
+        // gate on this if they need to know whether init() has run.
+        is_ready(): bool = false
+
+    machine:
+        $Uninitialized {
+            init() {
+                // Program the UART, then become writable. On real
+                // hardware this sets the baud rate / line format; on QEMU
+                // it's accepted and largely ignored.
+                serial::init_uart();
+                -> $Ready
+            }
+
+            // write_byte / write_line are intentionally NOT handled here:
+            // writing before init() is the bug this machine prevents. Per
+            // V4 explicit-only-forwarding, the unhandled events are
+            // silently dropped — no garbage goes out a misconfigured port.
+        }
+
+        $Ready {
+            write_byte(b: u8) {
+                serial::write_byte(b);
+            }
+
+            write_line(s: String) {
+                serial::write_str(&s);
+                serial::write_byte(b'\n');
+            }
+
+            // init() is not handled here: re-initializing an already-ready
+            // console is a no-op we don't need to write. Omitted, so it's
+            // silently ignored.
+
+            is_ready(): bool { @@:(true) }
+        }
+}
