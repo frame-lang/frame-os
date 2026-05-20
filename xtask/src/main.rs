@@ -154,6 +154,8 @@ const DIAGRAMS: &[(&str, &str)] = &[
     ("job_control.frs", "job_control.svg"),
     ("kernel.frs", "kernel.svg"),
     ("serial_driver.frs", "serial_driver.svg"),
+    ("task.frs", "task.svg"),
+    ("scheduler.frs", "scheduler.svg"),
 ];
 
 fn diagrams(mode: DiagramMode) -> Result<()> {
@@ -382,9 +384,12 @@ struct SmokeTest {
     /// triple-faults that wouldn't fail an `expect_contains` check on
     /// their own.
     expect_absent: &'static [&'static str],
-    /// Wall-clock seconds to let QEMU run before killing it and
-    /// reading the serial capture. Should comfortably exceed the
-    /// kernel's expected runtime to print everything it'll print.
+    /// Wall-clock seconds to let QEMU run before killing it and reading
+    /// the serial capture. This budget is dominated by the OVMF UEFI
+    /// firmware and Limine cold-start (several seconds), not the kernel's
+    /// own runtime (which prints in well under a second once it runs).
+    /// Keep it generous so a loaded machine or slow CI runner doesn't
+    /// false-fail before the bootloader even reaches the kernel.
     timeout_secs: u64,
 }
 
@@ -395,9 +400,10 @@ const SMOKE_TESTS: &[SmokeTest] = &[
         // 0xe2 0x80 0x94 in the UTF-8 serial stream); literal here.
         expect_contains: &["Frame OS kernel \u{2014} B0 Step 2", "entering boot HSM..."],
         expect_absent: &["KERNEL PANIC", "triple fault"],
-        // 5s is plenty: kernel boots and prints in well under 1s; we
-        // pad heavily so a slow CI runner doesn't false-fail.
-        timeout_secs: 5,
+        // OVMF + Limine cold-start can take several seconds before the
+        // kernel runs; 20s is comfortable headroom (the kernel itself
+        // prints in <1s once reached).
+        timeout_secs: 20,
     },
     SmokeTest {
         // The Step 2 payload: the Kernel HSM drives the boot chain.
@@ -416,7 +422,7 @@ const SMOKE_TESTS: &[SmokeTest] = &[
             "[run] kernel running",
         ],
         expect_absent: &["KERNEL PANIC", "triple fault"],
-        timeout_secs: 5,
+        timeout_secs: 20,
     },
 ];
 

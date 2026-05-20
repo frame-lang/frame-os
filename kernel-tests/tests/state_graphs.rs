@@ -66,3 +66,19 @@ fn serial_driver_state_graph_snapshot() {
     };
     insta::assert_snapshot!("serial_driver_state_graph", dot);
 }
+
+#[test]
+fn task_state_graph_snapshot() {
+    let Some(dot) = frame_to_dot("task.frs") else {
+        return; // framec unavailable; test skipped
+    };
+    insta::assert_snapshot!("task_state_graph", dot);
+}
+
+#[test]
+fn scheduler_state_graph_snapshot() {
+    let Some(dot) = frame_to_dot("scheduler.frs") else {
+        return; // framec unavailable; test skipped
+    };
+    insta::assert_snapshot!("scheduler_state_graph", dot);
+}

@@ -1,0 +1,69 @@
+// frame/scheduler.frs
+//
+// Scheduler — the run/halt mode of the kernel (B1).
+//
+// Deliberately minimal. Under preemptive round-robin the *picking* and the
+// *context switch* are native work done inside the timer ISR (reading a
+// native ready-queue); the Frame system does NOT pick or switch. The only
+// genuinely-different-behavior the scheduler has at B1 is a mode:
+//
+//   $Idle   — nothing is runnable; the kernel main loop should `hlt` and
+//             wait for an interrupt.
+//   $Active — at least one thread is runnable; keep switching.
+//
+// This is the same "model the invariant that actually exists, not the one a
+// textbook diagram suggests" call made for SerialDriver. The speculative
+// `$Idle → $PickingNext → $Running → $ContextSwitching` graph is not used:
+// those phases are native ISR mechanics with no distinct Frame behavior at
+// B1. The scheduler grows real states at B3, when blocking / waiting / zombie
+// interactions give it decisions worth modeling.
+//
+// State graph:
+//
+//   ┌─────────┐  task_ready (runnable: 0→1)   ┌──────────┐
+//   │ $Idle   │ ────────────────────────────► │ $Active  │
+//   │ (init)  │ ◄──────────────────────────── │          │
+//   └─────────┘  task_unready (runnable: 1→0)  └────┬─────┘
+//                                                   │ task_ready / task_unready
+//                                                   └── (runnable stays ≥1)
+//
+// `runnable` is the count of threads in the ready set. The native scheduler
+// keeps the actual ready-queue; this count is the Frame system's view of
+// "is there anything to run", which is all it needs to decide $Idle vs
+// $Active.
+
+@@[target("rust")]
+
+@@system Scheduler {
+    interface:
+        task_ready()
+        task_unready()
+        is_idle(): bool = false
+        runnable_count(): u32 = self.runnable
+
+    machine:
+        $Idle {
+            task_ready() {
+                self.runnable += 1;
+                -> $Active
+            }
+            // task_unready in $Idle can't happen (runnable is 0); unhandled,
+            // so silently ignored per explicit-only-forwarding.
+            is_idle(): bool { @@:(true) }
+        }
+
+        $Active {
+            task_ready() {
+                self.runnable += 1;
+            }
+            task_unready() {
+                self.runnable -= 1;
+                if self.runnable == 0 {
+                    -> $Idle
+                }
+            }
+        }
+
+    domain:
+        runnable: u32 = 0
+}

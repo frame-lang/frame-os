@@ -1,0 +1,56 @@
+---
+source: kernel-tests/tests/state_graphs.rs
+expression: dot
+---
+digraph Task {
+    compound=true
+    node [color="deepskyblue4" style="rounded, filled" fillcolor="azure"]
+    edge[color="red"]
+
+    Entry[width=0.2 shape="circle" style="filled" fillcolor="black" label=""]
+    Entry -> Created
+
+    Created [label = <
+        <table CELLBORDER="0" CELLPADDING="5" style="rounded">
+            <tr><td><b>Created</b></td></tr>
+            <hr/>
+            <tr><td align="left"><font point-size="10">
+make_ready()<br ALIGN="LEFT"/>terminate()<br ALIGN="LEFT"/>
+            </font></td></tr>
+        </table>
+    > margin=0 shape=none]
+    Ready [label = <
+        <table CELLBORDER="0" CELLPADDING="5" style="rounded">
+            <tr><td><b>Ready</b></td></tr>
+            <hr/>
+            <tr><td align="left"><font point-size="10">
+block()<br ALIGN="LEFT"/>terminate()<br ALIGN="LEFT"/>is_ready()<br ALIGN="LEFT"/>
+            </font></td></tr>
+        </table>
+    > margin=0 shape=none]
+    Blocked [label = <
+        <table CELLBORDER="0" CELLPADDING="5" style="rounded">
+            <tr><td><b>Blocked</b></td></tr>
+            <hr/>
+            <tr><td align="left"><font point-size="10">
+unblock()<br ALIGN="LEFT"/>terminate()<br ALIGN="LEFT"/>is_blocked()<br ALIGN="LEFT"/>
+            </font></td></tr>
+        </table>
+    > margin=0 shape=none]
+    Terminated [label = <
+        <table CELLBORDER="0" CELLPADDING="5" style="rounded">
+            <tr><td><b>Terminated</b></td></tr>
+            <hr/>
+            <tr><td align="left"><font point-size="10">
+is_terminated()<br ALIGN="LEFT"/>
+            </font></td></tr>
+        </table>
+    > margin=0 shape=none]
+
+    Created -> Ready [label=" make_ready "]
+    Created -> Terminated [label=" terminate "]
+    Ready -> Blocked [label=" block "]
+    Ready -> Terminated [label=" terminate "]
+    Blocked -> Ready [label=" unblock "]
+    Blocked -> Terminated [label=" terminate "]
+}

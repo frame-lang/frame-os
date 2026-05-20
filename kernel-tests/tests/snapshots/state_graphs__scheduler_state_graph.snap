@@ -1,0 +1,34 @@
+---
+source: kernel-tests/tests/state_graphs.rs
+expression: dot
+---
+digraph Scheduler {
+    compound=true
+    node [color="deepskyblue4" style="rounded, filled" fillcolor="azure"]
+    edge[color="red"]
+
+    Entry[width=0.2 shape="circle" style="filled" fillcolor="black" label=""]
+    Entry -> Idle
+
+    Idle [label = <
+        <table CELLBORDER="0" CELLPADDING="5" style="rounded">
+            <tr><td><b>Idle</b></td></tr>
+            <hr/>
+            <tr><td align="left"><font point-size="10">
+task_ready()<br ALIGN="LEFT"/>is_idle()<br ALIGN="LEFT"/>
+            </font></td></tr>
+        </table>
+    > margin=0 shape=none]
+    Active [label = <
+        <table CELLBORDER="0" CELLPADDING="5" style="rounded">
+            <tr><td><b>Active</b></td></tr>
+            <hr/>
+            <tr><td align="left"><font point-size="10">
+task_ready()<br ALIGN="LEFT"/>task_unready()<br ALIGN="LEFT"/>
+            </font></td></tr>
+        </table>
+    > margin=0 shape=none]
+
+    Idle -> Active [label=" task_ready "]
+    Active -> Idle [label=" task_unready "]
+}

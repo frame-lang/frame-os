@@ -1,0 +1,86 @@
+// frame/task.frs
+//
+// Task — per-thread coarse lifecycle (B1).
+//
+// Tracks the lifecycle transitions that happen in NORMAL (non-interrupt)
+// context: a thread is created, admitted to the ready set, blocks on a
+// resource, unblocks, and eventually terminates. It deliberately does NOT
+// model "currently executing on the CPU" — under preemption that flips on
+// every timer tick, which (a) would have to fire from the timer ISR
+// (forbidden: Frame dispatch is non-reentrant) and (b) is mechanical, not
+// lifecycle. "Which runnable thread is on the CPU right now" is native
+// scheduler state (`current_thread`), not a Frame state. So there is no
+// $Running here; $Ready means "runnable" (selected, or waiting its turn in
+// the native ready-queue).
+//
+// State graph:
+//
+//   ┌───────────┐  make_ready   ┌─────────┐   block    ┌───────────┐
+//   │ $Created  │ ────────────► │ $Ready  │ ─────────► │ $Blocked  │
+//   │ (initial) │               │         │ ◄───────── │           │
+//   └─────┬─────┘               └────┬────┘  unblock   └─────┬─────┘
+//         │                          │                       │
+//         │ terminate         terminate                terminate
+//         └──────────────┐        │                       │
+//                        ▼        ▼                       ▼
+//                    ┌─────────────────────────────────────────┐
+//                    │              $Terminated (sink)          │
+//                    └─────────────────────────────────────────┘
+//
+// At B3 this lifecycle is superseded by `Process`, which adds $Zombie and
+// $Reaped (exit-status reaping) on top of the same shape.
+
+@@[target("rust")]
+
+@@system Task(id: u32) {
+    interface:
+        make_ready()
+        block()
+        unblock()
+        terminate()
+        // Defaults read the domain / report the resting answer; only the
+        // states whose answer differs override. No per-tick churn.
+        id(): u32 = self.id
+        is_ready(): bool = false
+        is_blocked(): bool = false
+        is_terminated(): bool = false
+
+    machine:
+        $Created {
+            make_ready() {
+                -> $Ready
+            }
+            terminate() {
+                -> $Terminated
+            }
+        }
+
+        $Ready {
+            block() {
+                -> $Blocked
+            }
+            terminate() {
+                -> $Terminated
+            }
+            is_ready(): bool { @@:(true) }
+        }
+
+        $Blocked {
+            unblock() {
+                -> $Ready
+            }
+            terminate() {
+                -> $Terminated
+            }
+            is_blocked(): bool { @@:(true) }
+        }
+
+        // Terminal. make_ready / block / unblock have no handlers here; per
+        // Frame V4 explicit-only-forwarding they're silently ignored.
+        $Terminated {
+            is_terminated(): bool { @@:(true) }
+        }
+
+    domain:
+        id: u32 = id
+}

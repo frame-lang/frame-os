@@ -199,7 +199,10 @@ H3 is the H-track's final committed milestone. Further H-track work (a configura
 > plan. Near-term milestones (B1) are specified precisely; far ones
 > (B5–B7) name the Frame systems and expected framec gates but finalize
 > exact test paths when the milestone begins (as B0's tests did when they
-> moved from `kernel/tests/` to the xtask harness).
+> moved from `kernel/tests/` to the xtask harness). The deepest framec
+> gates cluster at **B4** (the deferred-event queue, born from the first
+> device-completion interrupt), **B5** (timed transitions, orthogonal
+> regions, history, scale — TCP), and **B7** (`Send`+`Sync` codegen).
 
 ### B0 — boots and halts
 
@@ -251,34 +254,35 @@ H3 is the H-track's final committed milestone. Further H-track work (a configura
 
 ### B1 — preemptive multitasking
 
-**Scope:** B0 plus a **preemptive** scheduler running multiple kernel threads. A periodic timer interrupt drives context switches — a thread in a tight loop is preempted, not relying on voluntary yield. This is the milestone where the kernel becomes interrupt-driven, and therefore where the **deferred-event queue** is built: the timer ISR must hand events to Frame systems without re-entering them, because Frame dispatch is single-threaded and run-to-completion. (This is the grounded form of the "Port"/mailbox concept harvested from the SOS comms design — built here from a concrete need, not speculatively.)
+**Scope:** B0 plus a **preemptive** scheduler running multiple kernel threads. A periodic timer interrupt drives context switches — a thread in a tight loop is preempted, not relying on voluntary yield.
 
-**Frame systems:**
-- `Scheduler` — HSM `$Idle → $PickingNext → $Running → $ContextSwitching`.
-- `Task` — `$Created → $Ready → $Running → $Ready`; `$Blocked`/`$Terminated` declared, exercised more fully at B3 as `Process`.
-- `Kernel.$Running` extended to start and drive the scheduler.
+**The native/Frame split (and why the deferred-event queue is *not* here).** Preemption is mostly native: the switch *must* happen inside the timer ISR (a tight-loop thread never reaches any other safe point), so the ISR saves full register state, picks the next thread from a **native ready-queue**, and swaps stacks — it never calls a Frame system (Frame dispatch is non-reentrant). The Frame `Scheduler` and `Task` are touched only from **normal context** (admit, block, unblock, exit), behind a short ISR-safe lock on the shared ready-queue. Consequently the **deferred-event queue moves to B4** — its first hard requirement is a *device-completion interrupt* that must deliver an event into a possibly-in-flight Frame system; B1's preemption doesn't need it. (Correction to the original B1 framing; see `docs/plans/b1.md`.)
+
+**Frame systems (deliberately minimal — the honest B1 forms):**
+- `Scheduler` — `$Idle` (no runnable threads → the main loop `hlt`s) / `$Active` (≥1 runnable). *Not* the speculative `$Idle → $PickingNext → $Running → $ContextSwitching`: picking and switching are native ISR work, so the only genuinely-different-behavior states are halt-vs-run. Grows real states at B3 (blocking/waiting/zombie). Same "model the invariant that exists" call as SerialDriver.
+- `Task` — `$Created → $Ready ⇄ $Blocked → $Terminated`. **No `$Running`:** "currently on the CPU" flips every tick and would fire from the ISR (forbidden) — it's native (`current_thread`), not a Frame state. `Task` models the coarse lifecycle that changes in normal context.
 
 **Native components:**
-- IDT + exception handlers; interrupt controller (8259 PIC or Local APIC) + periodic timer (PIT or APIC timer).
-- **Preemptive** context switch — save/restore the *complete* register state from interrupt context (not just callee-saved), per-task kernel stacks, fresh-task stack-frame crafting.
-- The **deferred-event queue**: an interrupt-safe MPSC ring per Frame system. The ISR `post`s; the kernel main loop `drain`s serially. Preserves Frame's non-reentrant run-to-completion invariant by construction.
+- IDT + exception handlers (faults print + halt, not silent triple-fault); 8259 PIC remap + PIT channel 0 periodic (~100 Hz). Reuse Limine's GDT; TSS deferred to B3 (no ring switch yet).
+- **Preemptive** context switch — save/restore the *complete* register state from interrupt context, per-task 16 KiB static kernel stacks, fresh-task stack-frame crafting.
+- Native ready-queue + `current_thread`, behind a short interrupt-safe lock (the first taste of kernel concurrency: ISR vs normal context).
 
-**framec gate expected:** *reentrancy* — driving a Frame system from interrupt context forces the `post`/`drain` split (a Frame system MUST NOT be dispatched inline from an ISR). Possibly a *no-alloc* need: the queue and event must not heap-allocate in interrupt context.
+**framec gate expected:** modest at B1 — mainly a check on whether the `Scheduler` FSM earns its keep at pure round-robin (if it's only `$Idle`/`$Active`, that's accepted per the B1 design decision; reassessed at B3). The deep gates (the queue, `no-alloc`) move to B4/B5/B7.
 
 #### Exit criteria
 
 | # | Exit criterion | Validating test(s) |
 |---|---|---|
-| B1-1 | `Scheduler` and `Task` state graphs match committed designs | Snapshots `scheduler_state_graph_snapshot`, `task_state_graph_snapshot` (`kernel-tests`) |
-| B1-2 | `Task` transitions correctly per committed state-event pair | Behavioral tests in `kernel-tests/tests/task_behavior.rs` (host) |
-| B1-3 | `Scheduler` picks next / context-switch logic correct, with the native switch mocked | Behavioral tests in `kernel-tests/tests/scheduler_behavior.rs` (host) |
-| B1-4 | The deferred-event queue obeys the post/drain contract: `post` never dispatches inline and is safe from any context; `drain` is serial per instance | Unit/behavioral tests for the queue (`kernel-tests`); the contract is the one in [`port_contract.md`](port_contract.md) (observation note) |
-| B1-5 | A tight-loop thread **is preempted** (distinguishes from cooperative) | QEMU smoke `tight_loop_thread_is_preempted_b1` — a thread that never yields still lets others run |
-| B1-6 | N kernel threads run concurrently, each visibly producing output | QEMU smoke `threads_run_concurrently_b1` (each thread's marker appears ≥N times) |
-| B1-7 | Diagrams + per-system docs for `Scheduler`, `Task`, and the deferred-event queue | `cargo xtask check-diagrams`; review |
+| B1-1 | `Scheduler` (`$Idle`/`$Active`) and `Task` (`$Created→$Ready⇄$Blocked→$Terminated`) state graphs match committed designs | Snapshots `scheduler_state_graph_snapshot`, `task_state_graph_snapshot` (`kernel-tests`) |
+| B1-2 | `Task` transitions correctly per committed state-event pair (no `$Running`) | Behavioral tests in `kernel-tests/tests/task_behavior.rs` (host) |
+| B1-3 | `Scheduler` flips `$Idle`↔`$Active` correctly on `task_ready`/`task_unready` and reports `is_idle` | Behavioral tests in `kernel-tests/tests/scheduler_behavior.rs` (host) |
+| B1-4 | A tight-loop thread **is preempted** (distinguishes from cooperative) | QEMU smoke `tight_loop_thread_is_preempted_b1` — a thread that never yields still lets others run |
+| B1-5 | N kernel threads run concurrently, each visibly producing output | QEMU smoke `threads_run_concurrently_b1` (each thread's marker appears ≥N times) |
+| B1-6 | The scheduler halts the CPU in `$Idle` when nothing is runnable | QEMU smoke `idle_halts_cpu_b1` |
+| B1-7 | Diagrams + per-system docs for `Scheduler` and `Task` | `cargo xtask check-diagrams`; review |
 | B1-8 | All CI gates pass, plus QEMU smoke on Linux | Full CI matrix + `qemu-test` |
 
-**Estimated effort:** Large. The preemptive context switch (saving full state from interrupt context and resuming a different thread) and the interrupt-safe queue are the classic hard parts; this is where the kernel first feels like a kernel.
+**Estimated effort:** Large. The preemptive context switch (saving full state from interrupt context and resuming a different thread) is the classic hard part; this is where the kernel first feels like a kernel. The Frame payload is small and honest — the substance of the milestone is native.
 
 ### B2 — virtual memory & address spaces
 
@@ -348,7 +352,7 @@ H3 is the H-track's final committed milestone. Further H-track work (a configura
 
 **Native components:** virtio-blk (or AHCI) driver + DMA; buffer/page cache; the on-disk FS format (inodes, dirents, free-block bitmap); VFS dispatch.
 
-**framec gate expected:** *per-inode/per-file serialization* — concurrent operations on one inode must serialize, which is the same `post`/`drain` queue pattern as B1, now applied to data structures; I/O request state machines under concurrency.
+**framec gate expected:** **the deferred-event queue is born here** — the block device's *completion interrupt* must deliver an event into a possibly-in-flight Frame I/O system, which is the first hard requirement for the `post`/`drain` split (the ISR `post`s a completion; the kernel main loop `drain`s it; the Frame system is never dispatched from interrupt context). Built from this concrete need (interrupt-safe, ideally no-alloc), it becomes the reference for the same pattern at B5 (NIC) and B7 (cross-core). Also: per-inode serialization for concurrent FS operations.
 
 #### Exit criteria
 

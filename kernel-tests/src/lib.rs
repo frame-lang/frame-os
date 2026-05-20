@@ -67,7 +67,11 @@ pub mod serial {
 }
 
 // Pull in the framec-generated systems. Each generated file ends with
-// `pub use _<name>_framec::*;`, re-exporting `SerialDriver` / `Kernel` at
-// this crate's root. SerialDriver first (Kernel holds one in its domain).
+// `pub use _<name>_framec::*;`, re-exporting the system type at this crate's
+// root. SerialDriver first (Kernel holds one in its domain). Task and
+// Scheduler (B1) are independent — the native scheduler composes them with
+// a ready-queue; the Frame systems don't reference each other.
 include!(concat!(env!("OUT_DIR"), "/serial_driver.rs"));
 include!(concat!(env!("OUT_DIR"), "/kernel.rs"));
+include!(concat!(env!("OUT_DIR"), "/task.rs"));
+include!(concat!(env!("OUT_DIR"), "/scheduler.rs"));

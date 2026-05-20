@@ -15,6 +15,8 @@ use anyhow::{anyhow, Context, Result};
 const FRAME_SYSTEMS: &[(&str, &str)] = &[
     ("serial_driver", "serial_driver.frs"),
     ("kernel", "kernel.frs"),
+    ("task", "task.frs"),
+    ("scheduler", "scheduler.frs"),
 ];
 
 fn main() -> Result<()> {
