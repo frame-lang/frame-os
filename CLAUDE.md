@@ -17,24 +17,23 @@ The current milestone is **H0** — the minimum viable hosted-mode shell. See `d
 cargo install framec
 cargo xtask install-tools
 
-# Day-to-day
-cargo build --workspace                      # build everything
-cargo test --workspace                       # run all tests
+# Day-to-day (hosted shell)
+cargo build                                  # builds default-members (excludes kernel)
+cargo test --workspace --exclude frame-os-kernel
 cargo run --bin frame-os-shell               # launch the shell
+
+# Bare-metal kernel
+cargo build -p frame-os-kernel --target x86_64-unknown-none
+cargo xtask qemu                             # build kernel + boot in QEMU via Limine UEFI
+                                             # (needs `brew install qemu mtools` on macOS)
 
 # Quality gates (must pass before a PR)
 cargo fmt --all -- --check
-cargo clippy --workspace --all-targets -- -D warnings
+cargo clippy --workspace --exclude frame-os-kernel --all-targets -- -D warnings
 cargo xtask check-diagrams                   # diagram drift check
 ```
 
-The kernel crate is excluded from `default-members` because it requires a bare-metal target. Build it explicitly when working on bare-metal:
-
-```bash
-cargo build -p frame-os-kernel --target x86_64-unknown-none
-```
-
-(That target produces nothing meaningful until B0 lands.)
+The kernel crate is excluded from workspace-wide commands because it requires the bare-metal target `x86_64-unknown-none` and won't link against the host environment. Build it explicitly with `cargo build -p frame-os-kernel --target x86_64-unknown-none`, or via `cargo xtask qemu` which handles the build + Limine bootloader + ESP image assembly + QEMU launch in one step.
 
 ## Frame language syntax
 

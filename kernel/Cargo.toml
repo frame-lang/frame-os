@@ -7,13 +7,23 @@ authors.workspace = true
 rust-version.workspace = true
 description = "Frame OS — bare-metal kernel"
 
-[lib]
-path = "src/lib.rs"
+[[bin]]
+name = "frame-os-kernel"
+path = "src/main.rs"
 
 # This crate is excluded from the workspace's `default-members` because it
 # needs a bare-metal target (`x86_64-unknown-none`) and won't build on the
-# host. Build explicitly with:
+# host. Build via xtask:
+#   cargo xtask qemu        — boot in QEMU
+#   cargo xtask qemu-test   — run smoke tests (B0 Step 4+)
+# Or explicitly:
 #   cargo build -p frame-os-kernel --target x86_64-unknown-none
-# Until B0 lands, this crate is intentionally empty.
 
 [dependencies]
+# Limine boot-protocol bindings. We use the `limine` crate to declare the
+# protocol headers + entry-point requests that the Limine bootloader
+# discovers when scanning the kernel ELF.
+#
+# (The x86_64-unknown-none target spec already sets panic-strategy = abort
+# by default — we don't need to override it in this crate's profile.)
+limine = "0.5"

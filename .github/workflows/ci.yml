@@ -44,14 +44,40 @@ jobs:
       - name: Check formatting
         run: cargo fmt --all -- --check
 
+      # --exclude frame-os-kernel: the kernel crate is bare-metal-only
+      # (target x86_64-unknown-none) and can't build for the host. The
+      # `kernel-build` job below covers it explicitly.
       - name: Clippy
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        run: cargo clippy --workspace --exclude frame-os-kernel --all-targets -- -D warnings
 
       - name: Build
-        run: cargo build --workspace
+        run: cargo build --workspace --exclude frame-os-kernel
 
       - name: Test
-        run: cargo test --workspace
+        run: cargo test --workspace --exclude frame-os-kernel
+
+  # Kernel cross-build: ensures the bare-metal kernel compiles for its
+  # target. Doesn't actually boot it (that would need QEMU + Limine, which
+  # is covered by `xtask qemu-test` once that lands at B0 Step 4).
+  kernel-build:
+    name: kernel build (x86_64-unknown-none)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-none
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-kernel-cargo-${{ hashFiles('**/Cargo.lock') }}
+      - name: Build kernel
+        run: cargo build -p frame-os-kernel --target x86_64-unknown-none
 
   # Diagram drift check — runs only on Linux because GraphViz is easiest to
   # install there in CI. The check is the same on every platform, so this
