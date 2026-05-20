@@ -179,6 +179,28 @@ H3 is the H-track's final committed milestone. Further H-track work (a configura
 
 ## Track B: Bare-metal kernel
 
+> **Scope re-baseline (2026-05-20).** Track B was originally a Frame
+> *demonstration*: cooperative scheduling, a bytecode VM, with user mode /
+> processes as an optional stretch (old B4). It has been re-baselined to a
+> **real-OS-class project** — preemptive multitasking, user mode +
+> processes + `fork`/`exec` as core, real virtual memory, an on-disk
+> filesystem, a TCP/IP networking stack, USB, and SMP. The goal is twofold:
+> build something genuinely impressive (xv6-class and beyond), and
+> maximally **stress-test Frame** on hard, protocol- and lifecycle-heavy
+> subsystems — TCP especially. The bytecode VM (old B3) is removed from the
+> core path; real ELF user programs replace it. Several items formerly
+> "out of scope" (networking, USB, on-disk FS, SMP, user mode, `fork`) are
+> now committed milestones (B3–B7).
+>
+> Each milestone deliberately pairs a **native substrate** (the unsafe
+> plumbing where Frame doesn't help) with a **Frame payload** (the
+> lifecycle/protocol showcase), and names the **framec capability it is
+> expected to stress** — so this roadmap doubles as the Frame stress-test
+> plan. Near-term milestones (B1) are specified precisely; far ones
+> (B5–B7) name the Frame systems and expected framec gates but finalize
+> exact test paths when the milestone begins (as B0's tests did when they
+> moved from `kernel/tests/` to the xtask harness).
+
 ### B0 — boots and halts
 
 **Scope:** Frame OS kernel boots in QEMU x86_64 via Limine, prints a banner over the serial port, halts cleanly. No scheduler, no tasks, no user programs. QEMU smoke test infrastructure (Level 7 in [`testing.md`](testing.md)) is established.
@@ -227,168 +249,227 @@ H3 is the H-track's final committed milestone. Further H-track work (a configura
 - **Step 4 (QEMU smoke test harness):** Done. `cargo xtask qemu-test` boots the kernel headlessly, captures serial to file, asserts substrings appear and no panic markers do. Two tests: `boot_prints_banner_b0` (banner) and `boot_hsm_runs_init_chain_b0` (full HSM chain in order). Wired into CI as a Linux-only `qemu-test` job.
 - **B0 is functionally complete.** All four steps done; exit criteria B0-1 through B0-13 are met or explicitly accounted for (B0-4's boot-child forwarding is a documented, deferred design item; B0-6 is the manual smoke; B0-9's dedicated isa-debug-exit test is deferred behind a Cargo feature). Remaining B-track work is B1+ (scheduler), not B0.
 
-### B1 — multitasking scheduler
+### B1 — preemptive multitasking
 
-**Scope:** B0 plus a scheduler running multiple Frame-defined tasks cooperatively, with the timer driving scheduling decisions.
+**Scope:** B0 plus a **preemptive** scheduler running multiple kernel threads. A periodic timer interrupt drives context switches — a thread in a tight loop is preempted, not relying on voluntary yield. This is the milestone where the kernel becomes interrupt-driven, and therefore where the **deferred-event queue** is built: the timer ISR must hand events to Frame systems without re-entering them, because Frame dispatch is single-threaded and run-to-completion. (This is the grounded form of the "Port"/mailbox concept harvested from the SOS comms design — built here from a concrete need, not speculatively.)
 
-**Tasks bundled into the kernel image:**
-- `BlinkerTask` — toggles a "virtual LED" (prints a character every N ticks) to demonstrate periodic execution
-- `ConsoleTask` — owns the serial console; other tasks send messages to it via a shared queue
-- `WatchdogTask` — pets a watchdog if other tasks are healthy; would panic on a stuck task (mostly demonstrative; no real watchdog hardware in QEMU)
-
-**Frame systems:** `Kernel` (extended with `$Running` state), `Scheduler` (new), `Task` (new — three instances at runtime), `KernelTimer` (new — or collapsed to plain Rust per the architecture-doc note).
+**Frame systems:**
+- `Scheduler` — HSM `$Idle → $PickingNext → $Running → $ContextSwitching`.
+- `Task` — `$Created → $Ready → $Running → $Ready`; `$Blocked`/`$Terminated` declared, exercised more fully at B3 as `Process`.
+- `Kernel.$Running` extended to start and drive the scheduler.
 
 **Native components:**
-- Cooperative context switching (since tasks yield voluntarily, this is a simple stack swap, much simpler than preemptive switching with full register save/restore)
-- Per-task kernel stacks
-- A simple message queue for inter-task communication
+- IDT + exception handlers; interrupt controller (8259 PIC or Local APIC) + periodic timer (PIT or APIC timer).
+- **Preemptive** context switch — save/restore the *complete* register state from interrupt context (not just callee-saved), per-task kernel stacks, fresh-task stack-frame crafting.
+- The **deferred-event queue**: an interrupt-safe MPSC ring per Frame system. The ISR `post`s; the kernel main loop `drain`s serially. Preserves Frame's non-reentrant run-to-completion invariant by construction.
+
+**framec gate expected:** *reentrancy* — driving a Frame system from interrupt context forces the `post`/`drain` split (a Frame system MUST NOT be dispatched inline from an ISR). Possibly a *no-alloc* need: the queue and event must not heap-allocate in interrupt context.
 
 #### Exit criteria
 
 | # | Exit criterion | Validating test(s) |
 |---|---|---|
-| B1-1 | `Scheduler` state graph matches committed design (`$Idle → $PickingNext → $Running → $ContextSwitching`) | Snapshot `scheduler_state_graph_snapshot` |
-| B1-2 | `Task` state graph matches committed design (`$Created → $Ready → $Running → $Ready` cycle; `$Blocked`, `$Terminated` declared but unexercised at B1) | Snapshot `task_state_graph_snapshot` |
-| B1-3 | `KernelTimer` state graph if implemented (`$Stopped → $Calibrating → $Running`), or collapsed-to-Rust decision documented if not | Snapshot `kernel_timer_state_graph_snapshot` (if Frame system) OR per-system doc explains the deferral |
-| B1-4 | `Scheduler.tick()` correctly cycles through ready tasks | Behavioral tests in `kernel/tests/scheduler_behavior.rs` covering pick-next, context-switch, idle |
-| B1-5 | `Task` transitions correctly via interface events (`make_ready`, `yield_now`, `block`, `unblock`) | Behavioral tests in `kernel/tests/task_behavior.rs` — one per committed state-event pair |
-| B1-6 | `Scheduler` + `Task` compose: scheduler invoked with N tasks runs each in turn | Integration test in `kernel/tests/scheduler_task_integration.rs` |
-| B1-7 | Three tasks run concurrently in QEMU, each visibly producing output | QEMU smoke `three_tasks_run_concurrently_b1`; the output assertion is "each task's identifying character appears at least N times in serial output" |
-| B1-8 | Tasks yield via explicit `yield_now()` calls, not preemption (no timer-driven preemption at B1) | Code review check; preemption code absent from `kernel/src/arch/`; QEMU smoke confirms scheduler doesn't preempt a tight loop |
-| B1-9 | `BlinkerTask`, `ConsoleTask`, `WatchdogTask` each have per-system docs (lightweight — they're instance examples, not generic systems) | Review check; `docs/systems/blinker_task.md`, etc. |
-| B1-10 | Updated diagrams for `Scheduler`, `Task`, `Kernel` (showing `$Running` child) committed and current | `cargo xtask check-diagrams` |
-| B1-11 | All CI quality gates pass, plus QEMU smoke tests on Linux | Full CI matrix + Linux kernel CI |
+| B1-1 | `Scheduler` and `Task` state graphs match committed designs | Snapshots `scheduler_state_graph_snapshot`, `task_state_graph_snapshot` (`kernel-tests`) |
+| B1-2 | `Task` transitions correctly per committed state-event pair | Behavioral tests in `kernel-tests/tests/task_behavior.rs` (host) |
+| B1-3 | `Scheduler` picks next / context-switch logic correct, with the native switch mocked | Behavioral tests in `kernel-tests/tests/scheduler_behavior.rs` (host) |
+| B1-4 | The deferred-event queue obeys the post/drain contract: `post` never dispatches inline and is safe from any context; `drain` is serial per instance | Unit/behavioral tests for the queue (`kernel-tests`); the contract is the one in [`port_contract.md`](port_contract.md) (observation note) |
+| B1-5 | A tight-loop thread **is preempted** (distinguishes from cooperative) | QEMU smoke `tight_loop_thread_is_preempted_b1` — a thread that never yields still lets others run |
+| B1-6 | N kernel threads run concurrently, each visibly producing output | QEMU smoke `threads_run_concurrently_b1` (each thread's marker appears ≥N times) |
+| B1-7 | Diagrams + per-system docs for `Scheduler`, `Task`, and the deferred-event queue | `cargo xtask check-diagrams`; review |
+| B1-8 | All CI gates pass, plus QEMU smoke on Linux | Full CI matrix + `qemu-test` |
 
-**Estimated effort:** Four to six weeks. This is the milestone where the kernel feels like a kernel.
+**Estimated effort:** Large. The preemptive context switch (saving full state from interrupt context and resuming a different thread) and the interrupt-safe queue are the classic hard parts; this is where the kernel first feels like a kernel.
 
-### B2 — interactive shell over serial
+### B2 — virtual memory & address spaces
 
-**Scope:** B1 plus a shell state machine running as a kernel task, reading from and writing to the serial console. Same `Shell` and `Parser` Frame systems as the hosted shell, with different action implementations.
+**Scope:** B1 plus real memory management. A physical frame allocator and 4-level paging, with the kernel in its own address space and the machinery to construct per-process address spaces (consumed at B3). Demand paging and copy-on-write fault handling.
 
-**Builtins available:**
-- `help` — list commands
-- `tasks` — list running tasks and their states (introspection of the scheduler)
-- `ticks` — show uptime in timer ticks
-- `mem` — show memory statistics
-- `echo` — echo arguments
-- `panic` — deliberately panic the kernel (for demoing the panic handler)
+**Frame systems:**
+- `PageFaultHandler` — HSM `$Classifying → $StackGrow | $CopyOnWrite | $LazyFault | $Fatal`; the parent catches the unrecoverable case and routes to process kill via `=> $^`.
 
-**Frame systems:** `Shell` (reused from H1 — identical `.frs`), `Parser` (reused from H1 — identical `.frs`), with bare-metal action implementations supplied in the kernel crate.
+**Native components:** physical frame allocator (bitmap or buddy); 4-level page tables with map/unmap/translate; address-space construction and teardown; the page-fault interrupt entry that frames the fault as an event into `PageFaultHandler`.
 
-**Native components:** Serial input handling (UART receive interrupt), command-line buffer in `heapless::String`.
+**framec gate expected:** *HSM forwarding* (fault → fatal → kill via `=> $^`); *transition guards* (the fault-classification predicates — present/write/user bits → which child state).
 
 #### Exit criteria
 
 | # | Exit criterion | Validating test(s) |
 |---|---|---|
-| B2-1 | The exact same `frame/shell.frs` and `frame/parser.frs` source files compile into both the hosted and kernel binaries | Cargo build success on both `shell` crate (host) and `kernel` crate (target `x86_64-unknown-none`); a `cargo xtask check-frame-source-shared` task asserts the file hashes match what both crates compile against |
-| B2-2 | The bare-metal `Shell` snapshot matches the hosted one for state structure (same states, transitions) | Snapshot file is shared / cross-referenced; `kernel/tests/state_graphs.rs::shell_state_graph_matches_hosted` asserts byte equality with the hosted snapshot |
-| B2-3 | Typing at the QEMU serial console produces a working REPL | QEMU smoke `serial_shell_responds_to_help_b2` sends "help\n" via QEMU serial, asserts builtin list appears |
-| B2-4 | `tasks` builtin lists running kernel tasks with their `Task` state | QEMU smoke `tasks_builtin_lists_running_tasks` |
-| B2-5 | `ticks` builtin prints uptime in timer ticks | QEMU smoke `ticks_builtin_increments_over_time` (read twice, second > first) |
-| B2-6 | `mem` builtin prints memory statistics | QEMU smoke `mem_builtin_prints_stats` |
-| B2-7 | `echo` builtin works identically to the hosted version | QEMU smoke `echo_builtin_in_kernel_matches_hosted` |
-| B2-8 | `panic` builtin deliberately panics the kernel (for demoing the panic handler) | QEMU smoke `panic_builtin_triggers_panic_handler` (asserts panic message appears on serial, then kernel halts) |
-| B2-9 | `Shell` per-system doc updated with a "Bare-metal action implementations" subsection documenting the kernel-side action bodies | Review check |
-| B2-10 | All CI quality gates pass, plus QEMU smoke tests | Full CI matrix + Linux kernel CI |
+| B2-1 | `PageFaultHandler` state graph matches committed design | Snapshot `page_fault_handler_state_graph_snapshot` (`kernel-tests`) |
+| B2-2 | Fault classification is correct: stack-grow, COW, lazy-fault, fatal | Behavioral tests in `kernel-tests/tests/page_fault_handler_behavior.rs` (host, faults injected as events) |
+| B2-3 | Physical frame allocator: alloc/free/double-free-guard | Unit tests (host) |
+| B2-4 | Paging: map → translate round-trips; unmap revokes; per-address-space isolation | Unit tests (host) where feasible + QEMU smoke `paging_maps_and_isolates_b2` |
+| B2-5 | A demand-paged region faults in correctly; an illegal access lands in `$Fatal` without crashing the kernel | QEMU smoke `demand_page_faults_in_b2`, `illegal_access_is_fatal_not_crash_b2` |
+| B2-6 | Diagrams + per-system doc for `PageFaultHandler` | `cargo xtask check-diagrams`; review |
+| B2-7 | All CI gates pass, plus QEMU smoke on Linux | Full CI matrix + `qemu-test` |
 
-**Estimated effort:** Two to three weeks.
+**Estimated effort:** Large; mostly native (paging is unsafe-Rust-heavy). The Frame payload is concentrated in `PageFaultHandler`.
 
-### B3 — bytecode VM and dynamic programs
+### B3 — user mode, processes, syscalls, ELF, fork/exec
 
-**Scope:** B2 plus a bytecode interpreter that can load and execute small programs sent over serial or baked into the kernel image.
+**Scope:** B2 plus the user/kernel boundary — the defining feature of a real OS. Ring-3 execution, the `syscall`/`sysret` fast path, per-process address spaces, ELF binary loading, and `fork`/`exec`. Basic signals (at least `SIGKILL`, `SIGSEGV` from a fatal fault, `SIGCHLD` on child exit). This is the milestone that crosses the xv6 bar.
 
-**Bytecode format:**
-- 32 opcodes — push, pop, add, sub, mul, div, mod, eq, ne, lt, gt, jmp, jz, jnz, call, ret, print_int, print_str, read_char, halt, plus a few others
-- Stack-based VM with a 256-entry operand stack
-- Programs are flat byte arrays; no separate code/data segments; no relocation
-- A small assembler (Python, around 200 lines) translates text mnemonics to bytecode files
+**Frame systems:**
+- `Process` — HSM `$Created → $Ready → $Running → $Blocked → $Zombie → $Reaped` (replaces `Task`; state-dependent `kill()` per the architecture doc).
+- `ProcessTable` — slot lifecycle: reserve → activate → zombie-awaiting-reap → free.
+- `SyscallDispatcher` — HSM `$Validating → $Executing` under a `$Active` parent that catches `bad-arg`/`permission-denied`/`out-of-memory` via `=> $^`.
+- `ElfLoader` — `$ReadingHeader → $ValidatingHeader → $MappingSegments → $BuildingStack → $Done`; `$Failed` sink cleans up partial work.
 
-**Frame systems:** `Interpreter` (new — the fetch-decode-execute cycle as a state machine), in addition to all previous systems.
+**Native components:** ring-3 entry, TSS, `syscall`/`sysret` MSR setup, full register save/restore at the boundary, ELF byte parsing, the syscall ABI, a minimal libc + crt0 for user programs, `fork` (address-space copy / COW) and `exec`.
 
-**Native components:** Bytecode loading (over serial, with simple framing), the assembler tool.
+**framec gate expected:** *scale* — one `Process` instance per process (does the `Rc`/`Vec`/`BTreeMap` machinery hold up at dozens–hundreds of instances?); *HSM depth + forwarding* (`SyscallDispatcher`); the `ElfLoader` `$Failed` partial-cleanup funnel.
 
 #### Exit criteria
 
 | # | Exit criterion | Validating test(s) |
 |---|---|---|
-| B3-1 | `Interpreter` state graph matches committed design (`$Fetching → $Decoding → $Exec<Opcode> → $Fetching`, terminal `$Halted` and `$Faulted`) | Snapshot `interpreter_state_graph_snapshot` |
-| B3-2 | Each opcode handler transitions correctly: stack effects, flow control (`jmp`, `jz`, `jnz`, `call`, `ret`), arithmetic | Behavioral tests in `kernel/tests/interpreter_behavior.rs` — at least one per opcode in the 32-opcode set, covering both the success path and any failure path |
-| B3-3 | `Interpreter` correctly executes a Fibonacci program | Behavioral `interpreter_runs_fibonacci_program` (uses a `.fb` byte array baked into the test); QEMU smoke `kernel_runs_fibonacci_via_run_builtin` |
-| B3-4 | The assembler (Python tool) produces bytecode files that match a committed set of golden expected outputs for known input programs | Test script in `tools/assembler/tests/`; runs as a separate `xtask` subcommand |
-| B3-5 | `load <name>` builtin reads bytecode over serial and stores it | QEMU smoke `load_then_run_executes_program` (composite test) |
-| B3-6 | `run <name>` builtin invokes `Interpreter` on the loaded bytecode and prints its output | Same QEMU smoke as B3-5 |
-| B3-7 | Stack overflow / underflow / illegal opcode produce `$Faulted` state, not a kernel panic | Behavioral `interpreter_stack_overflow_transitions_to_faulted`, `interpreter_illegal_opcode_transitions_to_faulted` |
-| B3-8 | The `Interpreter` SVG visibly shows the fetch-decode-execute cycle as a closed dispatch loop (Frame argument: the VM literally is a state machine) | Visual review check; the SVG should be readable as a flowchart |
-| B3-9 | Assembler tool documented in `tools/assembler/README.md` with the opcode table and bytecode format | Review check |
-| B3-10 | Per-system doc for `Interpreter` | Review check; Testing section enumerates per-opcode behavioral tests |
-| B3-11 | All CI quality gates pass, plus QEMU smoke tests, plus assembler tests | Full CI matrix |
+| B3-1 | `Process`, `ProcessTable`, `SyscallDispatcher`, `ElfLoader` state graphs match committed designs | Snapshots (`kernel-tests`) |
+| B3-2 | `Process` traverses its full lifecycle incl `$Zombie`/`$Reaped`; `kill()` is state-dependent | Behavioral `kernel-tests/tests/process_behavior.rs` (host) |
+| B3-3 | `SyscallDispatcher` forwards errors to `$Active` via `=> $^` | Behavioral `..._forwards_to_active` per error class (host) |
+| B3-4 | `ElfLoader` loads a valid ELF; a corrupt ELF lands in `$Failed` with cleanup | Behavioral `elf_loader_behavior.rs` incl corrupt-ELF (host) |
+| B3-5 | A user-mode hello-world runs (ring 3, via `exec`) | QEMU smoke `hello_world_runs_in_user_mode_b3` |
+| B3-6 | Hardware isolation: a user read of kernel memory page-faults and does **not** crash the kernel | QEMU smoke `user_kernel_read_faults_b3`, `user_fault_does_not_crash_kernel_b3` |
+| B3-7 | `fork` + `exec` spawns a child that runs independently; parent reaps via wait | QEMU smoke `fork_exec_spawns_child_b3` |
+| B3-8 | The syscall ABI is documented | `docs/syscall_abi.md`; review |
+| B3-9 | Per-system docs for the four new systems; diagrams current | Review; `cargo xtask check-diagrams` |
+| B3-10 | All CI gates pass, plus QEMU smoke on Linux | Full CI matrix + `qemu-test` |
 
-**Estimated effort:** Three to four weeks. The bytecode VM is the milestone where Frame's role is most direct — the interpreter is implemented as a Frame state machine, with each opcode as a state and the fetch-decode-execute cycle as the dispatch loop.
+**Estimated effort:** Very large. Ring transitions, the syscall boundary, `fork`/COW, and ELF loading are each substantial. This is the xv6-class core.
 
-B3 is the B-track's final committed milestone. Beyond B3, the project considers itself a success in its primary goals.
+### B4 — block device & filesystem
 
-### B4 — Tier 3: paging, user mode, ELF loading (STRETCH)
+**Scope:** B3 plus persistent storage. A block device driver, a buffer cache, and a real (if minimal) on-disk filesystem with inodes, directories, and a VFS layer. **The shell returns here as a *userspace program*** — the H-track `Shell`/`Parser` `.frs` compiled for user mode (not a kernel task), loading programs from disk via `fork`/`exec`. This is the strongest form of the "same Frame source, host and kernel" demonstration.
 
-**Scope:** B3 plus full Unix-shaped semantics — separate address spaces per process, user-mode execution, ELF binary loading, hardware-enforced isolation, system call dispatch via the `syscall` instruction.
+**Frame systems:**
+- `BlockRequest` — I/O request lifecycle `$Queued → $InFlight → $Complete | $Error`.
+- `OpenFile` — `$Open → $Reading/$Writing → $Closed`.
+- `Mount` — filesystem mount/unmount lifecycle.
+- `Shell`/`Parser` — reused from the H-track, now as a userspace program (bare-metal/userspace action implementations).
 
-**This is a stretch milestone.** Achieving B3 with strong documentation is a more valuable outcome than reaching a half-finished B4. B4 is the project's most ambitious technical achievement but explicitly optional.
+**Native components:** virtio-blk (or AHCI) driver + DMA; buffer/page cache; the on-disk FS format (inodes, dirents, free-block bitmap); VFS dispatch.
 
-**Frame systems:** `Process` (replacing `Task`), `ProcessTable` (new), `SyscallDispatcher` (new), `ElfLoader` (new), `PageFaultHandler` (new).
-
-**Native components, substantial:**
-- Full x86_64 paging (4-level page tables, per-process address spaces)
-- Context switching with full register state, FS/GS base, etc.
-- ELF parser (the byte-level parsing; the loader state machine is Frame)
-- Custom libc and crt0 for user programs
-- A custom toolchain configuration for cross-compiling user programs against Frame OS's syscall ABI
+**framec gate expected:** *per-inode/per-file serialization* — concurrent operations on one inode must serialize, which is the same `post`/`drain` queue pattern as B1, now applied to data structures; I/O request state machines under concurrency.
 
 #### Exit criteria
 
 | # | Exit criterion | Validating test(s) |
 |---|---|---|
-| B4-1 | `Process`, `ProcessTable`, `SyscallDispatcher`, `ElfLoader`, `PageFaultHandler` state graphs match committed designs | Snapshots `process_state_graph_snapshot`, `process_table_state_graph_snapshot`, `syscall_dispatcher_state_graph_snapshot`, `elf_loader_state_graph_snapshot`, `page_fault_handler_state_graph_snapshot` |
-| B4-2 | `Process` correctly traverses its lifecycle including `$Zombie` and `$Reaped` (which `Task` at B1 didn't exercise) | Behavioral tests in `kernel/tests/process_behavior.rs` per state-event pair |
-| B4-3 | `ProcessTable` correctly manages slot reservation, activation, zombie awaiting reap, and free | Behavioral tests in `kernel/tests/process_table_behavior.rs` |
-| B4-4 | `SyscallDispatcher` HSM: child states forward errors to `$Active` parent's handlers via explicit `=> $^` | Behavioral `bad_arg_in_validating_forwards_to_active`, `permission_denied_in_executing_forwards_to_active`, `out_of_memory_in_executing_forwards_to_active` |
-| B4-5 | `ElfLoader` correctly progresses through load phases, with `$Failed` cleaning up partial work | Behavioral tests in `kernel/tests/elf_loader_behavior.rs`, plus a deliberately-corrupt-ELF test that should land in `$Failed` |
-| B4-6 | `PageFaultHandler` correctly classifies stack-grow, copy-on-write, lazy-fault, and unrecoverable cases | Behavioral tests in `kernel/tests/page_fault_handler_behavior.rs` |
-| B4-7 | A user-mode hello world (compiled with `cc -ffreestanding -nostdlib -static`) runs on Frame OS | QEMU smoke `hello_world_runs_in_user_mode_b4` |
-| B4-8 | The hello world is hardware-isolated: attempting to read kernel memory page-faults; faulting does not crash the kernel | QEMU smoke `user_mode_kernel_memory_read_page_faults`, `user_mode_fault_does_not_crash_kernel` |
-| B4-9 | A custom libc + crt0 build is reproducible from sources in the repo | Build script in `userspace/` builds the libc and crt0 deterministically; CI exercises the build |
-| B4-10 | The syscall ABI is documented (interface table: syscall number, args, return) | `docs/syscall_abi.md` (new) — review check |
-| B4-11 | Per-system docs for all five new Frame systems | Review check |
-| B4-12 | All CI quality gates pass, plus full QEMU smoke set including user-mode tests | Full CI matrix |
+| B4-1 | `BlockRequest`, `OpenFile`, `Mount` state graphs match committed designs | Snapshots (`kernel-tests`) |
+| B4-2 | I/O request + file + mount lifecycles correct | Behavioral tests (host) per system |
+| B4-3 | create → write → read → delete round-trips; data survives across operations | QEMU smoke `fs_file_roundtrip_b4` |
+| B4-4 | `mount`/`unmount` work; the FS persists across a reboot of the same disk image | QEMU smoke `fs_persists_across_reboot_b4` |
+| B4-5 | The userspace shell `cat`s a file loaded from disk and runs a program from disk | QEMU smoke `userspace_shell_runs_program_from_disk_b4` |
+| B4-6 | `Shell`/`Parser` per-system docs gain a "userspace action implementations" note; same `.frs` builds for host and userspace | Review; build check |
+| B4-7 | Diagrams + per-system docs; all CI gates + QEMU smoke | `cargo xtask check-diagrams`; review; full CI + `qemu-test` |
 
-(A side-by-side write-up comparing the `Process` state graph to equivalent Linux kernel code is listed as a validation milestone in [`vision.md`](vision.md), not a technical milestone here. The kernel can be technically complete without the write-up.)
+**Estimated effort:** Very large.
 
-**Estimated effort:** Many months. Possibly the project's entire next phase rather than a single milestone.
+### B5 — networking (the headline)
+
+**Scope:** B4 plus a TCP/IP stack — the most impressive milestone and the deepest Frame stress test. A NIC driver, ARP, IPv4, ICMP (ping), UDP, and TCP, with **TCP modeled as the Frame state machine it canonically is**.
+
+**Frame systems:**
+- `ArpResolver`, `IpReassembly`, `UdpSocket`.
+- **`TcpConnection`** — the full RFC-793 state machine: `$Closed → $SynSent/$SynReceived → $Established → $FinWait1/$FinWait2/$Closing/$TimeWait/$CloseWait/$LastAck → $Closed`, with retransmit, delayed-ACK, and simultaneous-open/close edge cases. One instance per connection.
+
+**Native components:** virtio-net (or e1000) driver + DMA rings; checksum handling; socket buffers; the timer wheel feeding TCP's timers.
+
+**framec gates expected (the deepest in the whole roadmap):**
+- **Timed transitions / `after(ms)`** — TCP is full of timers (retransmit, `TIME_WAIT` 2·MSL, delayed-ACK, keepalive). If Frame has no native timed-transition primitive, this is where it is needed most.
+- **Orthogonal / parallel regions** — a connection's send and receive paths have largely independent state.
+- **History states** and **guards** (sequence-number / window predicates).
+- **Scale** — many concurrent connections, each an instance.
+
+#### Exit criteria
+
+| # | Exit criterion | Validating test(s) |
+|---|---|---|
+| B5-1 | `TcpConnection` state graph matches the RFC-793 diagram | Snapshot `tcp_connection_state_graph_snapshot`; review against RFC-793 |
+| B5-2 | Per-transition behavior incl the hard edges: simultaneous open/close, retransmit, `TIME_WAIT` expiry | Behavioral tests (host) per transition |
+| B5-3 | The kernel answers `ping` (ICMP echo) | QEMU smoke `kernel_answers_ping_b5` (external client over QEMU user-net) |
+| B5-4 | A full TCP handshake + a trivial request/response + clean close, against an external client | QEMU smoke `tcp_echo_or_http_b5` |
+| B5-5 | ARP resolution and IP reassembly correct | Behavioral + smoke |
+| B5-6 | Per-system docs incl a `TcpConnection`-vs-RFC-793 comparison write-up | Review |
+| B5-7 | Diagrams + all CI gates + QEMU smoke | `cargo xtask check-diagrams`; full CI + `qemu-test` |
+
+**Estimated effort:** Very large. This is the milestone the "stress-test Frame" thesis is pointed at — if Frame expresses a correct TCP FSM cleanly, that is the headline result.
+
+### B6 — USB
+
+**Scope:** B5 plus a USB stack: an xHCI host-controller driver and device enumeration, demonstrating Frame on a deep hardware protocol.
+
+**Frame systems:**
+- `UsbEnumeration` — `$Powered → $Reset → $AddressAssigned → $Configured`.
+- `UsbTransfer` — control/bulk/interrupt transfer lifecycles.
+- `HubPort` — per-port connect/reset/enable state.
+
+**Native components:** xHCI controller (command/event/transfer rings, DCBAA, scratchpad buffers); USB descriptor parsing.
+
+**framec gates expected:** deep protocol HSMs; orthogonal regions (multiple ports concurrently); timed transitions (reset/settle timing).
+
+#### Exit criteria
+
+| # | Exit criterion | Validating test(s) |
+|---|---|---|
+| B6-1 | `UsbEnumeration`, `UsbTransfer`, `HubPort` state graphs match committed designs | Snapshots (`kernel-tests`) |
+| B6-2 | Enumeration + transfer lifecycles correct | Behavioral tests (host) |
+| B6-3 | A QEMU virtual USB device (e.g. keyboard or mass-storage) enumerates to `$Configured` and completes a transfer | QEMU smoke `usb_device_enumerates_b6` |
+| B6-4 | Per-system docs; diagrams; all CI gates + QEMU smoke | Review; `cargo xtask check-diagrams`; full CI + `qemu-test` |
+
+**Estimated effort:** Very large.
+
+### B7 — SMP
+
+**Scope:** B6 plus symmetric multiprocessing. Bring up the application processors, run the scheduler across all cores, and make the kernel safe under true concurrency. The hardest milestone, and the one that most tests the deferred-event queue's concurrency story.
+
+**Frame systems:** minimal *new* Frame logic — locking and per-CPU data are native. The point is that the **existing** systems (`Scheduler`, `Process`, `TcpConnection`, …) remain correct when their Ports receive `post`s from other cores.
+
+**Native components:** AP startup (INIT/SIPI); per-CPU data (GS-base); IPIs; TLB shootdown; spinlocks/sleep-locks + documented lock ordering; the cross-core `post` path on the deferred-event queue.
+
+**framec gate expected:** **`Send` + `Sync` codegen** — a Frame system whose Port receives cross-core posts needs its event type and queue thread-safe; framec may need an `Arc`-based / `Send`-able codegen mode. This is the concurrency gate flagged in early analysis, now hit for real, in the meanest possible setting.
+
+#### Exit criteria
+
+| # | Exit criterion | Validating test(s) |
+|---|---|---|
+| B7-1 | Multiple cores each run threads/processes | QEMU smoke `smp_cores_run_concurrently_b7` (`-smp N`) |
+| B7-2 | A Frame system is safely driven from another core via cross-core `post` (no data race) | QEMU smoke + (where feasible) a sanitizer build |
+| B7-3 | Lock ordering documented; no deadlock under a stress workload | Review + a stress smoke test |
+| B7-4 | The deferred-event queue's `Send`/`Sync` story validated; framec codegen mode (if added) documented | Review; framec gate write-up |
+| B7-5 | All CI gates + QEMU smoke (incl `-smp`) on Linux | Full CI matrix + `qemu-test` |
+
+**Estimated effort:** Very large; the final boss. SMP correctness (locking, TLB shootdown, memory ordering) is where real kernels spend their hardest debugging.
 
 ## Dependency graph between milestones
 
-The track-internal dependencies are sequential: H0 → H1 → H2 → H3, and B0 → B1 → B2 → B3 → B4.
+The H-track (H0 → H1 → H2 → H3) is **complete**. The B-track is strictly
+sequential and each milestone builds on the last:
 
-The cross-track dependencies are:
-- **B2 depends on H1 in *spirit*, not strictly.** The `Shell` and `Parser` Frame systems are first written for the hosted track where iteration is faster. By the time we reach B2 we want those systems to be stable, which means H1 should be done. H2 and H3 add features to the hosted shell that don't propagate back to the bare-metal version, so B2 doesn't depend on them.
-- **B3 depends on B2.** The interpreter is exposed through the shell's `run` builtin.
-- **B4 stands alone in dependency terms** but builds on all previous bare-metal work.
+```
+B0 ──► B1 ──► B2 ──► B3 ──► B4 ──► B5 ──► B6 ──► B7
+done  preempt  VM   user/ block/  net   USB   SMP
+             space  proc  FS    (TCP)
+```
 
-A reasonable execution order:
+- **B1 → B2:** preemption + the deferred-event queue exist before virtual memory; VM doesn't need preemption but preemption surfaces the queue, which later milestones rely on.
+- **B2 → B3:** user-mode processes need per-process address spaces (B2's paging) and fault handling.
+- **B3 → B4:** the userspace shell and "load a program from disk" need both user mode (B3) and a filesystem (B4); the FS driver also benefits from preemption (B1) to overlap I/O.
+- **B4 → B5 → B6:** networking and USB are device stacks layered on the interrupt + DMA infrastructure that's matured by B4.
+- **B7 (SMP) last:** it re-validates every prior Frame system under true concurrency, so it comes after they exist and are correct single-core.
 
-1. H0 (a few days)
-2. H1 (1-2 weeks) — produces shared Frame systems
-3. B0 (2-3 weeks) — kernel boots in QEMU
-4. H2 (1 week) — extends hosted shell with external command execution
-5. B1 (4-6 weeks) — multitasking kernel
-6. B2 (2-3 weeks) — bare-metal shell using shared Frame systems
-7. H3 (2-3 weeks) — completes hosted track with job control
-8. B3 (3-4 weeks) — bytecode VM
-9. [Project's primary scope complete. Decision point: continue to B4, or declare success at B3 and write up.]
-10. B4 (months) — optional Tier 3 extension
+The H-track's `Shell`/`Parser` Frame systems are **reused** at B4 as a
+userspace program — the same `.frs`, different (userspace) action
+implementations. That cross-track sharing is a deliberate demonstration,
+not a dependency that blocks B-track progress.
 
-The reordering above (B2 before H3) reflects the dependency: B2 needs H1 done, not H3. Running B2 earlier surfaces any bare-metal-specific issues with the shared Frame systems sooner, while there's still time to fix them in both tracks.
-
-Total estimated effort to B3, summing the milestones: **roughly 4 to 6 months** of focused work, depending on pace and how much slips. Real projects always run over their estimates; the wider range allows for that. B4 if pursued adds another 6-12 months and should be treated as a separate phase of the project.
+**Estimated effort.** This is now a multi-year, real-OS-class project, not
+a months-long demonstration. Each of B1–B7 is a "very large" milestone in
+its own right (preemption, paging, the user/kernel boundary, a filesystem,
+a TCP/IP stack, USB, SMP are each the kind of thing that anchors a
+semester course or a small team for months). There is **no time pressure**
+on this roadmap — correctness, documentation, and Frame stress-test value
+are the goals, not speed. Milestones are taken one at a time, each landing
+green (all gates + QEMU smoke) before the next begins, exactly as B0 did.
 
 ## Testing across milestones
 
@@ -404,28 +485,37 @@ The test infrastructure is bootstrapped at H0 (workspace `cargo test`, `insta` s
 
 A milestone whose Frame systems lack the expected test coverage is not "done" even if the code works. The vision doc commits to documented systems with documented test coverage; the roadmap honors that commitment by treating tests as a milestone deliverable rather than a follow-up.
 
+## Now in scope (formerly excluded)
+
+The re-baseline pulled several items that were previously out of scope into
+committed milestones:
+
+- **User mode + processes + `fork`/`exec`** — core at B3 (was a B4 stretch / `fork` was excluded).
+- **Virtual memory / paging** — core at B2.
+- **On-disk filesystem** — core at B4 (was excluded; "bundled file table only").
+- **Networking / TCP/IP** — core at B5 (was excluded). The headline Frame stress test.
+- **USB** — core at B6 (was excluded).
+- **Multi-core / SMP** — core at B7 (was excluded).
+
 ## Out of scope
 
-For completeness, things that are *not* on this roadmap and won't be unless the project's scope is explicitly expanded later:
+Still *not* on this roadmap unless scope is expanded later:
 
-- Networking. No TCP/IP stack, no network drivers.
-- USB. No USB host or device support.
-- Filesystem on disk. The kernel image's bundled file table is the only "filesystem."
-- Multi-core / SMP. All bare-metal targets are single-core.
-- GUI. No framebuffer console, no graphics, serial is the only I/O.
-- Process forking. B4 supports `exec()` to start fresh processes but not `fork()` to clone existing ones.
-- Threads. One thread per process.
-- Comprehensive signal handling. SIGKILL only.
-- Power management, suspend/resume.
-- Audio, video, GPU.
-- Virtualization, container support.
+- **GUI / framebuffer graphics.** Serial (and possibly a later text console) only; no windowing, no compositor.
+- **Audio, video, GPU acceleration.**
+- **Multiple threads within one process.** The process is the unit of concurrency (one thread per process). Kernel-internal concurrency is the scheduler's threads and, at B7, multiple cores.
+- **Dynamic linking / shared libraries.** Static user binaries only.
+- **Full POSIX signal set.** A basic subset (`SIGKILL`, `SIGSEGV`, `SIGCHLD`) at B3; not the complete signal/handler/mask/`sigaction` machinery.
+- **Virtualization / container support.**
+- **Power management / ACPI sleep states** beyond what firmware does at boot. (A device/power state machine could be a *future* Frame showcase, but it is not committed.)
+- **Architectures beyond x86_64** for now. AArch64 / Raspberry Pi is a plausible later track, not a committed milestone.
 
-Adding any of these would multiply the project's size without strengthening its central argument. Some may make sense as follow-on projects once the core Frame OS is established. None are committed in this roadmap.
+These are excluded to keep an already-large project bounded; some may make sense as follow-on work once B7 is reached.
 
 ## How the roadmap will be maintained
 
 This file is updated as milestones are completed and as scope decisions change. Each milestone gets a "status" annotation as it progresses: `planned`, `in-progress`, `done`, or `deferred`. When a milestone is `done`, the criteria above should be verifiable by anyone who builds and runs Frame OS.
 
-Decisions to expand or contract scope are documented here, with reasoning. If B4 is dropped, this file should explain why. If a new milestone (say, "B5 — port to Pi 4") is added, this file should explain its goals and dependencies.
+Decisions to expand or contract scope are documented here, with reasoning — as the 2026-05-20 re-baseline note at the top of Track B does. If a committed milestone (e.g. B6/B7) is dropped, this file should explain why. If a new milestone (say, "B8 — AArch64 / Raspberry Pi port") is added, this file should explain its goals and dependencies.
 
 The roadmap is a project artifact, not a marketing document. It should be accurate enough that someone reading it knows what the project is, what it isn't, and what's actually working today.
