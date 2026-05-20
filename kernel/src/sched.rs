@@ -1,57 +1,86 @@
 // kernel/src/sched.rs
 //
-// B1 Step 3c: preemptive round-robin over kernel threads.
+// B1 Step 3c + completion: preemptive round-robin over kernel threads,
+// with the Frame `Scheduler` made load-bearing for the run/halt decision.
 //
-// This is the native half of preemption — the register/stack mechanics the
-// Frame `Scheduler` deliberately does NOT model. The timer ISR
-// (interrupts.rs `isr_timer`) saves the full register frame and calls
-// `schedule(rsp)`, which:
-//   - records the tick + ACKs the PIC (always), then
-//   - if preemption is active: stashes the outgoing thread's rsp in its TCB,
-//     advances round-robin, and returns the next thread's rsp;
-//   - else: returns the same rsp (no switch).
+// Split of responsibilities (the honest native/Frame line):
+//   - NATIVE (this module): the register/stack mechanics. A fixed TCB array,
+//     a per-TCB run state, and `schedule()` — called from the timer ISR —
+//     which saves the outgoing thread's rsp and picks the next *runnable*
+//     worker round-robin (or the boot context if none). The ISR path never
+//     touches a Frame system (Frame dispatch is non-reentrant).
+//   - FRAME (`Scheduler`, $Idle/$Active): the run/halt *mode*. Spawning a
+//     worker fires `task_ready` ($Idle→$Active); a worker exiting fires
+//     `task_unready` (→$Idle at zero). The boot context reads `is_idle()`
+//     to decide when to stop. Because the Scheduler is shared across
+//     preemptible threads and is non-reentrant, every dispatch runs inside
+//     `interrupts::without_interrupts` — single-core mutual exclusion.
 //
-// A fresh thread's stack is crafted to look exactly like a thread that was
-// preempted: 15 zeroed GPRs below a synthetic `iretq` frame (RIP=entry,
-// CS, RFLAGS with IF=1, RSP=its running stack, SS). The first switch into
-// it pops the GPRs and `iretq`s it to life with interrupts enabled, so it
-// is immediately preemptible.
-//
-// The demo runs two threads that busy-loop and print '1' / '2' WITHOUT ever
-// yielding. The only way both make progress (both digits appear) is the
-// timer preempting them — which is the whole point of the milestone.
+// The demo: two threads busy-loop printing '1'/'2' (no yield) for a few
+// rounds, then each EXITS. Preemption interleaves them (B1-4/B1-5); once
+// both have exited the Frame Scheduler is $Idle and the kernel halts
+// (B1-6).
 
 use core::arch::asm;
-use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use core::sync::atomic::{AtomicBool, Ordering};
 
+use crate::frame_systems::Scheduler;
 use crate::interrupts;
 use crate::serial;
 
 const MAX_THREADS: usize = 8;
 const STACK_SIZE: usize = 16 * 1024;
+const ROUNDS_PER_WORKER: u32 = 6;
+
+#[derive(Clone, Copy, PartialEq)]
+enum RunState {
+    Free,
+    Runnable,
+    Dead,
+}
 
 #[derive(Clone, Copy)]
 struct Tcb {
     rsp: u64,
+    state: RunState,
 }
 
-static mut TCBS: [Tcb; MAX_THREADS] = [Tcb { rsp: 0 }; MAX_THREADS];
-static mut N: usize = 0;
+static mut TCBS: [Tcb; MAX_THREADS] = [Tcb {
+    rsp: 0,
+    state: RunState::Free,
+}; MAX_THREADS];
+static mut N: usize = 0; // total TCBs incl. boot (slot 0)
 static mut CURRENT: usize = 0;
 static ACTIVE: AtomicBool = AtomicBool::new(false);
 
 static mut STACK1: [u8; STACK_SIZE] = [0; STACK_SIZE];
 static mut STACK2: [u8; STACK_SIZE] = [0; STACK_SIZE];
 
-static PRINTS: AtomicU32 = AtomicU32::new(0);
+// The Frame Scheduler — guarded by interrupts-off critical sections (it is
+// non-reentrant and shared across preemptible threads).
+static mut SCHED: Option<Scheduler> = None;
+
+fn tcbs() -> *mut Tcb {
+    (&raw mut TCBS) as *mut Tcb
+}
+
+/// Run `f` with the Frame Scheduler, in a critical section.
+fn with_sched<R>(f: impl FnOnce(&mut Scheduler) -> R) -> R {
+    interrupts::without_interrupts(|| unsafe {
+        let p = &raw mut SCHED;
+        let s = (*p).as_mut().expect("scheduler initialized");
+        f(s)
+    })
+}
 
 // ---------------------------------------------------------------------------
-// The scheduler callback (invoked from the timer ISR)
+// The scheduler callback (invoked from the timer ISR — native only)
 // ---------------------------------------------------------------------------
 
 /// Called by `isr_timer` with the interrupted thread's stack pointer.
-/// Returns the stack pointer to resume (same context if preemption is
-/// inactive, else the next thread round-robin).
+/// Returns the stack pointer to resume. Pure native: it must not touch the
+/// Frame Scheduler (that would re-enter a non-reentrant system from
+/// interrupt context).
 #[no_mangle]
 extern "C" fn schedule(current_rsp: u64) -> u64 {
     interrupts::record_tick();
@@ -61,18 +90,34 @@ extern "C" fn schedule(current_rsp: u64) -> u64 {
     }
 
     unsafe {
-        let tcbs = (&raw mut TCBS) as *mut Tcb;
+        let t = tcbs();
         let n = (&raw const N).read();
         let cur = (&raw const CURRENT).read();
-        (*tcbs.add(cur)).rsp = current_rsp;
-        let next = (cur + 1) % n;
+        (*t.add(cur)).rsp = current_rsp;
+
+        // Round-robin over worker slots 1..n (skip boot slot 0); fall back
+        // to boot (the idle context) when no worker is runnable.
+        let mut next = 0usize;
+        let mut step = 1usize;
+        while step <= n {
+            let cand = (cur + step) % n;
+            step += 1;
+            if cand == 0 {
+                continue;
+            }
+            if (*t.add(cand)).state == RunState::Runnable {
+                next = cand;
+                break;
+            }
+        }
+
         (&raw mut CURRENT).write(next);
-        (*tcbs.add(next)).rsp
+        (*t.add(next)).rsp
     }
 }
 
 // ---------------------------------------------------------------------------
-// Thread setup
+// Thread setup (native)
 // ---------------------------------------------------------------------------
 
 fn read_cs() -> u16 {
@@ -91,60 +136,69 @@ fn read_ss() -> u16 {
     v
 }
 
-/// Craft a fresh thread's stack so the first `context_switch`/`iretq` into
-/// it starts `entry` with interrupts enabled. Returns the saved rsp (where
-/// the timer ISR's `pop`s begin). Layout at the returned rsp (low → high):
-///   [r15..rax = 15 zeroed GPRs][RIP=entry][CS][RFLAGS=0x202][RSP][SS]
+/// Craft a fresh thread's stack as a synthetic preemption frame so the
+/// first switch `iretq`s `entry` to life with interrupts enabled. Layout at
+/// the returned rsp (low → high): [15 zeroed GPRs][RIP][CS][RFLAGS][RSP][SS].
 ///
 /// # Safety
 /// `stack_top` must point one past a writable stack of at least 256 bytes.
 unsafe fn init_thread(stack_top: *mut u8, entry: extern "C" fn() -> !, cs: u16, ss: u16) -> u64 {
-    let top = (stack_top as u64) & !0xF; // 16-aligned
-    let saved_rsp = top - 160; // 20 u64 slots; 160 is 16-aligned
+    let top = (stack_top as u64) & !0xF;
+    let saved_rsp = top - 160;
     let s = saved_rsp as *mut u64;
-    // 15 GPRs, zeroed (slots 0..15).
     let mut i = 0;
     while i < 15 {
         s.add(i).write(0);
         i += 1;
     }
-    // iretq frame (slots 15..20).
     s.add(15).write(entry as *const () as usize as u64); // RIP
     s.add(16).write(cs as u64); // CS
     s.add(17).write(0x202); // RFLAGS: IF=1, reserved bit1=1
-    s.add(18).write(top - 8); // RSP the thread runs on (≡ 8 mod 16)
+    s.add(18).write(top - 8); // RSP (≡ 8 mod 16)
     s.add(19).write(ss as u64); // SS
     saved_rsp
 }
 
-/// Reserve TCB[0] for the currently-running boot context. Its rsp is filled
-/// in by the first timer tick (when it's switched away from).
+/// Reserve TCB[0] for the boot context (the idle fallback).
 fn init_boot() {
     unsafe {
         (&raw mut N).write(1);
         (&raw mut CURRENT).write(0);
+        (*tcbs().add(0)).state = RunState::Runnable; // boot is always available
     }
 }
 
-/// Add a thread with the given stack top and entry point.
+/// Add a worker thread; fires the Frame Scheduler's `task_ready`.
 unsafe fn spawn(stack_top: *mut u8, entry: extern "C" fn() -> !) {
     let cs = read_cs();
     let ss = read_ss();
     let rsp = init_thread(stack_top, entry, cs, ss);
     let n = (&raw const N).read();
-    let tcbs = (&raw mut TCBS) as *mut Tcb;
-    (*tcbs.add(n)).rsp = rsp;
+    let t = tcbs();
+    (*t.add(n)).rsp = rsp;
+    (*t.add(n)).state = RunState::Runnable;
     (&raw mut N).write(n + 1);
+    with_sched(|s| s.task_ready());
+}
+
+/// Exit the calling worker: mark it dead (so the ISR stops scheduling it),
+/// fire the Frame Scheduler's `task_unready`, then park. Never returns — the
+/// next tick switches away and this thread is never resumed.
+fn exit_current() -> ! {
+    interrupts::without_interrupts(|| unsafe {
+        let cur = (&raw const CURRENT).read();
+        (*tcbs().add(cur)).state = RunState::Dead;
+    });
+    with_sched(|s| s.task_unready());
+    loop {
+        interrupts::wait_for_interrupt();
+    }
 }
 
 // ---------------------------------------------------------------------------
 // Demo threads
 // ---------------------------------------------------------------------------
 
-/// Busy-spin to pace serial output. Never yields — preemption is the only
-/// thing that can interrupt this. Sized small enough that, within the
-/// demo's tick window, each thread prints several times (clear repeated
-/// interleaving), but large enough not to flood the serial capture.
 fn pace() {
     for _ in 0..50_000u64 {
         core::hint::spin_loop();
@@ -152,28 +206,29 @@ fn pace() {
 }
 
 extern "C" fn worker1() -> ! {
-    loop {
+    for _ in 0..ROUNDS_PER_WORKER {
         pace();
         serial::write_str("1");
-        PRINTS.fetch_add(1, Ordering::Relaxed);
     }
+    exit_current();
 }
 
 extern "C" fn worker2() -> ! {
-    loop {
+    for _ in 0..ROUNDS_PER_WORKER {
         pace();
         serial::write_str("2");
-        PRINTS.fetch_add(1, Ordering::Relaxed);
     }
+    exit_current();
 }
 
-/// Run the preemptive demo: start two non-yielding threads, enable the
-/// timer, let them run preempted for a fixed number of ticks, then stop.
-/// Both '1' and '2' appearing proves the timer preempted them — neither
-/// thread ever yields voluntarily.
+/// Run the preemptive demo to completion: start two non-yielding threads,
+/// let preemption interleave them, and once both have exited (the Frame
+/// Scheduler reports `$Idle`) halt the demo.
 pub fn run() {
     serial::writeln("[preempt] starting two non-yielding threads");
     unsafe {
+        let p = &raw mut SCHED;
+        *p = Some(Scheduler::__create());
         init_boot();
         let s1 = (&raw mut STACK1).add(1) as *mut u8;
         let s2 = (&raw mut STACK2).add(1) as *mut u8;
@@ -184,15 +239,14 @@ pub fn run() {
     ACTIVE.store(true, Ordering::Relaxed);
     interrupts::enable();
 
-    // Run for ~50 timer ticks (~0.5s at 100 Hz). During this window the
-    // round-robin gives both workers many slices, so both print.
-    let target = interrupts::ticks() + 50;
-    while interrupts::ticks() < target {
+    // Idle when both workers have exited — the Frame Scheduler's $Idle
+    // state, read here from normal context, drives the halt.
+    while !with_sched(|s| s.is_idle()) {
         interrupts::wait_for_interrupt();
     }
 
     interrupts::disable();
     ACTIVE.store(false, Ordering::Relaxed);
 
-    serial::writeln("\n[preempt] done — both threads ran under preemption");
+    serial::writeln("\n[preempt] both threads exited; scheduler is $Idle — done");
 }

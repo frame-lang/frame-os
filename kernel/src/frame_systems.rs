@@ -31,3 +31,8 @@ use crate::serial;
 // keeps the include order matching the dependency direction.
 include!(concat!(env!("OUT_DIR"), "/serial_driver.rs"));
 include!(concat!(env!("OUT_DIR"), "/kernel.rs"));
+// Scheduler ($Idle/$Active): the native preemptive scheduler (sched.rs)
+// holds one and reads is_idle() to decide when the kernel halts. Its
+// actions are pure counter arithmetic — no native deps beyond the heap
+// types already re-exported above.
+include!(concat!(env!("OUT_DIR"), "/scheduler.rs"));

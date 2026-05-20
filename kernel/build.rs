@@ -21,6 +21,7 @@ use anyhow::{anyhow, Context, Result};
 // src/frame_systems.rs.
 const FRAME_SYSTEMS: &[(&str, &str)] = &[
     ("serial_driver", "serial_driver.frs"),
+    ("scheduler", "scheduler.frs"),
     ("kernel", "kernel.frs"),
 ];
 

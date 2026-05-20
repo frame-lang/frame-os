@@ -258,3 +258,24 @@ pub fn wait_for_interrupt() {
         asm!("hlt", options(nomem, nostack));
     }
 }
+
+/// Run `f` with interrupts disabled, restoring the previous interrupt-enable
+/// state afterward. Single-core mutual exclusion: a Frame system is
+/// non-reentrant, so when one is shared across preemptible threads (e.g. the
+/// `Scheduler`), every dispatch must run in such a critical section or a
+/// timer preemption mid-dispatch would corrupt it.
+pub fn without_interrupts<R>(f: impl FnOnce() -> R) -> R {
+    let flags: u64;
+    unsafe {
+        asm!("pushfq", "pop {}", out(reg) flags, options(preserves_flags));
+        asm!("cli", options(nomem, nostack));
+    }
+    let r = f();
+    // Bit 9 of RFLAGS is IF (interrupt-enable). Only re-enable if it was set.
+    if flags & (1 << 9) != 0 {
+        unsafe {
+            asm!("sti", options(nomem, nostack));
+        }
+    }
+    r
+}

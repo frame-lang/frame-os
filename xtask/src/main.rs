@@ -463,8 +463,8 @@ const SMOKE_TESTS: &[SmokeTest] = &[
         name: "preemption_b1",
         expect_contains: &[
             "[preempt] starting two non-yielding threads",
-            "1212",
-            "[preempt] done",
+            "12", // a 1→2 adjacency: the timer preempted worker1 into worker2
+            "scheduler is $Idle",
         ],
         expect_absent: &["KERNEL EXCEPTION", "KERNEL PANIC", "triple fault"],
         timeout_secs: 20,

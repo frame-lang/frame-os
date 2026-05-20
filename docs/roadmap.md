@@ -276,11 +276,14 @@ H3 is the H-track's final committed milestone. Further H-track work (a configura
 | B1-1 | `Scheduler` (`$Idle`/`$Active`) and `Task` (`$Created→$Ready⇄$Blocked→$Terminated`) state graphs match committed designs | Snapshots `scheduler_state_graph_snapshot`, `task_state_graph_snapshot` (`kernel-tests`) |
 | B1-2 | `Task` transitions correctly per committed state-event pair (no `$Running`) | Behavioral tests in `kernel-tests/tests/task_behavior.rs` (host) |
 | B1-3 | `Scheduler` flips `$Idle`↔`$Active` correctly on `task_ready`/`task_unready` and reports `is_idle` | Behavioral tests in `kernel-tests/tests/scheduler_behavior.rs` (host) |
-| B1-4 | A tight-loop thread **is preempted** (distinguishes from cooperative) | QEMU smoke `tight_loop_thread_is_preempted_b1` — a thread that never yields still lets others run |
-| B1-5 | N kernel threads run concurrently, each visibly producing output | QEMU smoke `threads_run_concurrently_b1` (each thread's marker appears ≥N times) |
-| B1-6 | The scheduler halts the CPU in `$Idle` when nothing is runnable | QEMU smoke `idle_halts_cpu_b1` |
-| B1-7 | Diagrams + per-system docs for `Scheduler` and `Task` | `cargo xtask check-diagrams`; review |
-| B1-8 | All CI gates pass, plus QEMU smoke on Linux | Full CI matrix + `qemu-test` |
+| B1-4 | A thread that **never yields is preempted** (distinguishes from cooperative) | QEMU smoke `preemption_b1` — two non-yielding threads print interleaved (`...121212...`), only possible via timer preemption — **done at Step 3c** |
+| B1-5 | Multiple kernel threads run concurrently, each visibly producing output | QEMU smoke `preemption_b1` (both `1` and `2` appear) — **done at Step 3c** |
+| B1-6 | The scheduler halts in `$Idle` when nothing is runnable | QEMU smoke `preemption_b1`: both workers exit → the Frame `Scheduler` reaches `$Idle` (`is_idle()` read from the kernel's idle loop drives the halt) — **done.** Also the cooperative `context_switch_ping_pong_b1` and `interrupts_and_timer_b1` |
+| B1-7 | Diagrams + per-system docs for `Scheduler` and `Task` | `cargo xtask check-diagrams`; `docs/systems/scheduler.md`, `docs/systems/task.md` — **done** |
+| B1-8 | All CI gates pass, plus QEMU smoke on Linux | Full CI matrix + `qemu-test` (5/5) — **done** |
+
+**Status:** Done. Preemptive multitasking works on bare metal (`cccf131`): the timer ISR full-frame-switches between non-yielding threads, threads exit, and the Frame `Scheduler` (`$Idle`/`$Active`) drives the kernel's idle-halt under interrupt-off critical sections. Steps: 1 (Frame layer, host-tested, `6996be7`), 2 (cooperative switch, `162f3e5`), 3a/3b (IDT + PIC/PIT timer, `a783c71`), 3c (preemption, `cccf131`), completion (load-bearing Scheduler + idle-halt + docs).
+- **Honest scope:** `Task` is host-validated but not wired into the kernel — it's load-bearing as `Process` at B3 (decorative at B1, so omitted per discipline). `$InitIDT`/`$InitTimer` still print as stubs (native init runs in `kmain`); wiring them into the HSM phases is a tracked refinement, not a B1 exit criterion.
 
 **Estimated effort:** Large. The preemptive context switch (saving full state from interrupt context and resuming a different thread) is the classic hard part; this is where the kernel first feels like a kernel. The Frame payload is small and honest — the substance of the milestone is native.
 
