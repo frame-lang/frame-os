@@ -41,9 +41,12 @@
         kill_job(id: u32)
         wait_for(id: u32)
         tick()
-        jobs(): Vec<JobSummary>
-        foreground_id(): u32
-        next_job_id(): u32
+        // Interface defaults read from domain fields and helper actions.
+        // Both states return the same values for these queries, so no
+        // per-state overrides are needed.
+        jobs(): Vec<JobSummary> = self.job_summaries()
+        foreground_id(): u32 = self.foreground_id.unwrap_or(0)
+        next_job_id(): u32 = self.next_id
         is_idle(): bool = true
         is_running_foreground(): bool = false
 
@@ -126,16 +129,10 @@
                 }
             }
 
-            // Events that are only meaningful from $RunningForeground are
-            // no-ops here:
-            wait_foreground() { }
-            stop_foreground() { }
-
-            jobs(): Vec<JobSummary> { @@:(self.job_summaries()) }
-            foreground_id(): u32 { @@:(self.foreground_id.unwrap_or(0)) }
-            next_job_id(): u32 { @@:(self.next_id) }
-            is_idle(): bool { @@:(true) }
-            is_running_foreground(): bool { @@:(false) }
+            // wait_foreground / stop_foreground only mean something in
+            // $RunningForeground; per V4 explicit-only-forwarding the
+            // missing handlers here are silently ignored. is_idle and
+            // is_running_foreground use the interface defaults (true / false).
         }
 
         $RunningForeground {
@@ -191,18 +188,14 @@
                 }
             }
 
-            // Spawning a NEW job while another is foreground isn't
-            // supported in H3 (real shells handle it; we don't). Both
-            // spawn paths defensively no-op here.
-            spawn_foreground(cmd: String, args: Vec<String>) { }
-            spawn_background(cmd: String, args: Vec<String>) { }
-            fg(id: u32) { }
-            bg(id: u32) { }
             wait_for(id: u32) { self.poll_until_done(id); }
 
-            jobs(): Vec<JobSummary> { @@:(self.job_summaries()) }
-            foreground_id(): u32 { @@:(self.foreground_id.unwrap_or(0)) }
-            next_job_id(): u32 { @@:(self.next_id) }
+            // spawn_foreground / spawn_background / fg / bg are not
+            // supported while a foreground job is active (no job-stacking
+            // at H3). Per V4 explicit-only-forwarding, omitting them
+            // means they're silently ignored — same end result as
+            // explicit no-op handlers.
+
             is_idle(): bool { @@:(false) }
             is_running_foreground(): bool { @@:(true) }
         }

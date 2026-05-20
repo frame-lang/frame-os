@@ -61,11 +61,15 @@
         to_background()
         kill()
         poll()
-        id(): u32 = 0
-        pid(): u32 = 0
-        cmd_str(): String
-        state_name(): String
-        exit_code(): i32 = 0
+        // Interface defaults read directly from domain fields. They hold
+        // the right value in every state — `id` is set at construction,
+        // `pid` is 0 until spawn, `exit_code` is 0 until $Done. Only
+        // is_done() and state_name() need per-state overrides.
+        id(): u32 = self.id
+        pid(): u32 = self.pid
+        cmd_str(): String = self.format_cmd()
+        state_name(): String = "Pending".to_string()
+        exit_code(): i32 = self.exit_code
         is_done(): bool = false
 
     machine:
@@ -98,12 +102,6 @@
             // means terminal Ctrl-C at the prompt doesn't reach the
             // background job — only the shell process gets SIGINT, and
             // rustyline handles that locally.
-            //
-            // Unix-only details:
-            //   - process_group(0) is std::os::unix::process::CommandExt
-            //     and stable since Rust 1.64.
-            //   - On Windows we fall back to the same null-stdio but
-            //     skip the process_group bit.
             spawn_detached(cmd: String, args: Vec<String>) {
                 self.cmd = cmd;
                 self.args = args;
@@ -133,20 +131,6 @@
                     }
                 }
             }
-
-            id(): u32 { @@:(self.id) }
-            pid(): u32 { @@:(0) }
-            cmd_str(): String { @@:(self.format_cmd()) }
-            state_name(): String { @@:("Pending".to_string()) }
-            exit_code(): i32 { @@:(0) }
-            is_done(): bool { @@:(false) }
-
-            // No-op handlers for events not valid from $Created:
-            stop() { }
-            to_foreground() { }
-            to_background() { }
-            kill() { }
-            poll() { }
         }
 
         $Foreground {
@@ -171,17 +155,7 @@
                 -> $Done
             }
 
-            // From $Foreground these are no-ops (already in target state):
-            spawn(cmd: String, args: Vec<String>) { }
-            spawn_detached(cmd: String, args: Vec<String>) { }
-            to_foreground() { }
-
-            id(): u32 { @@:(self.id) }
-            pid(): u32 { @@:(self.pid) }
-            cmd_str(): String { @@:(self.format_cmd()) }
             state_name(): String { @@:("Running".to_string()) }
-            exit_code(): i32 { @@:(0) }
-            is_done(): bool { @@:(false) }
         }
 
         $Background {
@@ -206,16 +180,7 @@
                 -> $Done
             }
 
-            spawn(cmd: String, args: Vec<String>) { }
-            spawn_detached(cmd: String, args: Vec<String>) { }
-            to_background() { }
-
-            id(): u32 { @@:(self.id) }
-            pid(): u32 { @@:(self.pid) }
-            cmd_str(): String { @@:(self.format_cmd()) }
             state_name(): String { @@:("Running".to_string()) }
-            exit_code(): i32 { @@:(0) }
-            is_done(): bool { @@:(false) }
         }
 
         $Stopped {
@@ -238,38 +203,15 @@
                 -> $Done
             }
 
-            poll() {
-                // A stopped process can still report its status via
-                // waitpid(WUNTRACED) but we don't auto-transition out of
-                // $Stopped on poll(). Callers explicitly resume.
-            }
-
-            spawn(cmd: String, args: Vec<String>) { }
-            spawn_detached(cmd: String, args: Vec<String>) { }
-            stop() { }
-
-            id(): u32 { @@:(self.id) }
-            pid(): u32 { @@:(self.pid) }
-            cmd_str(): String { @@:(self.format_cmd()) }
             state_name(): String { @@:("Stopped".to_string()) }
-            exit_code(): i32 { @@:(0) }
-            is_done(): bool { @@:(false) }
         }
 
         $Done {
-            // Terminal — all events are no-ops. Queries return the final
-            // state information.
-            spawn(cmd: String, args: Vec<String>) { }
-            spawn_detached(cmd: String, args: Vec<String>) { }
-            stop() { }
-            to_foreground() { }
-            to_background() { }
-            kill() { }
-            poll() { }
-
-            id(): u32 { @@:(self.id) }
-            pid(): u32 { @@:(self.pid) }
-            cmd_str(): String { @@:(self.format_cmd()) }
+            // Terminal. spawn / spawn_detached / stop / to_foreground /
+            // to_background / kill / poll have no handlers here — per
+            // Frame V4 explicit-only-forwarding, they're silently ignored.
+            // Only is_done() and state_name() need overrides.
+            is_done(): bool { @@:(true) }
 
             state_name(): String {
                 // Distinguish failed-to-spawn from completed cleanly.
@@ -279,9 +221,6 @@
                     @@:("Done".to_string())
                 }
             }
-
-            exit_code(): i32 { @@:(self.exit_code) }
-            is_done(): bool { @@:(true) }
         }
 
     actions:

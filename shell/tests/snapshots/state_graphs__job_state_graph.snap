@@ -15,7 +15,7 @@ digraph Job {
             <tr><td><b>Created</b></td></tr>
             <hr/>
             <tr><td align="left"><font point-size="10">
-spawn(cmd: String, args: Vec&lt;String&gt;)<br ALIGN="LEFT"/>spawn_detached(cmd: String, args: Vec&lt;String&gt;)<br ALIGN="LEFT"/>id()<br ALIGN="LEFT"/>pid()<br ALIGN="LEFT"/>cmd_str()<br ALIGN="LEFT"/>state_name()<br ALIGN="LEFT"/>exit_code()<br ALIGN="LEFT"/>is_done()<br ALIGN="LEFT"/>stop()<br ALIGN="LEFT"/>to_foreground()<br ALIGN="LEFT"/>to_background()<br ALIGN="LEFT"/>kill()<br ALIGN="LEFT"/>poll()<br ALIGN="LEFT"/>
+spawn(cmd: String, args: Vec&lt;String&gt;)<br ALIGN="LEFT"/>spawn_detached(cmd: String, args: Vec&lt;String&gt;)<br ALIGN="LEFT"/>
             </font></td></tr>
         </table>
     > margin=0 shape=none]
@@ -24,7 +24,7 @@ spawn(cmd: String, args: Vec&lt;String&gt;)<br ALIGN="LEFT"/>spawn_detached(cmd:
             <tr><td><b>Foreground</b></td></tr>
             <hr/>
             <tr><td align="left"><font point-size="10">
-poll()<br ALIGN="LEFT"/>stop()<br ALIGN="LEFT"/>to_background()<br ALIGN="LEFT"/>kill()<br ALIGN="LEFT"/>spawn(cmd: String, args: Vec&lt;String&gt;)<br ALIGN="LEFT"/>spawn_detached(cmd: String, args: Vec&lt;String&gt;)<br ALIGN="LEFT"/>to_foreground()<br ALIGN="LEFT"/>id()<br ALIGN="LEFT"/>pid()<br ALIGN="LEFT"/>cmd_str()<br ALIGN="LEFT"/>state_name()<br ALIGN="LEFT"/>exit_code()<br ALIGN="LEFT"/>is_done()<br ALIGN="LEFT"/>
+poll()<br ALIGN="LEFT"/>stop()<br ALIGN="LEFT"/>to_background()<br ALIGN="LEFT"/>kill()<br ALIGN="LEFT"/>state_name()<br ALIGN="LEFT"/>
             </font></td></tr>
         </table>
     > margin=0 shape=none]
@@ -33,7 +33,7 @@ poll()<br ALIGN="LEFT"/>stop()<br ALIGN="LEFT"/>to_background()<br ALIGN="LEFT"/
             <tr><td><b>Background</b></td></tr>
             <hr/>
             <tr><td align="left"><font point-size="10">
-poll()<br ALIGN="LEFT"/>stop()<br ALIGN="LEFT"/>to_foreground()<br ALIGN="LEFT"/>kill()<br ALIGN="LEFT"/>spawn(cmd: String, args: Vec&lt;String&gt;)<br ALIGN="LEFT"/>spawn_detached(cmd: String, args: Vec&lt;String&gt;)<br ALIGN="LEFT"/>to_background()<br ALIGN="LEFT"/>id()<br ALIGN="LEFT"/>pid()<br ALIGN="LEFT"/>cmd_str()<br ALIGN="LEFT"/>state_name()<br ALIGN="LEFT"/>exit_code()<br ALIGN="LEFT"/>is_done()<br ALIGN="LEFT"/>
+poll()<br ALIGN="LEFT"/>stop()<br ALIGN="LEFT"/>to_foreground()<br ALIGN="LEFT"/>kill()<br ALIGN="LEFT"/>state_name()<br ALIGN="LEFT"/>
             </font></td></tr>
         </table>
     > margin=0 shape=none]
@@ -42,7 +42,7 @@ poll()<br ALIGN="LEFT"/>stop()<br ALIGN="LEFT"/>to_foreground()<br ALIGN="LEFT"/
             <tr><td><b>Stopped</b></td></tr>
             <hr/>
             <tr><td align="left"><font point-size="10">
-to_foreground()<br ALIGN="LEFT"/>to_background()<br ALIGN="LEFT"/>kill()<br ALIGN="LEFT"/>poll()<br ALIGN="LEFT"/>spawn(cmd: String, args: Vec&lt;String&gt;)<br ALIGN="LEFT"/>spawn_detached(cmd: String, args: Vec&lt;String&gt;)<br ALIGN="LEFT"/>stop()<br ALIGN="LEFT"/>id()<br ALIGN="LEFT"/>pid()<br ALIGN="LEFT"/>cmd_str()<br ALIGN="LEFT"/>state_name()<br ALIGN="LEFT"/>exit_code()<br ALIGN="LEFT"/>is_done()<br ALIGN="LEFT"/>
+to_foreground()<br ALIGN="LEFT"/>to_background()<br ALIGN="LEFT"/>kill()<br ALIGN="LEFT"/>state_name()<br ALIGN="LEFT"/>
             </font></td></tr>
         </table>
     > margin=0 shape=none]
@@ -51,7 +51,7 @@ to_foreground()<br ALIGN="LEFT"/>to_background()<br ALIGN="LEFT"/>kill()<br ALIG
             <tr><td><b>Done</b></td></tr>
             <hr/>
             <tr><td align="left"><font point-size="10">
-spawn(cmd: String, args: Vec&lt;String&gt;)<br ALIGN="LEFT"/>spawn_detached(cmd: String, args: Vec&lt;String&gt;)<br ALIGN="LEFT"/>stop()<br ALIGN="LEFT"/>to_foreground()<br ALIGN="LEFT"/>to_background()<br ALIGN="LEFT"/>kill()<br ALIGN="LEFT"/>poll()<br ALIGN="LEFT"/>id()<br ALIGN="LEFT"/>pid()<br ALIGN="LEFT"/>cmd_str()<br ALIGN="LEFT"/>state_name()<br ALIGN="LEFT"/>exit_code()<br ALIGN="LEFT"/>is_done()<br ALIGN="LEFT"/>
+is_done()<br ALIGN="LEFT"/>state_name()<br ALIGN="LEFT"/>
             </font></td></tr>
         </table>
     > margin=0 shape=none]

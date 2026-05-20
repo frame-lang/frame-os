@@ -70,8 +70,14 @@
     interface:
         consume(c: char)
         finalize()
-        tokens(): Vec<String>
-        error(): String
+        // Interface defaults read directly from domain fields. They're
+        // correct in every state — `self.tokens` accumulates as scanning
+        // proceeds (empty until then), `self.error_msg` is empty until
+        // $InQuotedString.finalize() sets it on transition to $Failed.
+        // So no state needs to override these queries; the default fires
+        // everywhere.
+        tokens(): Vec<String> = self.tokens.clone()
+        error(): String = self.error_msg.clone()
         is_complete(): bool = false
 
     machine:
@@ -90,18 +96,6 @@
 
             finalize() {
                 -> $Done
-            }
-
-            tokens(): Vec<String> {
-                @@:(self.tokens.clone())
-            }
-
-            error(): String {
-                @@:(String::new())
-            }
-
-            is_complete(): bool {
-                @@:(false)
             }
         }
 
@@ -122,18 +116,6 @@
                 self.tokens.push(self.current.clone());
                 self.current.clear();
                 -> $Done
-            }
-
-            tokens(): Vec<String> {
-                @@:(self.tokens.clone())
-            }
-
-            error(): String {
-                @@:(String::new())
-            }
-
-            is_complete(): bool {
-                @@:(false)
             }
         }
 
@@ -158,64 +140,19 @@
                 );
                 -> $Failed
             }
-
-            tokens(): Vec<String> {
-                @@:(self.tokens.clone())
-            }
-
-            error(): String {
-                @@:(String::new())
-            }
-
-            is_complete(): bool {
-                @@:(false)
-            }
         }
 
+        // Terminal states. Per V4 explicit-only-forwarding, unhandled events
+        // are silently ignored — so $Done and $Failed don't need consume()
+        // or finalize() no-op handlers. The only override needed is
+        // is_complete() returning true; tokens() and error() read the
+        // domain fields via the interface defaults.
         $Done {
-            consume(c: char) {
-                // Terminal — further chars after finalize() are ignored.
-            }
-
-            finalize() {
-                // Idempotent — second finalize() is a no-op.
-            }
-
-            tokens(): Vec<String> {
-                @@:(self.tokens.clone())
-            }
-
-            error(): String {
-                @@:(String::new())
-            }
-
-            is_complete(): bool {
-                @@:(true)
-            }
+            is_complete(): bool { @@:(true) }
         }
 
         $Failed {
-            consume(c: char) {
-                // Terminal — further chars after the failure are ignored.
-            }
-
-            finalize() {
-                // Idempotent — second finalize() is a no-op.
-            }
-
-            tokens(): Vec<String> {
-                // Returns whatever was successfully tokenized before the
-                // failure. Callers should check error() first.
-                @@:(self.tokens.clone())
-            }
-
-            error(): String {
-                @@:(self.error_msg.clone())
-            }
-
-            is_complete(): bool {
-                @@:(true)
-            }
+            is_complete(): bool { @@:(true) }
         }
 
     domain:

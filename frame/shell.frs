@@ -69,10 +69,6 @@
             eof() {
                 -> $Exiting
             }
-
-            is_done(): bool {
-                @@:(false)
-            }
         }
 
         $Parsing {
@@ -147,25 +143,12 @@
                     -> $RunningBuiltin
                 }
             }
-
-            line(input: &str) {
-                // Transient state — $> runs synchronously.
-            }
-
-            interrupt() {
-                // Defensive.
-                -> $Prompting
-            }
-
-            eof() {
-                // Defensive.
-                -> $Prompting
-            }
-
-            is_done(): bool {
-                @@:(false)
-            }
         }
+
+        // $Parsing has only the $> handler. Transient state — runs
+        // synchronously inside the same shell.line() call. line/interrupt/
+        // eof can't be delivered while $> executes, so per V4 explicit-
+        // only-forwarding they're silently ignored (no handler needed).
 
         $RunningBuiltin {
             $>() {
@@ -178,25 +161,10 @@
                 self.history.push(self.current_line.clone());
                 -> $Prompting
             }
-
-            line(input: &str) {
-                // Transient.
-            }
-
-            interrupt() {
-                // Defensive.
-                -> $Prompting
-            }
-
-            eof() {
-                // Defensive.
-                -> $Prompting
-            }
-
-            is_done(): bool {
-                @@:(false)
-            }
         }
+
+        // $RunningBuiltin: same transient story as $Parsing — only $>
+        // matters.
 
         $RunningForeground {
             $>() {
@@ -232,52 +200,23 @@
                 self.history.push(self.current_line.clone());
                 -> $Prompting
             }
-
-            line(input: &str) {
-                // Transient — $> blocks in wait_foreground.
-            }
-
-            interrupt() {
-                // The actual Ctrl-C handling for a running foreground job
-                // happens at the OS / libc level: shell installs SIG_IGN
-                // briefly inside wait_foreground (via Job's run path),
-                // the child inherits the terminal foreground group and
-                // receives SIGINT naturally. This handler exists for the
-                // state-event contract — through normal flow it's
-                // unreachable while $> is in JobControl's polling loop.
-                -> $Prompting
-            }
-
-            eof() {
-                // Defensive.
-                -> $Prompting
-            }
-
-            is_done(): bool {
-                @@:(false)
-            }
         }
+
+        // $RunningForeground: only $> matters. Ctrl-C during foreground
+        // execution is handled at the OS / libc level (shell installs
+        // SIG_IGN inside wait_foreground; child inherits terminal
+        // foreground group and receives SIGINT naturally). The Shell-
+        // level interrupt() doesn't need to fire here.
 
         $Exiting {
             $>() {
                 self.print_goodbye();
             }
 
-            line(input: &str) {
-                // Already exiting; ignore.
-            }
-
-            interrupt() {
-                // Already exiting; ignore.
-            }
-
-            eof() {
-                // Already exiting; ignore.
-            }
-
-            is_done(): bool {
-                @@:(true)
-            }
+            // Terminal. line / interrupt / eof have no handlers — Frame
+            // V4 silently ignores them, which is the right semantics
+            // (the shell is shutting down; further input has no effect).
+            is_done(): bool { @@:(true) }
         }
 
     actions:

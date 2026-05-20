@@ -15,7 +15,7 @@ digraph Parser {
             <tr><td><b>ReadingWord</b></td></tr>
             <hr/>
             <tr><td align="left"><font point-size="10">
-consume(c: char)<br ALIGN="LEFT"/>finalize()<br ALIGN="LEFT"/>tokens()<br ALIGN="LEFT"/>error()<br ALIGN="LEFT"/>is_complete()<br ALIGN="LEFT"/>
+consume(c: char)<br ALIGN="LEFT"/>finalize()<br ALIGN="LEFT"/>
             </font></td></tr>
         </table>
     > margin=0 shape=none]
@@ -24,7 +24,7 @@ consume(c: char)<br ALIGN="LEFT"/>finalize()<br ALIGN="LEFT"/>tokens()<br ALIGN=
             <tr><td><b>InWord</b></td></tr>
             <hr/>
             <tr><td align="left"><font point-size="10">
-consume(c: char)<br ALIGN="LEFT"/>finalize()<br ALIGN="LEFT"/>tokens()<br ALIGN="LEFT"/>error()<br ALIGN="LEFT"/>is_complete()<br ALIGN="LEFT"/>
+consume(c: char)<br ALIGN="LEFT"/>finalize()<br ALIGN="LEFT"/>
             </font></td></tr>
         </table>
     > margin=0 shape=none]
@@ -33,7 +33,7 @@ consume(c: char)<br ALIGN="LEFT"/>finalize()<br ALIGN="LEFT"/>tokens()<br ALIGN=
             <tr><td><b>InQuotedString</b></td></tr>
             <hr/>
             <tr><td align="left"><font point-size="10">
-consume(c: char)<br ALIGN="LEFT"/>finalize()<br ALIGN="LEFT"/>tokens()<br ALIGN="LEFT"/>error()<br ALIGN="LEFT"/>is_complete()<br ALIGN="LEFT"/>
+consume(c: char)<br ALIGN="LEFT"/>finalize()<br ALIGN="LEFT"/>
             </font></td></tr>
         </table>
     > margin=0 shape=none]
@@ -42,7 +42,7 @@ consume(c: char)<br ALIGN="LEFT"/>finalize()<br ALIGN="LEFT"/>tokens()<br ALIGN=
             <tr><td><b>Done</b></td></tr>
             <hr/>
             <tr><td align="left"><font point-size="10">
-consume(c: char)<br ALIGN="LEFT"/>finalize()<br ALIGN="LEFT"/>tokens()<br ALIGN="LEFT"/>error()<br ALIGN="LEFT"/>is_complete()<br ALIGN="LEFT"/>
+is_complete()<br ALIGN="LEFT"/>
             </font></td></tr>
         </table>
     > margin=0 shape=none]
@@ -51,7 +51,7 @@ consume(c: char)<br ALIGN="LEFT"/>finalize()<br ALIGN="LEFT"/>tokens()<br ALIGN=
             <tr><td><b>Failed</b></td></tr>
             <hr/>
             <tr><td align="left"><font point-size="10">
-consume(c: char)<br ALIGN="LEFT"/>finalize()<br ALIGN="LEFT"/>tokens()<br ALIGN="LEFT"/>error()<br ALIGN="LEFT"/>is_complete()<br ALIGN="LEFT"/>
+is_complete()<br ALIGN="LEFT"/>
             </font></td></tr>
         </table>
     > margin=0 shape=none]

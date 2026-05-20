@@ -15,7 +15,7 @@ digraph Shell {
             <tr><td><b>Prompting</b></td></tr>
             <hr/>
             <tr><td align="left"><font point-size="10">
-$&gt;()<br ALIGN="LEFT"/>line(input: &amp;str)<br ALIGN="LEFT"/>interrupt()<br ALIGN="LEFT"/>eof()<br ALIGN="LEFT"/>is_done()<br ALIGN="LEFT"/>
+$&gt;()<br ALIGN="LEFT"/>line(input: &amp;str)<br ALIGN="LEFT"/>interrupt()<br ALIGN="LEFT"/>eof()<br ALIGN="LEFT"/>
             </font></td></tr>
         </table>
     > margin=0 shape=none]
@@ -24,7 +24,7 @@ $&gt;()<br ALIGN="LEFT"/>line(input: &amp;str)<br ALIGN="LEFT"/>interrupt()<br A
             <tr><td><b>Parsing</b></td></tr>
             <hr/>
             <tr><td align="left"><font point-size="10">
-$&gt;()<br ALIGN="LEFT"/>line(input: &amp;str)<br ALIGN="LEFT"/>interrupt()<br ALIGN="LEFT"/>eof()<br ALIGN="LEFT"/>is_done()<br ALIGN="LEFT"/>
+$&gt;()<br ALIGN="LEFT"/>
             </font></td></tr>
         </table>
     > margin=0 shape=none]
@@ -33,7 +33,7 @@ $&gt;()<br ALIGN="LEFT"/>line(input: &amp;str)<br ALIGN="LEFT"/>interrupt()<br A
             <tr><td><b>RunningBuiltin</b></td></tr>
             <hr/>
             <tr><td align="left"><font point-size="10">
-$&gt;()<br ALIGN="LEFT"/>line(input: &amp;str)<br ALIGN="LEFT"/>interrupt()<br ALIGN="LEFT"/>eof()<br ALIGN="LEFT"/>is_done()<br ALIGN="LEFT"/>
+$&gt;()<br ALIGN="LEFT"/>
             </font></td></tr>
         </table>
     > margin=0 shape=none]
@@ -42,7 +42,7 @@ $&gt;()<br ALIGN="LEFT"/>line(input: &amp;str)<br ALIGN="LEFT"/>interrupt()<br A
             <tr><td><b>RunningForeground</b></td></tr>
             <hr/>
             <tr><td align="left"><font point-size="10">
-$&gt;()<br ALIGN="LEFT"/>line(input: &amp;str)<br ALIGN="LEFT"/>interrupt()<br ALIGN="LEFT"/>eof()<br ALIGN="LEFT"/>is_done()<br ALIGN="LEFT"/>
+$&gt;()<br ALIGN="LEFT"/>
             </font></td></tr>
         </table>
     > margin=0 shape=none]
@@ -51,7 +51,7 @@ $&gt;()<br ALIGN="LEFT"/>line(input: &amp;str)<br ALIGN="LEFT"/>interrupt()<br A
             <tr><td><b>Exiting</b></td></tr>
             <hr/>
             <tr><td align="left"><font point-size="10">
-$&gt;()<br ALIGN="LEFT"/>line(input: &amp;str)<br ALIGN="LEFT"/>interrupt()<br ALIGN="LEFT"/>eof()<br ALIGN="LEFT"/>is_done()<br ALIGN="LEFT"/>
+$&gt;()<br ALIGN="LEFT"/>is_done()<br ALIGN="LEFT"/>
             </font></td></tr>
         </table>
     > margin=0 shape=none]
@@ -59,8 +59,6 @@ $&gt;()<br ALIGN="LEFT"/>line(input: &amp;str)<br ALIGN="LEFT"/>interrupt()<br A
     Prompting -> Exiting [label=" line "]
     Prompting -> Parsing [label=" line "]
     Prompting -> Exiting [label=" eof "]
-    Parsing -> Prompting [label=" interrupt "]
-    Parsing -> Prompting [label=" eof "]
     Parsing -> Prompting [label=" $> "]
     Parsing -> Prompting [label=" $> "]
     Parsing -> RunningForeground [label=" $> "]
@@ -70,10 +68,6 @@ $&gt;()<br ALIGN="LEFT"/>line(input: &amp;str)<br ALIGN="LEFT"/>interrupt()<br A
     Parsing -> Prompting [label=" $> "]
     Parsing -> Prompting [label=" $> "]
     Parsing -> RunningBuiltin [label=" $> "]
-    RunningBuiltin -> Prompting [label=" interrupt "]
-    RunningBuiltin -> Prompting [label=" eof "]
     RunningBuiltin -> Prompting [label=" $> "]
-    RunningForeground -> Prompting [label=" interrupt "]
-    RunningForeground -> Prompting [label=" eof "]
     RunningForeground -> Prompting [label=" $> "]
 }
