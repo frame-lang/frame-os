@@ -424,6 +424,21 @@ const SMOKE_TESTS: &[SmokeTest] = &[
         expect_absent: &["KERNEL PANIC", "triple fault"],
         timeout_secs: 20,
     },
+    SmokeTest {
+        // B1 Step 2: the native cooperative context switch. Two kernel
+        // threads ping-pong on independent stacks and hand control back to
+        // main. "ABABAB" proves repeated alternation between the two
+        // stacks; the bookend lines prove the round-trip (main → A/B → main)
+        // completed without a fault.
+        name: "context_switch_ping_pong_b1",
+        expect_contains: &[
+            "[switch] starting A/B ping-pong",
+            "ABABAB",
+            "[switch] back in main, demo done",
+        ],
+        expect_absent: &["KERNEL PANIC", "triple fault"],
+        timeout_secs: 20,
+    },
 ];
 
 fn run_qemu_test() -> Result<()> {

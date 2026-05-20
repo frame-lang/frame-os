@@ -28,7 +28,9 @@ extern crate alloc;
 use core::panic::PanicInfo;
 
 mod allocator;
+mod context;
 mod frame_systems;
+mod sched_demo;
 mod serial;
 
 use frame_systems::Kernel;
@@ -88,6 +90,12 @@ unsafe extern "C" fn kmain() -> ! {
     // (When B1 adds a scheduler, kmain will hold the Kernel and pump
     // tick() events into it instead of halting here.)
     let _kernel = Kernel::__create();
+
+    // B1 Step 2: demonstrate the native cooperative context switch — two
+    // kernel threads ping-pong on independent stacks and hand control back.
+    // Transitional; Step 3 replaces this with the timer ISR driving the
+    // Frame Scheduler for real preemption.
+    sched_demo::run();
 
     halt_forever();
 }
