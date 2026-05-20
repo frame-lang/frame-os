@@ -14,4 +14,8 @@ pub struct JobSummary {
     pub id: u32,
     pub state: String,
     pub cmd: String,
+    /// 0 unless the job is in `$Done`. Shell reads this after
+    /// wait_foreground to print "[exit code: N]" for non-zero exits
+    /// (preserving H2's external-command surface behavior).
+    pub exit_code: i32,
 }

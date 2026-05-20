@@ -25,15 +25,24 @@
 
 use std::process::ExitCode;
 
-use frame_os_shell::Shell;
+use frame_os_shell::{signals, Shell};
 use rustyline::error::ReadlineError;
 use rustyline::DefaultEditor;
 
 fn main() -> ExitCode {
     // Banner — printed once at startup, before the Shell prints its first
     // prompt. (Shell::__create() runs $Prompting.$> which prints "frame-os> ".)
-    println!("Frame OS shell — H2");
+    println!("Frame OS shell — H3");
     println!("type 'exit' or 'quit' to leave (Ctrl-D also exits; Ctrl-C cancels current input)");
+    println!("trailing `&` runs a command in the background");
+
+    // Install SIGTSTP handler (Unix only) so Ctrl-Z stops the foreground
+    // job without taking the shell down. JobControl's polling loop reads
+    // the flag this handler sets. See shell/src/signals.rs for details.
+    if let Err(err) = signals::install_sigtstp_handler() {
+        eprintln!("warning: could not install SIGTSTP handler: {err}");
+        // Continue — the shell still works, Ctrl-Z just won't be honored.
+    }
 
     let mut shell = Shell::__create();
 

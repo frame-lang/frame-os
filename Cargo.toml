@@ -30,6 +30,7 @@ rust-version = "1.75"
 rustyline = "14"
 ctrlc = "3"
 libc = "0.2"
+signal-hook = "0.3"
 
 # Testing
 insta = "1.40"

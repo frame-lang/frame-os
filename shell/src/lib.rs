@@ -13,6 +13,7 @@
 pub mod builtin;
 pub mod frame_systems;
 pub mod job_summary;
+pub mod signals;
 
 pub use builtin::Builtin;
 pub use frame_systems::{Job, JobControl, Parser, Shell};

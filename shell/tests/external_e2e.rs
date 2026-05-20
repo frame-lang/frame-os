@@ -120,3 +120,49 @@ fn multiple_externals_in_sequence() {
     .stdout(contains("two"))
     .stdout(contains("three"));
 }
+
+// ---------------------------------------------------------------------------
+// H3 Step 3 — background launch via trailing `&`
+// ---------------------------------------------------------------------------
+
+#[test]
+fn background_command_returns_to_prompt_immediately() {
+    // Launch a 60-second sleep in the background, then immediately type
+    // a builtin that returns synchronously, then exit. If `&` correctly
+    // routes to spawn_background instead of waiting on the foreground,
+    // the shell processes both commands before the timeout.
+    //
+    // This is the primary acceptance check for H3 Step 3: did `&` cause
+    // the shell to NOT block on the spawned process.
+    let tmp = TempDir::new().unwrap();
+    shell_at(tmp.path(), "/bin/sleep 60 &\necho ready\nexit\n")
+        .success()
+        .stdout(contains("ready"))
+        .stdout(contains("goodbye"));
+    // The sleep is still running when the shell exits. On Unix, the
+    // shell's process exit causes the OS to deliver SIGHUP to its
+    // children's process groups. Since we don't (yet) setpgid background
+    // jobs (H3 known limitation), the sleep will receive the SIGHUP and
+    // die when its parent shell does. Cleanup is implicit.
+}
+
+#[test]
+fn background_then_foreground_still_completes() {
+    // Mix of bg and fg externals in sequence. Verifies $Parsing's
+    // branch on `&` doesn't break the foreground path.
+    let tmp = TempDir::new().unwrap();
+    shell_at(tmp.path(), "/bin/sleep 60 &\n/bin/echo hello\nexit\n")
+        .success()
+        .stdout(contains("hello"))
+        .stdout(contains("goodbye"));
+}
+
+#[test]
+fn background_builtin_prints_unsupported_message() {
+    // H3 Step 3 deliberately doesn't support `builtin &`. Should print
+    // a message and return to prompt cleanly.
+    let tmp = TempDir::new().unwrap();
+    shell_at(tmp.path(), "pwd &\nexit\n")
+        .success()
+        .stdout(contains("background builtins are not supported"));
+}

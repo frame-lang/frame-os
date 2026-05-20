@@ -23,7 +23,7 @@ These run inside the hosted-mode shell (`cargo run --bin frame-os-shell`) on Lin
 
 | System | Milestone | Status | Description |
 |---|---|---|---|
-| [`Shell` (hosted variant)](shell.md) | H0–H3 | In progress (H2 complete) | Top-level shell lifecycle: prompt, parse, run builtins or external commands, repeat. State-dependent Ctrl-C handling demonstrates Frame's argument concretely at H2. |
+| [`Shell` (hosted variant)](shell.md) | H0–H3 | In progress (H3 Step 3 — JobControl integrated; Step 4 adds jobs/fg/bg/wait builtins) | Top-level shell lifecycle: prompt, parse, run builtins or external commands, repeat. State-dependent Ctrl-C handling at H2; background-job launch via `&` and Ctrl-Z foreground stop at H3 Step 3. |
 | [`Parser`](parser.md) | H1 | In progress (H1) | Per-char event-driven tokenizer. `$ReadingWord → $InWord → $InQuotedString → $Done / $Failed`. Handles whitespace separation and double/single quoted substrings. |
 | [`JobControl`](job_control.md) | H3 | In progress (H3 Step 2 — standalone FSM landed; integration at Step 3) | Manager system for background jobs. Holds `Vec<Job>`. 2 states, 6 edges, 19 behavioral tests. |
 | [`Job`](job.md) | H3 | In progress (H3 Step 1 — standalone FSM landed; integration at Step 3) | Per-instance job state machine. One instance per running, stopped, or completed external command. 5 states, 14 edges, 16 behavioral tests. |

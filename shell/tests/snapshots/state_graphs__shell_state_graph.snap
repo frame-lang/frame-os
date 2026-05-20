@@ -37,9 +37,9 @@ $&gt;()<br ALIGN="LEFT"/>line(input: &amp;str)<br ALIGN="LEFT"/>interrupt()<br A
             </font></td></tr>
         </table>
     > margin=0 shape=none]
-    RunningExternal [label = <
+    RunningForeground [label = <
         <table CELLBORDER="0" CELLPADDING="5" style="rounded">
-            <tr><td><b>RunningExternal</b></td></tr>
+            <tr><td><b>RunningForeground</b></td></tr>
             <hr/>
             <tr><td align="left"><font point-size="10">
 $&gt;()<br ALIGN="LEFT"/>line(input: &amp;str)<br ALIGN="LEFT"/>interrupt()<br ALIGN="LEFT"/>eof()<br ALIGN="LEFT"/>is_done()<br ALIGN="LEFT"/>
@@ -62,12 +62,14 @@ $&gt;()<br ALIGN="LEFT"/>line(input: &amp;str)<br ALIGN="LEFT"/>interrupt()<br A
     Parsing -> Prompting [label=" interrupt "]
     Parsing -> Prompting [label=" eof "]
     Parsing -> Prompting [label=" $> "]
-    Parsing -> RunningExternal [label=" $> "]
+    Parsing -> Prompting [label=" $> "]
+    Parsing -> RunningForeground [label=" $> "]
+    Parsing -> Prompting [label=" $> "]
     Parsing -> RunningBuiltin [label=" $> "]
     RunningBuiltin -> Prompting [label=" interrupt "]
     RunningBuiltin -> Prompting [label=" eof "]
     RunningBuiltin -> Prompting [label=" $> "]
-    RunningExternal -> Prompting [label=" interrupt "]
-    RunningExternal -> Prompting [label=" eof "]
-    RunningExternal -> Prompting [label=" $> "]
+    RunningForeground -> Prompting [label=" interrupt "]
+    RunningForeground -> Prompting [label=" eof "]
+    RunningForeground -> Prompting [label=" $> "]
 }

@@ -50,16 +50,14 @@
     machine:
         $Idle {
             spawn_foreground(cmd: String, args: Vec<String>) {
+                // Always transition to $RunningForeground, even on spawn
+                // failure. The failed Job is in $Done state; wait_foreground's
+                // polling loop sees is_done() on its first iteration and
+                // returns immediately. This keeps JobControl's state simple:
+                // every spawn_foreground call moves us to $RunningForeground
+                // and the matching wait_foreground call moves us back.
                 let mut job = @@Job(self.next_id);
                 job.spawn(cmd, args);
-                if job.is_done() {
-                    // Spawn failure (e.g. NotFound). Add to list as Done;
-                    // stay in $Idle. Caller will see the failure via
-                    // jobs() listing.
-                    self.jobs.push(job);
-                    self.next_id += 1;
-                    return;
-                }
                 self.foreground_id = Some(self.next_id);
                 self.jobs.push(job);
                 self.next_id += 1;
@@ -67,11 +65,14 @@
             }
 
             spawn_background(cmd: String, args: Vec<String>) {
+                // Use Job.spawn_detached: redirects child stdio to
+                // /dev/null and puts it in its own process group. This
+                // prevents (a) the orphaned background job from holding
+                // our stdio pipes open after the shell exits, and (b)
+                // terminal Ctrl-C at the prompt from killing it.
+                // Lands the Job directly in $Background.
                 let mut job = @@Job(self.next_id);
-                job.spawn(cmd, args);
-                if !job.is_done() {
-                    job.to_background();
-                }
+                job.spawn_detached(cmd, args);
                 self.jobs.push(job);
                 self.next_id += 1;
             }
@@ -216,7 +217,6 @@
                 None => return,
             };
             loop {
-                let mut resting = true;
                 let mut idx: Option<usize> = None;
                 for (i, j) in self.jobs.iter().enumerate() {
                     if j.id == fid {
@@ -228,6 +228,15 @@
                     Some(i) => i,
                     None => return,
                 };
+                // Check for SIGTSTP (Ctrl-Z) — the signal handler in
+                // shell/src/signals.rs set the flag if a SIGTSTP was
+                // delivered since the last check. If so, the child was
+                // stopped at the OS level; record the $Stopped transition
+                // on the Job and exit the loop.
+                if crate::signals::take_suspend_flag() {
+                    self.jobs[i].stop();
+                    break;
+                }
                 self.jobs[i].poll();
                 if self.jobs[i].is_done() {
                     break;
@@ -235,7 +244,6 @@
                 if self.jobs[i].state_name() == "Stopped" {
                     break;
                 }
-                let _ = resting;
                 std::thread::sleep(std::time::Duration::from_millis(20));
             }
         }
@@ -270,6 +278,7 @@
                     id: j.id(),
                     state: j.state_name(),
                     cmd: j.cmd_str(),
+                    exit_code: j.exit_code(),
                 });
             }
             @@:(out)

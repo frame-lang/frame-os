@@ -15,12 +15,16 @@ path = "src/main.rs"
 # Line editing + Ctrl-C / Ctrl-D handling at the prompt.
 rustyline = { workspace = true }
 
-# Used by Shell.$RunningExternal at H2 to install a SIG_IGN handler so the
-# shell survives Ctrl-C while a child process is running (the child still
-# receives the signal via the terminal foreground process group and dies
-# naturally). Unix-only; the corresponding Windows path is future polish.
+# Unix-only signal-handling deps:
+#  - libc: SIG_IGN install during foreground child.wait (carried from H2),
+#    plus libc::kill for Job's signal delivery (SIGTSTP/SIGCONT/SIGKILL).
+#  - signal-hook: SIGTSTP handler installed at startup so Ctrl-Z stops the
+#    foreground job without taking the shell down with it (H3 Step 3).
+# Windows paths are deferred — H3 features that depend on SIGTSTP/SIGCONT
+# cleanly omit via #[cfg(unix)] gates.
 [target.'cfg(unix)'.dependencies]
 libc = { workspace = true }
+signal-hook = { workspace = true }
 
 [dev-dependencies]
 insta = { workspace = true }

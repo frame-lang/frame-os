@@ -40,11 +40,20 @@ pub enum Builtin {
 }
 
 /// True iff the classified command was not matched against any known builtin.
-/// Used by `$Parsing.$>` to route to `$RunningExternal` instead of
-/// `$RunningBuiltin`. Lifted out as a function so the .frs handler body
-/// stays a single-line condition.
+/// Used by `$Parsing.$>` to route to `$RunningForeground` (H3) or to
+/// JobControl.spawn_background, instead of `$RunningBuiltin`.
 pub fn is_unknown(b: &Builtin) -> bool {
     matches!(b, Builtin::Unknown(_, _))
+}
+
+/// Extract the cmd and args from `Builtin::Unknown(cmd, args)`. Callers
+/// should gate with `is_unknown(...)` first; otherwise this returns an
+/// empty pair, which JobControl will treat as a spawn failure.
+pub fn unknown_parts(b: &Builtin) -> (String, Vec<String>) {
+    match b {
+        Builtin::Unknown(c, a) => (c.clone(), a.clone()),
+        _ => (String::new(), Vec::new()),
+    }
 }
 
 /// Classify a token vector into a Builtin.

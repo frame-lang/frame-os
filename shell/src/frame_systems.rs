@@ -18,7 +18,7 @@
 // field referencing a type from another module of this crate? Import it
 // here so the generated module can see it.
 
-use crate::builtin::{classify, execute, is_unknown, Builtin};
+use crate::builtin::{classify, execute, is_unknown, unknown_parts, Builtin};
 use crate::job_summary::JobSummary;
 
 include!(concat!(env!("OUT_DIR"), "/shell.rs"));

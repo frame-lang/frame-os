@@ -1,29 +1,35 @@
 // frame/shell.frs
 //
-// Frame OS Shell — H2 (external command execution).
+// Frame OS Shell — H3 Step 3 (JobControl integration + background jobs).
 //
-// State graph at H2 — 5 states, plus Entry → $Prompting:
+// State graph at H3 — 5 states, plus Entry → $Prompting:
 //
-//   $Prompting ── line(exit/quit) ──────────────────────────► $Exiting
-//                                                              (terminal)
+//   $Prompting ── line(exit/quit) ──────────────────────────────► $Exiting
+//                                                                  (terminal)
 //   $Prompting ── line(builtin) ──► $Parsing ──► $RunningBuiltin ──► $Prompting
-//   $Prompting ── line(external) ─► $Parsing ──► $RunningExternal ─► $Prompting
-//   $Prompting ── eof() ────────────────────────────────────► $Exiting
-//   $Prompting ── interrupt() ──► $Prompting   (stay — line was cleared by rustyline)
+//   $Prompting ── line(extern, no &) ► $Parsing ──► $RunningForeground ──► $Prompting
+//   $Prompting ── line(extern, ends &) ► $Parsing ── spawn_background ──► $Prompting
+//   $Prompting ── eof() ──────────────────────────────────────► $Exiting
+//   $Prompting ── interrupt() ──► $Prompting   (stay — line was cleared)
 //
-//   $RunningExternal ── interrupt() ──► $Prompting   (kills the child process)
+// $RunningExternal (H2) is gone. $RunningForeground replaces it and
+// delegates to JobControl, which holds Vec<Job> and the FG/BG/Stopped
+// bookkeeping.
 //
-// H0 had `interrupt() → $Exiting` from $Prompting. H2 inverts that: at the
-// prompt, Ctrl-C is "abort this input," not "exit." Ctrl-D / EOF still
-// exits, but it gets its own event (`eof()`) so the two intent paths
-// stay distinct.
+// Ctrl-Z / SIGTSTP handling: NOT a Frame event. shell/src/signals.rs
+// installs a SIGTSTP handler that sets a global flag. JobControl's
+// drive_foreground_to_idle polling loop checks the flag on each
+// iteration; when set, it stops the foreground job (records the
+// $Stopped transition on the Job) and breaks. Shell sees wait_foreground
+// return normally and transitions $RunningForeground → $Prompting.
+// From the user's point of view: Ctrl-Z drops them back at the prompt
+// with the foreground job stopped — visible via the `jobs` builtin
+// (Step 4).
 //
-// The Frame argument lands here: the SAME `interrupt()` event has
-// different effects per state. In `$Prompting` it's a no-op (rustyline
-// already cleared the line; we just stay). In `$RunningExternal` it kills
-// the running child and returns to the prompt. There is no
-// `if shell.state() == ...` in the host loop — main.rs calls
-// `shell.interrupt()` unconditionally, and Frame dispatches.
+// Background reaping: $Prompting.$> calls job_control.tick() before
+// printing the prompt. tick() polls every non-done job and reaps any
+// that have exited. (Bash prints "[N] Done <cmd>" notices when this
+// happens; we don't — defer to H3 polish.)
 
 @@[target("rust")]
 
@@ -37,6 +43,8 @@
     machine:
         $Prompting {
             $>() {
+                // Reap done background jobs (silently). Then prompt.
+                self.job_control.tick();
                 self.print_prompt();
             }
 
@@ -53,10 +61,8 @@
             }
 
             interrupt() {
-                // H2: Ctrl-C at the prompt is "abort this input." Rustyline
-                // already cleared the line buffer; we just print a fresh
-                // prompt and stay in $Prompting. To exit, use Ctrl-D, exit,
-                // or quit.
+                // Ctrl-C at the prompt is "abort this input." Rustyline
+                // already cleared the line buffer; re-prompt.
                 self.print_prompt();
             }
 
@@ -79,31 +85,52 @@
                 if !p.error().is_empty() {
                     println!("parse error: {}", p.error());
                     -> $Prompting
+                }
+
+                // Detect trailing `&` for background launch.
+                let mut tokens = p.tokens();
+                let background = tokens.last().map(|s| s.as_str()) == Some("&");
+                if background {
+                    tokens.pop();
+                }
+
+                self.current_builtin = classify(tokens);
+                let unknown = is_unknown(&self.current_builtin);
+
+                if unknown && background {
+                    // Background external command. Spawn and stay $Prompting.
+                    let (cmd, args) = unknown_parts(&self.current_builtin);
+                    self.job_control.spawn_background(cmd, args);
+                    self.history.push(self.current_line.clone());
+                    -> $Prompting
+                } else if unknown {
+                    // Foreground external command.
+                    let (cmd, args) = unknown_parts(&self.current_builtin);
+                    self.job_control.spawn_foreground(cmd, args);
+                    self.last_foreground_id = self.job_control.foreground_id();
+                    -> $RunningForeground
+                } else if background {
+                    // Background builtin — H3 doesn't support it.
+                    // Real bash runs `pwd &` as a one-shot sub-shell; we
+                    // don't. Print a message and skip the run.
+                    println!("frame-os: background builtins are not supported");
+                    -> $Prompting
                 } else {
-                    self.current_builtin = classify(p.tokens());
-                    // H2 split: route unknown commands to $RunningExternal
-                    // (try as host-OS command). Known builtins go to
-                    // $RunningBuiltin as before.
-                    if is_unknown(&self.current_builtin) {
-                        -> $RunningExternal
-                    } else {
-                        -> $RunningBuiltin
-                    }
+                    -> $RunningBuiltin
                 }
             }
 
             line(input: &str) {
-                // Transient state — $> runs synchronously and transitions
-                // out before the host loop can deliver another event.
+                // Transient state — $> runs synchronously.
             }
 
             interrupt() {
-                // Defensive; unreachable in practice.
+                // Defensive.
                 -> $Prompting
             }
 
             eof() {
-                // Defensive; unreachable in practice.
+                // Defensive.
                 -> $Prompting
             }
 
@@ -120,11 +147,11 @@
             }
 
             line(input: &str) {
-                // Transient state.
+                // Transient.
             }
 
             interrupt() {
-                // Builtins are synchronous and brief; defensive transition.
+                // Defensive.
                 -> $Prompting
             }
 
@@ -138,30 +165,53 @@
             }
         }
 
-        $RunningExternal {
+        $RunningForeground {
             $>() {
-                self.run_external();
+                // Block-equivalent: drives JobControl's polling loop
+                // until the foreground job exits or is stopped.
+                self.job_control.wait_foreground();
+
+                // Surface non-zero exit codes for completed foreground
+                // jobs (preserves H2's "[exit code: N]" output).
+                let id = self.last_foreground_id;
+                for s in self.job_control.jobs().iter() {
+                    if s.id == id {
+                        if s.state == "Done" && s.exit_code != 0 {
+                            println!("[exit code: {}]", s.exit_code);
+                        } else if s.state.starts_with("Failed") {
+                            // Spawn failure (NotFound etc.). Print a
+                            // shell-shaped message similar to bash's
+                            // "command not found".
+                            let parsed: String = s.state
+                                .strip_prefix("Failed (")
+                                .and_then(|x| x.strip_suffix(")"))
+                                .map(|x| x.to_string())
+                                .unwrap_or_default();
+                            if parsed.contains("No such file") {
+                                println!("{}: command not found", s.cmd);
+                            } else {
+                                println!("{}: {}", s.cmd, parsed);
+                            }
+                        }
+                        break;
+                    }
+                }
                 self.history.push(self.current_line.clone());
                 -> $Prompting
             }
 
             line(input: &str) {
-                // Transient state — $> blocks in child.wait().
+                // Transient — $> blocks in wait_foreground.
             }
 
             interrupt() {
-                // The actual SIGINT delivery during child.wait() is handled
-                // at the OS / libc level (see run_external action below):
-                // the shell installs SIG_IGN, the child inherits the
-                // terminal foreground group and dies naturally on Ctrl-C,
-                // child.wait() returns, and we transition to $Prompting
-                // via the $> handler's normal flow.
-                //
-                // This interrupt() handler is reachable only by tests that
-                // manipulate domain state directly (or by future async
-                // designs). It defensively attempts to kill the child by
-                // PID and transitions back to $Prompting.
-                self.kill_child();
+                // The actual Ctrl-C handling for a running foreground job
+                // happens at the OS / libc level: shell installs SIG_IGN
+                // briefly inside wait_foreground (via Job's run path),
+                // the child inherits the terminal foreground group and
+                // receives SIGINT naturally. This handler exists for the
+                // state-event contract — through normal flow it's
+                // unreachable while $> is in JobControl's polling loop.
                 -> $Prompting
             }
 
@@ -208,82 +258,6 @@
             println!("goodbye");
         }
 
-        // Spawn the classified external command, install SIG_IGN for the
-        // duration of child.wait() so the shell survives Ctrl-C while the
-        // child handles SIGINT naturally (or other signals), then restore
-        // the previous SIGINT disposition. On Unix only — Windows takes a
-        // different path that's not yet implemented (see shell/Cargo.toml).
-        run_external() {
-            let (cmd, args) = match &self.current_builtin {
-                Builtin::Unknown(c, a) => (c.clone(), a.clone()),
-                // Defensive: $RunningExternal shouldn't be entered for any
-                // other Builtin variant. Just bail.
-                _ => return,
-            };
-
-            let mut command = std::process::Command::new(&cmd);
-            command.args(&args);
-
-            let mut child = match command.spawn() {
-                Ok(c) => c,
-                Err(e) => {
-                    if e.kind() == std::io::ErrorKind::NotFound {
-                        println!("{cmd}: command not found");
-                    } else {
-                        println!("{cmd}: {e}");
-                    }
-                    return;
-                }
-            };
-
-            self.current_child_pid = Some(child.id());
-
-            // Install SIG_IGN for SIGINT so the shell survives Ctrl-C while
-            // the child runs. Save the previous handler so we can restore.
-            #[cfg(unix)]
-            let prev_handler = unsafe {
-                libc::signal(libc::SIGINT, libc::SIG_IGN)
-            };
-
-            let status = child.wait();
-
-            #[cfg(unix)]
-            unsafe {
-                libc::signal(libc::SIGINT, prev_handler);
-            }
-
-            self.current_child_pid = None;
-
-            // Surface non-zero exit codes for the user. Signal-killed
-            // processes have code() == None on Unix; print nothing in that
-            // case, like bash.
-            match status {
-                Ok(s) if !s.success() => {
-                    if let Some(code) = s.code() {
-                        println!("[exit code: {code}]");
-                    }
-                }
-                Ok(_) => {}
-                Err(e) => println!("wait failed: {e}"),
-            }
-        }
-
-        // Attempt to kill the currently-running external child by PID.
-        // Reachable only via the $RunningExternal.interrupt() handler,
-        // which itself is unreachable through normal flow because $> is
-        // synchronous. Documented for the state-event interface contract
-        // and exercised by behavioral tests that drive interrupt() against
-        // a domain manually seeded with a running child.
-        kill_child() {
-            if let Some(pid) = self.current_child_pid {
-                #[cfg(unix)]
-                unsafe {
-                    libc::kill(pid as i32, libc::SIGINT);
-                }
-                let _ = pid;
-            }
-        }
-
     domain:
         // The most recent line being processed.
         current_line: String = String::new()
@@ -291,13 +265,17 @@
         // The classified Builtin from the most recent parse.
         current_builtin: Builtin = Builtin::Empty
 
-        // PID of the currently-running external child, set while
-        // $RunningExternal.run_external() is in child.wait().
-        current_child_pid: Option<u32> = None
+        // Job id of the most recently spawned foreground job. Stored so
+        // $RunningForeground.$> can find the exit info in jobs() after
+        // wait_foreground returns (which clears JobControl.foreground_id).
+        last_foreground_id: u32 = 0
 
         // Shell's tracked working directory.
         cwd: std::path::PathBuf = std::env::current_dir().unwrap_or_default()
 
         // Command history.
         history: Vec<String> = Vec::new()
+
+        // The job table + foreground-tracking manager.
+        job_control: JobControl = @@JobControl()
 }

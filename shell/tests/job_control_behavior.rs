@@ -47,14 +47,17 @@ fn spawn_foreground_transitions_to_running_foreground() {
 }
 
 #[test]
-fn spawn_foreground_failure_stays_idle() {
+fn spawn_foreground_failure_lands_in_idle_after_wait() {
     let mut jc = JobControl::__create();
     jc.spawn_foreground("/this/binary/does/not/exist".to_string(), vec![]);
-    // Spawn failed; we stayed in $Idle, but the failed job is in the list
-    // so the user can see it via `jobs`.
+    // Always transitions to $RunningForeground (even on spawn failure).
+    assert!(jc.is_running_foreground());
+    // wait_foreground sees the failed Job is already $Done on the first
+    // poll iteration and returns immediately.
+    jc.wait_foreground();
     assert!(jc.is_idle());
-    assert_eq!(jc.jobs().len(), 1);
     let summaries = jc.jobs();
+    assert_eq!(summaries.len(), 1);
     assert!(summaries[0].state.starts_with("Failed"));
 }
 
