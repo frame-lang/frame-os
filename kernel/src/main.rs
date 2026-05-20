@@ -30,6 +30,10 @@ use core::panic::PanicInfo;
 mod allocator;
 mod context;
 mod frame_systems;
+mod interrupts;
+mod io;
+mod pic;
+mod pit;
 mod sched_demo;
 mod serial;
 
@@ -90,6 +94,30 @@ unsafe extern "C" fn kmain() -> ! {
     // (When B1 adds a scheduler, kmain will hold the Kernel and pump
     // tick() events into it instead of halting here.)
     let _kernel = Kernel::__create();
+
+    // B1 Step 3a: install the IDT and prove the interrupt path works by
+    // firing a software breakpoint. The handler prints "[int3 ok]" and
+    // `iretq`s; the "[idt] survived int3" line proves we returned.
+    interrupts::init();
+    serial::write_str("[idt] firing int3: ");
+    interrupts::test_breakpoint();
+    serial::writeln("\n[idt] survived int3");
+
+    // B1 Step 3b: remap the PIC, start the PIT at 100 Hz, enable
+    // interrupts, and wait for ~20 timer ticks. Reaching the "elapsed"
+    // line proves IRQ0 is firing (otherwise the hlt loop blocks forever
+    // and the smoke test times out). Disable again before the cooperative
+    // demo so the two don't interleave.
+    pic::remap();
+    pit::init(100);
+    interrupts::enable();
+    serial::writeln("[timer] waiting for ticks...");
+    let target = interrupts::ticks() + 20;
+    while interrupts::ticks() < target {
+        interrupts::wait_for_interrupt();
+    }
+    serial::writeln("[timer] 20 ticks elapsed");
+    interrupts::disable();
 
     // B1 Step 2: demonstrate the native cooperative context switch — two
     // kernel threads ping-pong on independent stacks and hand control back.

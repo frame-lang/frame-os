@@ -425,6 +425,21 @@ const SMOKE_TESTS: &[SmokeTest] = &[
         timeout_secs: 20,
     },
     SmokeTest {
+        // B1 Step 3a/3b: the IDT and the timer IRQ. `[int3 ok]` +
+        // `survived int3` prove the IDT, gate descriptors, and iretq work;
+        // `20 ticks elapsed` proves the PIC remap + PIT + timer ISR fire
+        // IRQ0 (the hlt-wait loop only exits if ticks accumulate). No
+        // exception safety-net line should appear.
+        name: "interrupts_and_timer_b1",
+        expect_contains: &[
+            "[int3 ok]",
+            "[idt] survived int3",
+            "[timer] 20 ticks elapsed",
+        ],
+        expect_absent: &["KERNEL EXCEPTION", "KERNEL PANIC", "triple fault"],
+        timeout_secs: 20,
+    },
+    SmokeTest {
         // B1 Step 2: the native cooperative context switch. Two kernel
         // threads ping-pong on independent stacks and hand control back to
         // main. "ABABAB" proves repeated alternation between the two
