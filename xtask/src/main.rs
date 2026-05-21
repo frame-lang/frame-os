@@ -1013,6 +1013,28 @@ const SMOKE_TESTS: &[SmokeTest] = &[
         ],
         timeout_secs: 20,
     },
+    SmokeTest {
+        // B5 Step 2b: IPv4 + ICMP echo. After resolving the gateway MAC, the
+        // kernel sends an ICMP echo request to 10.0.2.2 (Ethernet → IPv4 →
+        // ICMP, both checksums) and matches the reply — proving the IPv4/ICMP
+        // encode + parse path. slirp answers ping to its gateway address
+        // deterministically. (Answering inbound pings — the responder, B5-3 —
+        // lands with TAP, where inbound ICMP can reach the guest.)
+        name: "kernel_pings_gateway_b5",
+        expect_contains: &[
+            "[arp] resolved 10.0.2.2 -> ",
+            "[icmp] ping 10.0.2.2 seq 0",
+            "[icmp] reply from 10.0.2.2 seq 0",
+            "[net] ping ok",
+        ],
+        expect_absent: &[
+            "KERNEL EXCEPTION",
+            "KERNEL PANIC",
+            "triple fault",
+            "[icmp] no reply (timeout)",
+        ],
+        timeout_secs: 20,
+    },
 ];
 
 fn run_qemu_test() -> Result<()> {

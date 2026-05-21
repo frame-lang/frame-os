@@ -16,11 +16,16 @@ use crate::frame_systems::ArpResolver;
 use crate::{interrupts, serial, virtio_net};
 
 const ETHERTYPE_ARP: [u8; 2] = [0x08, 0x06];
+const ETHERTYPE_IPV4: [u8; 2] = [0x08, 0x00];
 const ARP_OPER_REQUEST: [u8; 2] = [0x00, 0x01];
 const ARP_OPER_REPLY: [u8; 2] = [0x00, 0x02];
 
+const IP_PROTO_ICMP: u8 = 1;
+const ICMP_ECHO_REPLY: u8 = 0;
+const ICMP_ECHO_REQUEST: u8 = 8;
+
 const GUEST_IP: [u8; 4] = [10, 0, 2, 15]; // QEMU slirp default guest address
-const GATEWAY_IP: [u8; 4] = [10, 0, 2, 2]; // QEMU slirp gateway (answers ARP)
+const GATEWAY_IP: [u8; 4] = [10, 0, 2, 2]; // QEMU slirp gateway (answers ARP + ping)
 
 /// Retransmit interval, in PIT ticks. The gateway answers within a tick or two;
 /// this is a generous re-send window.
@@ -92,6 +97,83 @@ fn store_gateway_mac(frame: &[u8]) {
     unsafe { (*p).copy_from_slice(&frame[22..28]) };
 }
 
+// --- IPv4 + ICMP echo (B5 Step 2b) -----------------------------------------
+
+/// Internet checksum (RFC 1071): one's-complement sum of 16-bit big-endian
+/// words, with the carries folded in, then complemented. Used for the IPv4
+/// header and the ICMP message.
+fn checksum(data: &[u8]) -> u16 {
+    let mut sum: u32 = 0;
+    let mut i = 0;
+    while i + 1 < data.len() {
+        sum += u16::from_be_bytes([data[i], data[i + 1]]) as u32;
+        i += 2;
+    }
+    if i < data.len() {
+        sum += (data[i] as u32) << 8; // odd trailing byte, high-padded
+    }
+    while (sum >> 16) != 0 {
+        sum = (sum & 0xFFFF) + (sum >> 16);
+    }
+    !(sum as u16)
+}
+
+const PING_PAYLOAD: [u8; 8] = *b"frameos!";
+const PING_ID: u16 = 0x1234;
+
+/// Send one ICMP echo request to the gateway (Ethernet → IPv4 → ICMP), using
+/// the gateway MAC resolved by `ArpResolver`. 50 bytes: 14 + 20 + 8 + 8.
+fn send_ping(seq: u16) {
+    let gw = gateway_mac();
+    let mac = virtio_net::mac();
+    let mut f = [0u8; 14 + 20 + 8 + 8];
+
+    // Ethernet header.
+    f[0..6].copy_from_slice(&gw);
+    f[6..12].copy_from_slice(&mac);
+    f[12..14].copy_from_slice(&ETHERTYPE_IPV4);
+
+    // IPv4 header (offset 14, no options → IHL 5).
+    let total_len = (20 + 8 + PING_PAYLOAD.len()) as u16;
+    f[14] = 0x45; // version 4, IHL 5
+    f[16..18].copy_from_slice(&total_len.to_be_bytes());
+    f[20..22].copy_from_slice(&0x4000u16.to_be_bytes()); // don't-fragment
+    f[22] = 64; // TTL
+    f[23] = IP_PROTO_ICMP;
+    f[26..30].copy_from_slice(&GUEST_IP); // src
+    f[30..34].copy_from_slice(&GATEWAY_IP); // dst
+    let ip_csum = checksum(&f[14..34]); // checksum field (24..26) still zero
+    f[24..26].copy_from_slice(&ip_csum.to_be_bytes());
+
+    // ICMP echo request (offset 34).
+    f[34] = ICMP_ECHO_REQUEST;
+    f[38..40].copy_from_slice(&PING_ID.to_be_bytes());
+    f[40..42].copy_from_slice(&seq.to_be_bytes());
+    f[42..50].copy_from_slice(&PING_PAYLOAD);
+    let icmp_csum = checksum(&f[34..50]); // checksum field (36..38) still zero
+    f[36..38].copy_from_slice(&icmp_csum.to_be_bytes());
+
+    virtio_net::tx_frame(&f);
+}
+
+/// Is `frame` an ICMP echo reply from the gateway to us, matching `seq`?
+fn is_icmp_echo_reply(frame: &[u8], seq: u16) -> bool {
+    if frame.len() < 14 + 20 + 8 || frame[12..14] != ETHERTYPE_IPV4 {
+        return false;
+    }
+    if frame[14] >> 4 != 4 || frame[14 + 9] != IP_PROTO_ICMP {
+        return false;
+    }
+    if frame[26..30] != GATEWAY_IP || frame[30..34] != GUEST_IP {
+        return false; // not from the gateway to us
+    }
+    let icmp = 14 + (frame[14] & 0x0F) as usize * 4; // honor IHL
+    frame.len() >= icmp + 8
+        && frame[icmp] == ICMP_ECHO_REPLY
+        && frame[icmp + 4..icmp + 6] == PING_ID.to_be_bytes()
+        && frame[icmp + 6..icmp + 8] == seq.to_be_bytes()
+}
+
 // --- demo ------------------------------------------------------------------
 
 /// B5 Step 2a demo: bring up virtio-net, then resolve the gateway's MAC through
@@ -128,13 +210,49 @@ pub fn run_demo() {
     }
     interrupts::disable();
 
-    if arpr.is_resolved() {
-        serial::write_str("[arp] resolved 10.0.2.2 -> ");
-        print_mac(&gateway_mac());
-        serial::writeln("");
-        serial::writeln("[net] gateway resolved via ArpResolver: ok");
-    } else {
+    if !arpr.is_resolved() {
         serial::writeln("[net] gateway resolution did not complete");
+        return;
+    }
+    serial::write_str("[arp] resolved 10.0.2.2 -> ");
+    print_mac(&gateway_mac());
+    serial::writeln("");
+    serial::writeln("[net] gateway resolved via ArpResolver: ok");
+
+    // B5 Step 2b: ICMP echo (ping) the gateway, now that we have its MAC.
+    ping_gateway();
+}
+
+/// B5 Step 2b: send an ICMP echo request to the gateway and wait for the reply
+/// (Ethernet → IPv4 → ICMP, with both checksums). slirp answers ping to its
+/// gateway address (10.0.2.2) deterministically. This is the ICMP *client*
+/// path; answering inbound pings (the responder, B5-3) lands with TAP, where
+/// inbound ICMP can actually reach the guest.
+fn ping_gateway() {
+    serial::writeln("[icmp] ping 10.0.2.2 seq 0");
+    send_ping(0);
+
+    interrupts::enable();
+    let deadline = interrupts::ticks() + 300;
+    let mut buf = [0u8; virtio_net::MAX_FRAME];
+    let mut got = false;
+    while interrupts::ticks() < deadline {
+        if let Some(n) = virtio_net::poll_rx(&mut buf) {
+            if is_icmp_echo_reply(&buf[..n], 0) {
+                got = true;
+                break;
+            }
+        } else {
+            interrupts::wait_for_interrupt();
+        }
+    }
+    interrupts::disable();
+
+    if got {
+        serial::writeln("[icmp] reply from 10.0.2.2 seq 0");
+        serial::writeln("[net] ping ok");
+    } else {
+        serial::writeln("[icmp] no reply (timeout)");
     }
 }
 
