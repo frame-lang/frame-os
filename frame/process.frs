@@ -1,0 +1,134 @@
+// frame/process.frs
+//
+// Process — per-process lifecycle (B3 Step 3). Supersedes Task: same coarse
+// shape, plus the two states a real OS needs for exit-status collection —
+// $Zombie (exited, not yet waited-on) and $Reaped (status collected, slot
+// reclaimable).
+//
+// Like Task, there is deliberately NO $Running state. "Currently on the CPU"
+// flips on every timer tick from the preemptive scheduler's ISR, and the ISR
+// cannot fire Frame events (Frame dispatch is non-reentrant). "Which runnable
+// process is executing right now" is native scheduler state, not a Frame
+// transition. $Ready means "runnable". This is the same call made for Task,
+// Scheduler, and SerialDriver — model the invariant that exists, not the
+// textbook diagram. (The architecture doc's $Running is dropped here for that
+// reason; see docs/architecture.md.)
+//
+// State graph ($Alive is an HSM parent, drawn as the box; $Zombie/$Reaped are
+// outside it — kill() is meaningless once exited):
+//
+//   ┌──────────────────────── $Alive (parent) ─────────────────────────┐
+//   │   kill(): exit_code = KILLED, -> $Zombie                          │
+//   │                                                                   │
+//   │   ┌──────────┐ make_ready ┌─────────┐  block   ┌───────────┐      │
+//   │   │ $Created │ ──────────►│ $Ready  │ ───────► │ $Blocked  │      │
+//   │   │ (initial)│            │         │ ◄─────── │           │      │
+//   │   └──────────┘            └────┬────┘ unblock  └───────────┘      │
+//   │                                │ exit(code)                       │
+//   └────────────────────────────────┼─────────────── kill (any) ──────┘
+//                                     ▼                    │
+//                               ┌──────────┐  reap(): i32  ▼
+//                               │ $Zombie  │ ──────────► ┌──────────┐
+//                               └──────────┘             │ $Reaped  │ (sink)
+//                                                        └──────────┘
+//
+// The HSM win is load-bearing here: kill() means the same thing in every live
+// state (record a killed exit code, go $Zombie), so it is written ONCE on the
+// $Alive parent and the three live children forward to it via the state-level
+// `=> $^`. $Zombie and $Reaped are NOT children of $Alive — killing an already-
+// exited process is a no-op, so those events are simply unhandled (ignored)
+// there. This mirrors SyscallDispatcher's `$Active.reject` funnel, and unlike
+// Kernel/PageFaultHandler's forwarding it is actually traversed (and tested).
+//
+// exit(code) vs kill(): exit() is voluntary (the process called the exit
+// syscall, code is its status); kill() is forced (sets a sentinel KILLED code).
+// Both land in $Zombie; the difference is only the recorded exit_code.
+
+@@[target("rust")]
+
+@@system Process(pid: u32) {
+    interface:
+        make_ready()
+        block()
+        unblock()
+        exit(code: i32)
+        kill()
+        // Reap a zombie: collect its exit status and move to $Reaped. Returns
+        // the exit code. On a non-zombie this is unhandled (ignored) and the
+        // default (the recorded exit_code, still 0 for a live process) is read.
+        reap(): i32 = self.exit_code
+        // Queries. Defaults read the domain / report the resting answer; only
+        // the states whose answer differs override.
+        pid(): u32 = self.pid
+        exit_code(): i32 = self.exit_code
+        state_name(): String = "Created".to_string()
+        is_ready(): bool = false
+        is_blocked(): bool = false
+        is_zombie(): bool = false
+        is_reaped(): bool = false
+
+    machine:
+        $Created => $Alive {
+            make_ready() {
+                -> $Ready
+            }
+            // kill forwards to $Alive; block/unblock/exit/reap are unhandled
+            // (no-ops on a not-yet-ready process) and also forward (where the
+            // parent ignores them too).
+            => $^
+        }
+
+        $Ready => $Alive {
+            block() {
+                -> $Blocked
+            }
+            exit(code: i32) {
+                self.exit_code = code;
+                -> $Zombie
+            }
+            is_ready(): bool { @@:(true) }
+            state_name(): String { @@:("Ready".to_string()) }
+            => $^
+        }
+
+        $Blocked => $Alive {
+            unblock() {
+                -> $Ready
+            }
+            is_blocked(): bool { @@:(true) }
+            state_name(): String { @@:("Blocked".to_string()) }
+            => $^
+        }
+
+        // Parent: the single kill handler the live children forward to.
+        $Alive {
+            kill() {
+                // -1 is the "killed" sentinel (distinct from a voluntary
+                // exit(code) — at B3 we don't model signal numbers yet).
+                self.exit_code = -1;
+                -> $Zombie
+            }
+        }
+
+        $Zombie {
+            reap(): i32 {
+                // Set the return value first (a transition is terminal), then
+                // move to the reaped sink. The reaper gets the exit code.
+                @@:(self.exit_code)
+                -> $Reaped
+            }
+            is_zombie(): bool { @@:(true) }
+            state_name(): String { @@:("Zombie".to_string()) }
+        }
+
+        // Terminal sink. make_ready / block / unblock / exit / kill have no
+        // handlers — per V4 explicit-only-forwarding they're silently ignored.
+        $Reaped {
+            is_reaped(): bool { @@:(true) }
+            state_name(): String { @@:("Reaped".to_string()) }
+        }
+
+    domain:
+        pid: u32 = pid
+        exit_code: i32 = 0
+}

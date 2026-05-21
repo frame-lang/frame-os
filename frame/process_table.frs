@@ -1,0 +1,186 @@
+// frame/process_table.frs
+//
+// ProcessTable — manager for the kernel's fixed-size process array (B3 Step 3).
+//
+// The "one manager + N instances" pattern, same as the hosted shell's
+// JobControl + Job: ProcessTable holds a Vec<Process> and orchestrates
+// per-process lifecycle operations by pid. Where JobControl was the H3
+// instance of the pattern, ProcessTable is the B3 (kernel) instance.
+//
+// The one invariant worth modeling as state is capacity: a fixed-size process
+// table can fill up, and spawn() must then fail (a real OS returns EAGAIN /
+// fork failure). That is genuine state-dependent dispatch — spawn() does
+// different things in $HasCapacity vs $Full — so it earns two states, the same
+// way Scheduler earned $Idle/$Active. (We do NOT model the architecture doc's
+// per-slot $Free→$Reserved→$Active→$ZombieAwaitingReap: that largely duplicates
+// the Process lifecycle, and $Reserved exists for partial fork() failures,
+// which arrive at Step 5. Manager-of-instances is the honest shape now.)
+//
+// State graph ($Managing is an HSM parent holding the capacity-independent
+// operations both modes share):
+//
+//   ┌──────────────────────── $Managing (parent) ──────────────────────┐
+//   │   block_pid / unblock_pid / exit_pid / kill_pid  (forward by pid) │
+//   │                                                                   │
+//   │   ┌───────────────┐  spawn when table fills    ┌──────────┐       │
+//   │   │ $HasCapacity  │ ─────────────────────────► │  $Full   │       │
+//   │   │  (initial)    │ ◄───────────────────────── │          │       │
+//   │   └───────────────┘  reap_pid frees a slot      └──────────┘       │
+//   └───────────────────────────────────────────────────────────────────┘
+//
+// The HSM forwarding is load-bearing: the four by-pid lifecycle operations are
+// identical in both modes (they don't touch capacity), so they live ONCE on
+// the $Managing parent and the two children forward to it via `=> $^`. Only
+// spawn() (may fill → $Full) and reap_pid() (may free → $HasCapacity) differ
+// per child, so those stay on the children.
+//
+// A reaped process is removed from the Vec (the slot is freed). $Reaped is
+// therefore observable on a standalone Process but transient in the table —
+// "reaped" means "gone from the table."
+
+@@[target("rust")]
+
+@@system ProcessTable(capacity: u32) {
+    interface:
+        // Create a process, admit it to $Ready, and add it to the table.
+        // Returns its pid, or 0 if the table is full.
+        spawn(): u32 = 0
+        block_pid(pid: u32)
+        unblock_pid(pid: u32)
+        exit_pid(pid: u32, code: i32)
+        kill_pid(pid: u32)
+        // Reap the zombie with this pid: collect its status, free its slot.
+        // Returns the exit code, or -1 if no such zombie.
+        reap_pid(pid: u32): i32 = -1
+        // Queries. count = entries currently in the table (reaped are removed).
+        count(): u32 = self.procs.len() as u32
+        is_full(): bool = false
+        pid_state(pid: u32): String = self.lookup_state(pid)
+
+    machine:
+        $HasCapacity => $Managing {
+            spawn(): u32 {
+                let pid = self.next_pid;
+                let mut p = @@Process(pid);
+                p.make_ready();
+                self.procs.push(p);
+                self.next_pid += 1;
+                @@:(pid)
+                if self.procs.len() as u32 >= self.capacity {
+                    -> $Full
+                }
+            }
+            reap_pid(pid: u32): i32 {
+                // Freeing a slot while we already have capacity: no mode change.
+                @@:(self.reap_and_free(pid))
+            }
+            => $^
+        }
+
+        $Full => $Managing {
+            spawn(): u32 {
+                // Table full — reject. Default return (0) is already correct;
+                // set it explicitly for readability.
+                @@:(0)
+            }
+            reap_pid(pid: u32): i32 {
+                let code = self.reap_and_free(pid);
+                @@:(code)
+                // If a slot was actually freed, capacity is available again.
+                if (self.procs.len() as u32) < self.capacity {
+                    -> $HasCapacity
+                }
+            }
+            is_full(): bool { @@:(true) }
+            => $^
+        }
+
+        // Parent: capacity-independent by-pid operations, shared by both modes.
+        $Managing {
+            block_pid(pid: u32) {
+                self.forward_block(pid);
+            }
+            unblock_pid(pid: u32) {
+                self.forward_unblock(pid);
+            }
+            exit_pid(pid: u32, code: i32) {
+                self.forward_exit(pid, code);
+            }
+            kill_pid(pid: u32) {
+                self.forward_kill(pid);
+            }
+        }
+
+    actions:
+        // Reap the zombie with `pid`: Zombie -> Reaped, then remove it from the
+        // table (free the slot). Returns the exit code, or -1 if not found /
+        // not a zombie. Native `return` for the early exit out of the search.
+        reap_and_free(pid: u32): i32 {
+            let mut found: Option<usize> = None;
+            for (i, p) in self.procs.iter_mut().enumerate() {
+                if p.pid() == pid && p.is_zombie() {
+                    found = Some(i);
+                    break;
+                }
+            }
+            match found {
+                Some(i) => {
+                    let code = self.procs[i].reap();
+                    self.procs.remove(i);
+                    return code;
+                }
+                None => return -1,
+            }
+        }
+
+        forward_block(pid: u32) {
+            for p in self.procs.iter_mut() {
+                if p.pid() == pid {
+                    p.block();
+                    return;
+                }
+            }
+        }
+
+        forward_unblock(pid: u32) {
+            for p in self.procs.iter_mut() {
+                if p.pid() == pid {
+                    p.unblock();
+                    return;
+                }
+            }
+        }
+
+        forward_exit(pid: u32, code: i32) {
+            for p in self.procs.iter_mut() {
+                if p.pid() == pid {
+                    p.exit(code);
+                    return;
+                }
+            }
+        }
+
+        forward_kill(pid: u32) {
+            for p in self.procs.iter_mut() {
+                if p.pid() == pid {
+                    p.kill();
+                    return;
+                }
+            }
+        }
+
+        // The state_name of the process with `pid`, or "None" if absent.
+        lookup_state(pid: u32): String {
+            for p in self.procs.iter_mut() {
+                if p.pid() == pid {
+                    return p.state_name();
+                }
+            }
+            @@:("None".to_string())
+        }
+
+    domain:
+        procs: Vec<Process> = Vec::new()
+        next_pid: u32 = 1
+        capacity: u32 = capacity
+}

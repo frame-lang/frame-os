@@ -152,3 +152,7 @@ include!(concat!(env!("OUT_DIR"), "/task.rs"));
 include!(concat!(env!("OUT_DIR"), "/scheduler.rs"));
 include!(concat!(env!("OUT_DIR"), "/page_fault_handler.rs"));
 include!(concat!(env!("OUT_DIR"), "/syscall_dispatcher.rs"));
+// Process before ProcessTable: ProcessTable's domain holds Vec<Process> and
+// instantiates @@Process, so the Process type must be in scope first.
+include!(concat!(env!("OUT_DIR"), "/process.rs"));
+include!(concat!(env!("OUT_DIR"), "/process_table.rs"));

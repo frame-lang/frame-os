@@ -158,6 +158,8 @@ const DIAGRAMS: &[(&str, &str)] = &[
     ("scheduler.frs", "scheduler.svg"),
     ("page_fault_handler.frs", "page_fault_handler.svg"),
     ("syscall_dispatcher.frs", "syscall_dispatcher.svg"),
+    ("process.frs", "process.svg"),
+    ("process_table.frs", "process_table.svg"),
 ];
 
 fn diagrams(mode: DiagramMode) -> Result<()> {
@@ -577,17 +579,26 @@ const SMOKE_TESTS: &[SmokeTest] = &[
         timeout_secs: 20,
     },
     SmokeTest {
-        // B3 Step 1b: the user/kernel boundary. A hand-crafted ring-3
-        // program writes 'A'/'B' via write_char syscalls and exits(42); the
-        // exit syscall longjmps back to the kernel. "AB" proves syscalls
-        // from ring 3 reach the kernel; the exit + back-in-kernel lines
-        // prove sysret-less exit + the longjmp work. No exception/fault.
+        // B3 Step 1b + Step 3: the user/kernel boundary, with the ring-3
+        // program tracked as a Process. A hand-crafted ring-3 program writes
+        // 'A'/'B' via write_char syscalls and exits(42); the exit syscall
+        // longjmps back to the kernel. "AB" proves syscalls from ring 3 reach
+        // the kernel; the exit + back-in-kernel lines prove sysret-less exit +
+        // the longjmp work.
+        //
+        // Step 3 adds the Process/ProcessTable lifecycle markers: the program
+        // is spawned ($Ready), runs, the exit syscall moves it to $Zombie, and
+        // the kernel reaps it ($Reaped) — freeing the slot (table count → 0).
+        // No exception/fault.
         name: "ring3_syscall_b3",
         expect_contains: &[
+            "[proc] spawned pid 1 (Ready)",
             "[user] entering ring 3",
             "AB",
             "[user] exited with code 42",
+            "[proc] pid 1 exited -> Zombie",
             "[user] back in kernel after user exit",
+            "[proc] reaped pid 1; exit 42; table count 0",
         ],
         expect_absent: &["KERNEL EXCEPTION", "KERNEL PANIC", "triple fault"],
         timeout_secs: 20,

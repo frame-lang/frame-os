@@ -16,12 +16,24 @@
 
 use core::arch::{asm, global_asm};
 
-use crate::frame_systems::SyscallDispatcher;
+use crate::frame_systems::{ProcessTable, SyscallDispatcher};
 use crate::{frames, paging, serial};
 
 // The syscall dispatcher HSM (B3 Step 2). Driven synchronously from the
 // syscall entry; single instance, single-core.
 static mut DISPATCHER: Option<SyscallDispatcher> = None;
+
+// The process table (B3 Step 3). One global instance. The single ring-3
+// program below gets a Process entry whose lifecycle the kernel drives:
+// spawn → $Ready, then it runs natively (no $Running state — "on the CPU" is
+// native scheduler state), then the exit syscall moves it → $Zombie, and the
+// kernel reaps it here → $Reaped (freeing the slot). Driving ProcessTable from
+// inside a SyscallDispatcher handler is safe: they are independent Frame
+// instances, so this is not a non-reentrant re-entry.
+static mut PROC_TABLE: Option<ProcessTable> = None;
+static mut USER_PROC_PID: u32 = 0;
+
+const MAX_PROCS: u32 = 64;
 
 // MSR numbers.
 const IA32_EFER: u32 = 0xC000_0080;
@@ -161,6 +173,14 @@ extern "C" fn syscall_dispatch(num: u64, a0: u64, a1: u64) -> u64 {
     d.result()
 }
 
+/// Borrow the global process table.
+fn proc_table() -> &'static mut ProcessTable {
+    unsafe {
+        let p = &raw mut PROC_TABLE;
+        (*p).as_mut().expect("process table initialized")
+    }
+}
+
 /// Validation predicate, called by the dispatcher's `$Validating` state.
 pub fn is_known_syscall(num: u64) -> bool {
     num == 0 || num == 1
@@ -179,6 +199,15 @@ pub fn perform_syscall(num: u64, a0: u64, _a1: u64) -> u64 {
             serial::write_str("\n[user] exited with code ");
             serial::write_u32_decimal(a0 as u32);
             serial::writeln("");
+            // Record the voluntary exit in the process table: $Ready → $Zombie.
+            // (This is a different Frame instance than the SyscallDispatcher we
+            // are currently dispatching inside — no reentrancy hazard.)
+            let pid = unsafe { (&raw const USER_PROC_PID).read() };
+            proc_table().exit_pid(pid, a0 as i32);
+            serial::write_str("[proc] pid ");
+            serial::write_u32_decimal(pid);
+            serial::write_str(" exited -> ");
+            serial::writeln(&proc_table().pid_state(pid));
             unsafe { resume_kernel_after_user() } // never returns
         }
         _ => u64::MAX, // unreachable: validated by is_known_syscall
@@ -189,6 +218,21 @@ pub fn perform_syscall(num: u64, a0: u64, _a1: u64) -> u64 {
 /// blob) + a user stack, enter ring 3, and return here when the user exits.
 pub fn run() {
     init();
+
+    // Stand up the process table and admit the user program as a Process.
+    unsafe {
+        let p = &raw mut PROC_TABLE;
+        *p = Some(ProcessTable::__create(MAX_PROCS));
+    }
+    let pid = proc_table().spawn(); // $Created → $Ready
+    unsafe {
+        (&raw mut USER_PROC_PID).write(pid);
+    }
+    serial::write_str("[proc] spawned pid ");
+    serial::write_u32_decimal(pid);
+    serial::write_str(" (");
+    serial::write_str(&proc_table().pid_state(pid));
+    serial::writeln(")");
 
     const CODE_VA: u64 = 0x0000_0000_1000_0000;
     const STACK_VA: u64 = 0x0000_0000_2000_0000;
@@ -210,6 +254,17 @@ pub fn run() {
     }
 
     serial::writeln("[user] back in kernel after user exit");
+
+    // Reap the exited process: $Zombie → $Reaped, freeing its table slot.
+    let code = proc_table().reap_pid(pid);
+    serial::write_str("[proc] reaped pid ");
+    serial::write_u32_decimal(pid);
+    serial::write_str("; exit ");
+    serial::write_u32_decimal(code as u32);
+    serial::write_str("; table count ");
+    serial::write_u32_decimal(proc_table().count());
+    serial::writeln("");
+
     frames::free_frame(code_frame);
     frames::free_frame(stack_frame);
 }

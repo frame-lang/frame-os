@@ -44,3 +44,10 @@ include!(concat!(env!("OUT_DIR"), "/page_fault_handler.rs"));
 // $Active parent via `=> $^`. Actions call crate::usermode::{is_known_syscall,
 // perform_syscall}.
 include!(concat!(env!("OUT_DIR"), "/syscall_dispatcher.rs"));
+// Process + ProcessTable (B3 Step 3): the per-process lifecycle HSM and the
+// manager that holds Vec<Process>. Process must be included before
+// ProcessTable (the latter's domain holds Vec<Process> and instantiates
+// @@Process). Both are pure (no native action deps); usermode.rs drives the
+// live ring-3 process through a global ProcessTable.
+include!(concat!(env!("OUT_DIR"), "/process.rs"));
+include!(concat!(env!("OUT_DIR"), "/process_table.rs"));

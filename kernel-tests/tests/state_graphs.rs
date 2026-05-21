@@ -98,3 +98,19 @@ fn syscall_dispatcher_state_graph_snapshot() {
     };
     insta::assert_snapshot!("syscall_dispatcher_state_graph", dot);
 }
+
+#[test]
+fn process_state_graph_snapshot() {
+    let Some(dot) = frame_to_dot("process.frs") else {
+        return; // framec unavailable; test skipped
+    };
+    insta::assert_snapshot!("process_state_graph", dot);
+}
+
+#[test]
+fn process_table_state_graph_snapshot() {
+    let Some(dot) = frame_to_dot("process_table.frs") else {
+        return; // framec unavailable; test skipped
+    };
+    insta::assert_snapshot!("process_table_state_graph", dot);
+}
