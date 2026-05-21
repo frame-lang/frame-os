@@ -61,3 +61,7 @@ include!(concat!(env!("OUT_DIR"), "/block_request.rs"));
 include!(concat!(env!("OUT_DIR"), "/mount.rs"));
 // OpenFile (B4 Step 3): per-fd lifecycle (access mode as state). Pure.
 include!(concat!(env!("OUT_DIR"), "/open_file.rs"));
+// ArpResolver (B5 Step 2a): one IPv4→MAC resolution's lifecycle. Its actions
+// call crate::net::{arp_send_request,arp_arm_timer,arp_on_failed}; the enter
+// handler arms the retransmit timer (the native timer-wheel pattern).
+include!(concat!(env!("OUT_DIR"), "/arp_resolver.rs"));

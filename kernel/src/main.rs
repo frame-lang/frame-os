@@ -36,6 +36,7 @@ mod fs;
 mod gdt;
 mod interrupts;
 mod io;
+mod net;
 mod paging;
 mod pci;
 mod pic;
@@ -262,10 +263,11 @@ unsafe extern "C" fn kmain() -> ! {
     // exit syscall longjmps back to the kernel.
     usermode::run();
 
-    // B5 Step 1: bring up virtio-net and ARP the slirp gateway — proving the
-    // NIC init + TX + RX + the post/drain path (the IRQ posts, the kernel
-    // drains the RX used ring) end to end.
-    virtio_net::run_demo();
+    // B5 Step 1/2a: bring up virtio-net (NIC init + TX + RX + post/drain), then
+    // resolve the slirp gateway's MAC through the `ArpResolver` Frame system —
+    // the first networking Frame system + the retransmit-timer-via-enter-handler
+    // pattern.
+    net::run_demo();
 
     // B2 Step 3 (fatal path): deliberately fault on an unmapped, non-lazy
     // address. The PageFaultHandler classifies it $Fatal, reports it, and

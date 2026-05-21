@@ -164,6 +164,7 @@ const DIAGRAMS: &[(&str, &str)] = &[
     ("block_request.frs", "block_request.svg"),
     ("mount.frs", "mount.svg"),
     ("open_file.frs", "open_file.svg"),
+    ("arp_resolver.frs", "arp_resolver.svg"),
 ];
 
 fn diagrams(mode: DiagramMode) -> Result<()> {
@@ -987,24 +988,28 @@ const SMOKE_TESTS: &[SmokeTest] = &[
         timeout_secs: 20,
     },
     SmokeTest {
-        // B5 Step 1: virtio-net bring-up. The kernel inits the NIC (reads its
-        // MAC), then ARPs the QEMU slirp gateway (10.0.2.2) and waits for the
-        // reply — proving NIC init + TX + RX + the post/drain path (RX IRQ
-        // posts, the kernel drains the used ring) end to end. slirp answers ARP
-        // for the gateway deterministically.
-        name: "net_link_up_b5",
+        // B5 Step 2a: ARP resolution through the `ArpResolver` Frame system. The
+        // kernel inits the NIC, then resolves the QEMU slirp gateway (10.0.2.2)
+        // via ArpResolver — the first networking Frame system: `$Incomplete`'s
+        // enter handler sends the request + arms a retransmit timer (the native
+        // timer pattern), the receive loop fires `reply()` on the matching ARP
+        // reply. Proves NIC TX/RX + post/drain + the Frame-driven resolution
+        // lifecycle. slirp answers ARP for the gateway deterministically.
+        name: "arp_resolves_gateway_b5",
         expect_contains: &[
             "[net] virtio-net ready",
-            "[net] ARP who-has 10.0.2.2",
-            "[net] ARP reply: gateway MAC ",
-            "[net] rx/tx round-trip: ok",
+            "[net] MAC ",
+            "[arp] who-has 10.0.2.2 (gateway)",
+            "[arp] resolved 10.0.2.2 -> ",
+            "[net] gateway resolved via ArpResolver: ok",
         ],
         expect_absent: &[
             "KERNEL EXCEPTION",
             "KERNEL PANIC",
             "triple fault",
             "[net] virtio-net NOT found",
-            "[net] no ARP reply (timeout)",
+            "[arp] resolution failed",
+            "[net] gateway resolution did not complete",
         ],
         timeout_secs: 20,
     },

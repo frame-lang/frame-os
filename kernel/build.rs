@@ -30,6 +30,7 @@ const FRAME_SYSTEMS: &[(&str, &str)] = &[
     ("block_request", "block_request.frs"),
     ("mount", "mount.frs"),
     ("open_file", "open_file.frs"),
+    ("arp_resolver", "arp_resolver.frs"),
     ("kernel", "kernel.frs"),
 ];
 

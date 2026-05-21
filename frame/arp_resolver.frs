@@ -1,0 +1,70 @@
+// frame/arp_resolver.frs
+//
+// ArpResolver — the lifecycle of resolving one IPv4 address to a MAC (B5 Step
+// 2a). The first networking Frame system, and the project's first use of the
+// "timer armed in the enter handler, fired by a native timer wheel through the
+// post/drain boundary" pattern (the B5 plan's answer to TCP's timers, rehearsed
+// here at small scale).
+//
+// State graph:
+//
+//   $Incomplete ── reply ──► $Resolved
+//      │  ▲
+//      │  └── timeout (attempts < max) ── re-enter: re-send + re-arm
+//      └───── timeout (attempts >= max) ──► $Failed
+//
+// Frame owns the lifecycle + retry policy (attempts/max in the domain); native
+// owns the mechanism: $Incomplete's enter handler sends the ARP request and
+// arms the retransmit timer (`crate::net`), the receive loop fires `reply()`
+// when the matching ARP reply arrives, and the native timer wheel fires
+// `timeout()` when the deadline passes. The resolved MAC bytes live natively
+// (Frame owns "are we resolved?", not the bytes).
+
+@@[target("rust")]
+
+@@system ArpResolver {
+    interface:
+        reply()
+        timeout()
+        is_resolved(): bool = false
+        is_failed(): bool = false
+
+    machine:
+        $Incomplete {
+            $>() {
+                // Each entry (initial or via a retransmit self-transition) is one
+                // attempt: count it, send the request, arm the timer.
+                self.attempts = self.attempts + 1;
+                crate::net::arp_send_request();
+                crate::net::arp_arm_timer();
+            }
+
+            reply() {
+                -> $Resolved
+            }
+
+            timeout() {
+                if self.attempts >= self.max_attempts {
+                    -> $Failed
+                } else {
+                    // Re-enter $Incomplete: the enter handler re-sends + re-arms.
+                    -> $Incomplete
+                }
+            }
+        }
+
+        $Resolved {
+            is_resolved(): bool { @@:(true) }
+        }
+
+        $Failed {
+            $>() {
+                crate::net::arp_on_failed();
+            }
+            is_failed(): bool { @@:(true) }
+        }
+
+    domain:
+        attempts: u32 = 0
+        max_attempts: u32 = 5
+}

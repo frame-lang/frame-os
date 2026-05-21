@@ -229,6 +229,48 @@ pub mod elf {
     pub fn cleanup() {}
 }
 
+/// Host test-double for the kernel's `net` module. The generated `ArpResolver`
+/// actions call `crate::net::{arp_send_request, arp_arm_timer, arp_on_failed}`;
+/// in the kernel those build/send Ethernet frames + arm the retransmit
+/// deadline, here they record call counts in thread-locals so behavioral tests
+/// can assert "one request + one timer armed per attempt" and "failed after the
+/// retry cap." Thread-local (libtest runs each test on its own thread).
+pub mod net {
+    use std::cell::Cell;
+
+    thread_local! {
+        static REQUESTS: Cell<u32> = const { Cell::new(0) };
+        static ARMS: Cell<u32> = const { Cell::new(0) };
+        static FAILED: Cell<bool> = const { Cell::new(false) };
+    }
+
+    pub fn arp_send_request() {
+        REQUESTS.with(|c| c.set(c.get() + 1));
+    }
+    pub fn arp_arm_timer() {
+        ARMS.with(|c| c.set(c.get() + 1));
+    }
+    pub fn arp_on_failed() {
+        FAILED.with(|c| c.set(true));
+    }
+
+    // Test inspectors.
+    pub fn requests_sent() -> u32 {
+        REQUESTS.with(|c| c.get())
+    }
+    pub fn timers_armed() -> u32 {
+        ARMS.with(|c| c.get())
+    }
+    pub fn failed() -> bool {
+        FAILED.with(|c| c.get())
+    }
+    pub fn reset() {
+        REQUESTS.with(|c| c.set(0));
+        ARMS.with(|c| c.set(0));
+        FAILED.with(|c| c.set(false));
+    }
+}
+
 // Pull in the framec-generated systems. Each generated file ends with
 // `pub use _<name>_framec::*;`, re-exporting the system type at this crate's
 // root. SerialDriver first (Kernel holds one in its domain). Task and
@@ -253,3 +295,6 @@ include!(concat!(env!("OUT_DIR"), "/block_request.rs"));
 include!(concat!(env!("OUT_DIR"), "/mount.rs"));
 // OpenFile (B4 Step 3): per-fd access-mode lifecycle. Pure (no native deps).
 include!(concat!(env!("OUT_DIR"), "/open_file.rs"));
+// ArpResolver (B5 Step 2a): one IPv4→MAC resolution's lifecycle. Actions call
+// crate::net::* (the host double above counts requests/arms/failure).
+include!(concat!(env!("OUT_DIR"), "/arp_resolver.rs"));
