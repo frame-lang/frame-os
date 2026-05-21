@@ -33,6 +33,7 @@ mod frame_systems;
 mod frames;
 mod interrupts;
 mod io;
+mod paging;
 mod pic;
 mod pit;
 mod sched;
@@ -119,6 +120,35 @@ unsafe extern "C" fn kmain() -> ! {
         let f3 = frames::alloc_frame().expect("frame alloc");
         frames::free_frame(f3);
         serial::writeln("[frames] realloc after free: ok");
+    }
+
+    // B2 Step 2: paging. Map a fresh frame at an unmapped test VA, write a
+    // pattern through the mapping, confirm it lands in the right physical
+    // frame (cross-checked via the HHDM), then translate and unmap.
+    {
+        const TEST_VA: u64 = 0x0000_4000_0000_0000; // 64 TiB, unmapped lower-half
+        const PATTERN: u64 = 0xDEAD_BEEF_CAFE_F00D;
+        let frame = frames::alloc_frame().expect("frame alloc");
+        unsafe {
+            paging::map(TEST_VA, frame, paging::WRITABLE);
+            let p = TEST_VA as *mut u64;
+            p.write_volatile(PATTERN);
+            let via_va = p.read_volatile();
+            let via_hhdm = (frames::phys_to_virt(frame) as *const u64).read_volatile();
+            if via_va == PATTERN && via_hhdm == PATTERN {
+                serial::writeln("[paging] map + write + read-back: ok");
+            }
+        }
+        if paging::translate(TEST_VA) == Some(frame) {
+            serial::writeln("[paging] translate matches frame: ok");
+        }
+        unsafe {
+            paging::unmap(TEST_VA);
+        }
+        if paging::translate(TEST_VA).is_none() {
+            serial::writeln("[paging] unmap clears mapping: ok");
+        }
+        frames::free_frame(frame);
     }
 
     // B1 Step 3a: install the IDT and prove the interrupt path works by

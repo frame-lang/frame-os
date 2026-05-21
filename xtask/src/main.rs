@@ -482,6 +482,19 @@ const SMOKE_TESTS: &[SmokeTest] = &[
         expect_absent: &["KERNEL EXCEPTION", "KERNEL PANIC", "triple fault"],
         timeout_secs: 20,
     },
+    SmokeTest {
+        // B2 Step 2: 4-level paging. Map a fresh frame at an unmapped VA,
+        // write through the mapping and confirm it lands in the right
+        // physical frame (cross-checked via the HHDM), translate, unmap.
+        name: "paging_b2",
+        expect_contains: &[
+            "[paging] map + write + read-back: ok",
+            "[paging] translate matches frame: ok",
+            "[paging] unmap clears mapping: ok",
+        ],
+        expect_absent: &["KERNEL EXCEPTION", "KERNEL PANIC", "triple fault"],
+        timeout_secs: 20,
+    },
 ];
 
 fn run_qemu_test() -> Result<()> {
