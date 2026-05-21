@@ -534,6 +534,15 @@ fn qemu_base_command(artifacts: &QemuArtifacts, ovmf_vars: &Path, blk_disk: &Pat
             "-device",
             "virtio-blk-pci,drive=blk0,disable-modern=on,disable-legacy=off",
         ])
+        // virtio-net on QEMU user-mode networking (slirp): no host privilege,
+        // CI-friendly. `disable-modern=on` forces the legacy I/O-BAR interface
+        // our driver speaks. slirp answers ARP for the gateway (10.0.2.2), which
+        // the B5 Step 1 demo relies on. TAP is the deferred production path.
+        .args(["-netdev", "user,id=net0"])
+        .args([
+            "-device",
+            "virtio-net-pci,netdev=net0,disable-modern=on,disable-legacy=off",
+        ])
         .args(["-display", "none"])
         // isa-debug-exit: the kernel's halt path writes port 0xf4, which
         // makes QEMU exit cleanly (code (val<<1)|1) once the boot/demos are
@@ -974,6 +983,28 @@ const SMOKE_TESTS: &[SmokeTest] = &[
             "triple fault",
             "[frameshell] open failed",
             "[frameshell] exec failed",
+        ],
+        timeout_secs: 20,
+    },
+    SmokeTest {
+        // B5 Step 1: virtio-net bring-up. The kernel inits the NIC (reads its
+        // MAC), then ARPs the QEMU slirp gateway (10.0.2.2) and waits for the
+        // reply — proving NIC init + TX + RX + the post/drain path (RX IRQ
+        // posts, the kernel drains the used ring) end to end. slirp answers ARP
+        // for the gateway deterministically.
+        name: "net_link_up_b5",
+        expect_contains: &[
+            "[net] virtio-net ready",
+            "[net] ARP who-has 10.0.2.2",
+            "[net] ARP reply: gateway MAC ",
+            "[net] rx/tx round-trip: ok",
+        ],
+        expect_absent: &[
+            "KERNEL EXCEPTION",
+            "KERNEL PANIC",
+            "triple fault",
+            "[net] virtio-net NOT found",
+            "[net] no ARP reply (timeout)",
         ],
         timeout_secs: 20,
     },

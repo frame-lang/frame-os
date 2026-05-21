@@ -147,6 +147,31 @@ global_asm!(
     "  pop rcx",
     "  pop rax",
     "  iretq",
+    // virtio-net IRQ (B5). Same shape as virtio-blk: save caller-saved GPRs,
+    // call the Rust post handler (read the device ISR, flag a pending event,
+    // EOI the PIC), restore + iretq. No Frame dispatch here — only `post`.
+    ".global isr_virtio_net",
+    "isr_virtio_net:",
+    "  push rax",
+    "  push rcx",
+    "  push rdx",
+    "  push rsi",
+    "  push rdi",
+    "  push r8",
+    "  push r9",
+    "  push r10",
+    "  push r11",
+    "  call virtio_net_irq",
+    "  pop r11",
+    "  pop r10",
+    "  pop r9",
+    "  pop r8",
+    "  pop rdi",
+    "  pop rsi",
+    "  pop rdx",
+    "  pop rcx",
+    "  pop rax",
+    "  iretq",
     // Page fault (#PF, vector 14). Unlike most exceptions, #PF pushes an
     // error code (below the iretq frame), and the faulting address is in
     // CR2. Pass both to the Rust handler; it returns (recovered → retry) or
@@ -237,6 +262,7 @@ extern "C" {
     fn isr_timer();
     fn isr_page_fault();
     fn isr_virtio_blk();
+    fn isr_virtio_net();
 }
 
 /// Rust half of the virtio-blk IRQ stub (B4). Posts the completion (native,
@@ -245,6 +271,28 @@ extern "C" {
 extern "C" fn virtio_blk_irq() {
     crate::virtio_blk::on_irq();
     crate::pic::eoi_slave();
+}
+
+/// Rust half of the virtio-net IRQ stub (B5). Posts a pending network event
+/// (native, interrupt-safe — no Frame dispatch) and EOIs the PIC on whichever
+/// line the device landed (read from PCI config; master or slave).
+#[no_mangle]
+extern "C" fn virtio_net_irq() {
+    crate::virtio_net::on_irq();
+    crate::pic::eoi_for(crate::virtio_net::irq_line());
+}
+
+/// Wire the virtio-net ISR at runtime, once its IRQ line is known (read from
+/// PCI config at net init). The IDT is live (already `lidt`'d), so updating a
+/// gate takes effect immediately. virtio-net's line isn't fixed like the
+/// timer's or virtio-blk's, so it can't be set in `init()`.
+pub fn wire_virtio_net(irq: u8) {
+    let cs = read_cs();
+    unsafe {
+        let idt = &raw mut IDT;
+        (*idt)[crate::pic::PIC1_OFFSET as usize + irq as usize]
+            .set(isr_virtio_net as *const () as usize as u64, cs);
+    }
 }
 
 #[no_mangle]

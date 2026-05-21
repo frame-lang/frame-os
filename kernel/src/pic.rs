@@ -63,3 +63,23 @@ pub fn eoi_slave() {
     outb(PIC2_CMD, PIC_EOI);
     outb(PIC1_CMD, PIC_EOI);
 }
+
+/// Unmask an arbitrary IRQ line, master (0..7) or slave (8..15). Used by
+/// virtio-net (B5), whose IRQ line isn't fixed — it's read from PCI config.
+pub fn unmask_irq(irq: u8) {
+    if irq < 8 {
+        let m = inb(PIC1_DATA) & !(1 << irq);
+        outb(PIC1_DATA, m);
+    } else {
+        unmask_slave_irq(irq);
+    }
+}
+
+/// Send end-of-interrupt for an arbitrary IRQ line (master or slave).
+pub fn eoi_for(irq: u8) {
+    if irq < 8 {
+        eoi_master();
+    } else {
+        eoi_slave();
+    }
+}

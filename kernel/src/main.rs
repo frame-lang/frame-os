@@ -46,6 +46,7 @@ mod serial;
 mod usermode;
 mod vfs;
 mod virtio_blk;
+mod virtio_net;
 mod vm;
 
 use frame_systems::Kernel;
@@ -260,6 +261,11 @@ unsafe extern "C" fn kmain() -> ! {
     // hand-crafted program that writes "AB" via syscalls and exits(42); the
     // exit syscall longjmps back to the kernel.
     usermode::run();
+
+    // B5 Step 1: bring up virtio-net and ARP the slirp gateway — proving the
+    // NIC init + TX + RX + the post/drain path (the IRQ posts, the kernel
+    // drains the RX used ring) end to end.
+    virtio_net::run_demo();
 
     // B2 Step 3 (fatal path): deliberately fault on an unmapped, non-lazy
     // address. The PageFaultHandler classifies it $Fatal, reports it, and

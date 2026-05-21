@@ -428,6 +428,9 @@ H3 is the H-track's final committed milestone. Further H-track work (a configura
 
 **Estimated effort:** Very large. This is the milestone the "stress-test Frame" thesis is pointed at — if Frame expresses a correct TCP FSM cleanly, that is the headline result.
 
+**Status:** In progress. See [`plans/b5.md`](plans/b5.md).
+- **Step 1 (virtio-net + RX/TX + post/drain for frames):** Done. A legacy virtio-net driver (`virtio_net.rs`): PCI discovery (reuses `pci.rs`), feature negotiation (MAC only), two virtqueues (RX = queue 0, TX = queue 1) in contiguous DMA frames, a pre-posted RX buffer pool, and the device IRQ wired at runtime from its PCI `interrupt_line` (it shares IRQ 11 with virtio-blk, which is idle by the time networking runs; `pic::eoi_for`/`unmask_irq` handle either PIC line). **The post/drain pattern is reused verbatim from B4:** the RX IRQ `on_irq` only *posts* (acks the device ISR + flags), the kernel *drains* the RX used ring (`poll_rx`) from normal context — no Frame dispatch in the ISR. Demo: read the MAC, then a deterministic ARP round-trip against QEMU's slirp gateway (TX an ARP request for 10.0.2.2, RX the reply), proving init + TX + RX + post/drain end to end. Transport is QEMU user-net (slirp); TAP is the deferred production path. Validated by `net_link_up_b5` (**23/23** QEMU smoke). ARP/IP/ICMP as Frame systems land at Step 2.
+
 ### B6 — USB
 
 **Scope:** B5 plus a USB stack: an xHCI host-controller driver and device enumeration, demonstrating Frame on a deep hardware protocol.
