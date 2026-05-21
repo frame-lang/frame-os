@@ -11,28 +11,38 @@
 // non-reentrancy hazard that needs a queue for *async* interrupts does not
 // apply to a synchronous exception.
 //
-// State graph:
+// State graph ($Fatal is a PEER, drawn outside the parent box — see below):
 //
-//   ┌──────────────────────────── $FaultActive (parent) ───────────────────┐
-//   │                                                                       │
-//   │   ┌──────────────┐  fault, addr in lazy region    ┌──────────────┐    │
-//   │   │ $Classifying │ ──────────────────────────────►│  $LazyFault  │    │
-//   │   │  (initial)   │                                 │  $>: map it  │    │
-//   │   └──────┬───────┘ ◄──── map ok (recovered) ───────└──────┬───────┘    │
-//   │          │  fault, not a lazy region                      │ map OOM    │
-//   │          └───────────────────────┐          ┌─────────────┘            │
-//   │                                   ▼          ▼                         │
-//   │                              ┌──────────────────┐                      │
-//   │                              │     $Fatal       │                      │
-//   │                              └──────────────────┘                      │
-//   └───────────────────────────────────────────────────────────────────────┘
+//   ┌──────────────────── $FaultActive (parent) ─────────────────────┐
+//   │                                                                 │
+//   │   ┌──────────────┐  fault, addr in lazy region  ┌────────────┐ │
+//   │   │ $Classifying │ ────────────────────────────►│ $LazyFault │ │
+//   │   │  (initial)   │ ◄──── map ok (recovered) ─────│ $>: map it │ │
+//   │   └──────┬───────┘                               └─────┬──────┘ │
+//   │          │ fault, not a lazy region                    │ OOM    │
+//   └──────────┼──────────────────────────────────────────── ┼───────┘
+//              │                                              │
+//              └─────────────────────┐         ┌──────────────┘
+//                                     ▼         ▼
+//                                ┌──────────────────┐
+//                                │      $Fatal      │  (peer sink)
+//                                └──────────────────┘
+//
+// Why `$Fatal` is a PEER, not a child of `$FaultActive`: the parent is a
+// superstate, and the condition it expresses is "still *attempting* to handle
+// this fault, sharing the forward-to-failure protocol" — true of $Classifying,
+// $LazyFault, and (at B4) $StackGrow / $CopyOnWrite. That condition is *false*
+// in $Fatal: recovery has been abandoned. So $Fatal sits outside the superstate
+// as the post-failure sink. (The committed .md and the generated graph both
+// reflect this — $Fatal carries no `=> $FaultActive`.)
 //
 // The HSM parent `$FaultActive` exists for B4: there it hosts the shared
-// "unrecoverable → kill the process" handler that the deep children
-// ($StackGrow / $CopyOnWrite / $LazyFault) forward to via `=> $^`. At B2
-// the two children fully handle their cases, so the forwarding edge is
-// declared (matching the committed design) but not yet traversed — the same
-// "declared now, load-bearing later" pattern as `Task.$Blocked` at B1.
+// "unrecoverable → kill the process" handler that the recovery children
+// ($StackGrow / $CopyOnWrite / $LazyFault) forward to via `=> $^`; that handler
+// reaches the sink with a normal `-> $Fatal`. At B2 the two children fully
+// handle their cases, so the forwarding edge is declared (matching the
+// committed design) but not yet traversed — the same "declared now,
+// load-bearing later" pattern as `Task.$Blocked` at B1.
 
 @@[target("rust")]
 
