@@ -23,6 +23,9 @@ use crate::frames;
 pub const PRESENT: u64 = 1 << 0;
 /// PTE flag: writable.
 pub const WRITABLE: u64 = 1 << 1;
+/// PTE flag: user-accessible (ring 3). Required on the leaf *and* every
+/// intermediate table on the walk for a ring-3 access to succeed.
+pub const USER: u64 = 1 << 2;
 
 /// Mask selecting the physical frame address out of a page-table entry or
 /// CR3 (bits 12..52).
@@ -66,7 +69,11 @@ unsafe fn next_table(table_phys: u64, index: u64) -> u64 {
             t.add(k).write(0);
             k += 1;
         }
-        *e = (frame & ADDR_MASK) | PRESENT | WRITABLE;
+        // Intermediate tables are present + writable + user. The leaf PTE's
+        // USER bit is what actually gates ring-3 access (a kernel leaf with
+        // USER clear is still protected); permissive intermediates just let
+        // user *leaves* underneath them be reachable.
+        *e = (frame & ADDR_MASK) | PRESENT | WRITABLE | USER;
         frame
     } else {
         *e & ADDR_MASK

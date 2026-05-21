@@ -543,6 +543,22 @@ const SMOKE_TESTS: &[SmokeTest] = &[
         expect_absent: &["KERNEL EXCEPTION", "KERNEL PANIC", "triple fault"],
         timeout_secs: 20,
     },
+    SmokeTest {
+        // B3 Step 1b: the user/kernel boundary. A hand-crafted ring-3
+        // program writes 'A'/'B' via write_char syscalls and exits(42); the
+        // exit syscall longjmps back to the kernel. "AB" proves syscalls
+        // from ring 3 reach the kernel; the exit + back-in-kernel lines
+        // prove sysret-less exit + the longjmp work. No exception/fault.
+        name: "ring3_syscall_b3",
+        expect_contains: &[
+            "[user] entering ring 3",
+            "AB",
+            "[user] exited with code 42",
+            "[user] back in kernel after user exit",
+        ],
+        expect_absent: &["KERNEL EXCEPTION", "KERNEL PANIC", "triple fault"],
+        timeout_secs: 20,
+    },
 ];
 
 fn run_qemu_test() -> Result<()> {
