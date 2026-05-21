@@ -469,6 +469,19 @@ const SMOKE_TESTS: &[SmokeTest] = &[
         expect_absent: &["KERNEL EXCEPTION", "KERNEL PANIC", "triple fault"],
         timeout_secs: 20,
     },
+    SmokeTest {
+        // B2 Step 1: the physical frame allocator over Limine's memory map.
+        // Two distinct page-aligned frames, free restoring the count, and a
+        // successful realloc-after-free exercise alloc/free/bitmap.
+        name: "frame_allocator_b2",
+        expect_contains: &[
+            "[frames] alloc two distinct frames: ok",
+            "[frames] free restores count: ok",
+            "[frames] realloc after free: ok",
+        ],
+        expect_absent: &["KERNEL EXCEPTION", "KERNEL PANIC", "triple fault"],
+        timeout_secs: 20,
+    },
 ];
 
 fn run_qemu_test() -> Result<()> {

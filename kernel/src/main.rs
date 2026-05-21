@@ -30,6 +30,7 @@ use core::panic::PanicInfo;
 mod allocator;
 mod context;
 mod frame_systems;
+mod frames;
 mod interrupts;
 mod io;
 mod pic;
@@ -95,6 +96,30 @@ unsafe extern "C" fn kmain() -> ! {
     // (When B1 adds a scheduler, kmain will hold the Kernel and pump
     // tick() events into it instead of halting here.)
     let _kernel = Kernel::__create();
+
+    // B2 Step 1: physical frame allocator. Init from Limine's memory map,
+    // then a self-test: two distinct page-aligned frames, free restores the
+    // count, realloc after free works. (Moves into $InitMemory at Step 5.)
+    frames::init();
+    serial::write_str("[frames] usable frames: ");
+    serial::write_u32_decimal(frames::free_count() as u32);
+    serial::writeln("");
+    {
+        let before = frames::free_count();
+        let f1 = frames::alloc_frame().expect("frame alloc");
+        let f2 = frames::alloc_frame().expect("frame alloc");
+        if f1 != f2 && f1 % 4096 == 0 && f2 % 4096 == 0 && frames::free_count() == before - 2 {
+            serial::writeln("[frames] alloc two distinct frames: ok");
+        }
+        frames::free_frame(f1);
+        frames::free_frame(f2);
+        if frames::free_count() == before {
+            serial::writeln("[frames] free restores count: ok");
+        }
+        let f3 = frames::alloc_frame().expect("frame alloc");
+        frames::free_frame(f3);
+        serial::writeln("[frames] realloc after free: ok");
+    }
 
     // B1 Step 3a: install the IDT and prove the interrupt path works by
     // firing a software breakpoint. The handler prints "[int3 ok]" and
