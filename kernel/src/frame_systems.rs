@@ -54,3 +54,6 @@ include!(concat!(env!("OUT_DIR"), "/process_table.rs"));
 // ElfLoader (B3 Step 4): the load-phase FSM. Actions call crate::elf::* (the
 // native byte parser + segment mapper); $Failed funnels cleanup.
 include!(concat!(env!("OUT_DIR"), "/elf_loader.rs"));
+// BlockRequest (B4 Step 1): the block-I/O request lifecycle, driven by the
+// drained virtio-blk completion. Pure (no native action deps).
+include!(concat!(env!("OUT_DIR"), "/block_request.rs"));

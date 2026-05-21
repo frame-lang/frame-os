@@ -161,6 +161,7 @@ const DIAGRAMS: &[(&str, &str)] = &[
     ("process.frs", "process.svg"),
     ("process_table.frs", "process_table.svg"),
     ("elf_loader.frs", "elf_loader.svg"),
+    ("block_request.frs", "block_request.svg"),
 ];
 
 fn diagrams(mode: DiagramMode) -> Result<()> {
@@ -292,9 +293,15 @@ struct QemuArtifacts {
     /// (serial capture shows only the OVMF screen-clear escapes, no kernel
     /// output). Per-invocation copies make that impossible to cascade.
     ovmf_vars_template: PathBuf,
+    /// A blank raw disk template attached as a virtio-blk device (B4). Each
+    /// invocation gets a fresh copy (see `fresh_blk_disk`) so a write test
+    /// can't corrupt another's disk.
+    blk_template: PathBuf,
     /// Directory under `target/` where per-invocation vars copies live.
     qemu_dir: PathBuf,
 }
+
+const BLK_DISK_BYTES: u64 = 1024 * 1024; // 1 MiB virtio-blk disk
 
 fn prepare_qemu_artifacts(workspace: &Path) -> Result<QemuArtifacts> {
     let kernel_elf = build_kernel(workspace)?;
@@ -305,12 +312,33 @@ fn prepare_qemu_artifacts(workspace: &Path) -> Result<QemuArtifacts> {
     let qemu_dir = workspace.join("target").join("qemu");
     std::fs::create_dir_all(&qemu_dir)?;
 
+    // A blank 1 MiB raw disk template for the virtio-blk device.
+    let blk_template = qemu_dir.join("blk-template.img");
+    let f = std::fs::File::create(&blk_template)
+        .with_context(|| format!("failed to create {}", blk_template.display()))?;
+    f.set_len(BLK_DISK_BYTES)
+        .with_context(|| format!("failed to size {}", blk_template.display()))?;
+
     Ok(QemuArtifacts {
         esp_img,
         ovmf_code,
         ovmf_vars_template,
+        blk_template,
         qemu_dir,
     })
+}
+
+/// Produce a fresh copy of the virtio-blk disk for one QEMU invocation.
+fn fresh_blk_disk(artifacts: &QemuArtifacts, tag: &str) -> Result<PathBuf> {
+    let disk = artifacts.qemu_dir.join(format!("blk-{tag}.img"));
+    std::fs::copy(&artifacts.blk_template, &disk).with_context(|| {
+        format!(
+            "failed to copy blk template {} -> {}",
+            artifacts.blk_template.display(),
+            disk.display()
+        )
+    })?;
+    Ok(disk)
 }
 
 /// Produce a fresh, writable copy of the OVMF NVRAM vars for a single QEMU
@@ -333,7 +361,7 @@ fn fresh_ovmf_vars(artifacts: &QemuArtifacts, tag: &str) -> Result<PathBuf> {
 /// arguments. Callers add the serial routing they want
 /// (`-serial stdio` for interactive, `-serial file:<path>` for smoke
 /// tests) and then either spawn or run.
-fn qemu_base_command(artifacts: &QemuArtifacts, ovmf_vars: &Path) -> Command {
+fn qemu_base_command(artifacts: &QemuArtifacts, ovmf_vars: &Path, blk_disk: &Path) -> Command {
     let mut cmd = Command::new("qemu-system-x86_64");
     cmd.args(["-machine", "q35", "-cpu", "qemu64", "-m", "256M"])
         // UEFI firmware (split into read-only code + writable NVRAM).
@@ -347,6 +375,17 @@ fn qemu_base_command(artifacts: &QemuArtifacts, ovmf_vars: &Path) -> Command {
         // Boot drive — real FAT image with our ESP layout.
         .args(["-drive"])
         .arg(format!("format=raw,file={}", artifacts.esp_img.display()))
+        // virtio-blk data disk (B4). `disable-modern=on` forces the legacy
+        // (I/O BAR) virtio interface our driver speaks.
+        .args(["-drive"])
+        .arg(format!(
+            "file={},if=none,id=blk0,format=raw",
+            blk_disk.display()
+        ))
+        .args([
+            "-device",
+            "virtio-blk-pci,drive=blk0,disable-modern=on,disable-legacy=off",
+        ])
         .args(["-display", "none"])
         // isa-debug-exit: the kernel's halt path writes port 0xf4, which
         // makes QEMU exit cleanly (code (val<<1)|1) once the boot/demos are
@@ -371,7 +410,8 @@ fn run_qemu() -> Result<()> {
 
     eprintln!("booting kernel in QEMU (Ctrl-C or Ctrl-A x to quit)...");
     let ovmf_vars = fresh_ovmf_vars(&artifacts, "run")?;
-    let mut cmd = qemu_base_command(&artifacts, &ovmf_vars);
+    let blk_disk = fresh_blk_disk(&artifacts, "run")?;
+    let mut cmd = qemu_base_command(&artifacts, &ovmf_vars, &blk_disk);
     cmd.args(["-serial", "stdio"]);
     let status = cmd
         .status()
@@ -675,6 +715,20 @@ const SMOKE_TESTS: &[SmokeTest] = &[
         expect_absent: &["KERNEL EXCEPTION", "KERNEL PANIC", "triple fault"],
         timeout_secs: 20,
     },
+    SmokeTest {
+        // B4 Step 1: the virtio-blk driver + the post/drain deferred-event
+        // pattern. The kernel inits the device, writes a known pattern to a
+        // sector and reads it back — the completion IRQ `post`s, the kernel
+        // `drain`s it and drives a `BlockRequest` to $Complete, and the data
+        // verifies. The first async-interrupt → Frame boundary.
+        name: "blk_roundtrip_b4",
+        expect_contains: &[
+            "[blk] virtio-blk ready",
+            "[blk] sector write/read round-trip: ok",
+        ],
+        expect_absent: &["KERNEL EXCEPTION", "KERNEL PANIC", "triple fault"],
+        timeout_secs: 20,
+    },
 ];
 
 fn run_qemu_test() -> Result<()> {
@@ -727,7 +781,8 @@ fn run_smoke_test(test: &SmokeTest, artifacts: &QemuArtifacts, serial_path: &Pat
     // headless. We discard QEMU's own stdout/stderr — the interesting
     // stream is the captured serial output.
     let ovmf_vars = fresh_ovmf_vars(artifacts, test.name)?;
-    let mut cmd = qemu_base_command(artifacts, &ovmf_vars);
+    let blk_disk = fresh_blk_disk(artifacts, test.name)?;
+    let mut cmd = qemu_base_command(artifacts, &ovmf_vars, &blk_disk);
     cmd.args(["-serial"])
         .arg(format!("file:{}", serial_path.display()))
         .stdout(Stdio::null())

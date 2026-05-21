@@ -247,3 +247,5 @@ include!(concat!(env!("OUT_DIR"), "/process_table.rs"));
 // ElfLoader (B3 Step 4): the load-phase FSM. Actions call crate::elf::* (the
 // host double above does real header parsing, stubs the mapping).
 include!(concat!(env!("OUT_DIR"), "/elf_loader.rs"));
+// BlockRequest (B4 Step 1): I/O request lifecycle. Pure (no native deps).
+include!(concat!(env!("OUT_DIR"), "/block_request.rs"));

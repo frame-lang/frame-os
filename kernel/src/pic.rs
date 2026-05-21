@@ -10,7 +10,7 @@
 // We use the legacy 8259 + PIT path (not the APIC) deliberately — it's the
 // classic minimal route to "a periodic interrupt fires," per the B1 plan.
 
-use crate::io::outb;
+use crate::io::{inb, outb};
 
 const PIC1_CMD: u16 = 0x20;
 const PIC1_DATA: u16 = 0x21;
@@ -43,5 +43,23 @@ pub fn remap() {
 
 /// Send end-of-interrupt for a master-PIC IRQ (IRQ0..7), e.g. the timer.
 pub fn eoi_master() {
+    outb(PIC1_CMD, PIC_EOI);
+}
+
+/// Unmask a slave-PIC IRQ (IRQ8..15), e.g. virtio-blk on IRQ11 (B4). Clears
+/// the IRQ's mask bit on the slave and also unmasks the master's cascade line
+/// (IRQ2), through which the slave is wired.
+pub fn unmask_slave_irq(irq: u8) {
+    let bit = irq - 8;
+    let slave = inb(PIC2_DATA) & !(1 << bit);
+    outb(PIC2_DATA, slave);
+    let master = inb(PIC1_DATA) & !(1 << 2); // cascade
+    outb(PIC1_DATA, master);
+}
+
+/// Send end-of-interrupt for a slave-PIC IRQ (IRQ8..15): the slave first, then
+/// the master (the cascade line must also be acknowledged).
+pub fn eoi_slave() {
+    outb(PIC2_CMD, PIC_EOI);
     outb(PIC1_CMD, PIC_EOI);
 }

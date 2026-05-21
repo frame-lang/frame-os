@@ -22,6 +22,8 @@ use crate::serial;
 
 /// Master-PIC vector offset; IRQ0 (PIT timer) lands here.
 const TIMER_VECTOR: usize = crate::pic::PIC1_OFFSET as usize;
+/// virtio-blk is on IRQ11 (slave PIC) → vector 0x20 + 11 (B4).
+const VIRTIO_BLK_VECTOR: usize = crate::pic::PIC1_OFFSET as usize + 11;
 
 /// Monotonic timer tick count, incremented by the timer ISR.
 static TICKS: AtomicU64 = AtomicU64::new(0);
@@ -109,6 +111,32 @@ global_asm!(
     "  push r10",
     "  push r11",
     "  call breakpoint_handler",
+    "  pop r11",
+    "  pop r10",
+    "  pop r9",
+    "  pop r8",
+    "  pop rdi",
+    "  pop rsi",
+    "  pop rdx",
+    "  pop rcx",
+    "  pop rax",
+    "  iretq",
+    // virtio-blk IRQ (vector 43). Save caller-saved GPRs, call the Rust post
+    // handler (read the device ISR, record the completion, EOI the PIC), then
+    // restore + iretq. The handler does NOT dispatch any Frame system — it
+    // only `post`s; the kernel `drain`s from normal context (B4 post/drain).
+    ".global isr_virtio_blk",
+    "isr_virtio_blk:",
+    "  push rax",
+    "  push rcx",
+    "  push rdx",
+    "  push rsi",
+    "  push rdi",
+    "  push r8",
+    "  push r9",
+    "  push r10",
+    "  push r11",
+    "  call virtio_blk_irq",
     "  pop r11",
     "  pop r10",
     "  pop r9",
@@ -208,6 +236,15 @@ extern "C" {
     fn isr_breakpoint();
     fn isr_timer();
     fn isr_page_fault();
+    fn isr_virtio_blk();
+}
+
+/// Rust half of the virtio-blk IRQ stub (B4). Posts the completion (native,
+/// interrupt-safe) and EOIs the slave PIC. Never touches a Frame system.
+#[no_mangle]
+extern "C" fn virtio_blk_irq() {
+    crate::virtio_blk::on_irq();
+    crate::pic::eoi_slave();
 }
 
 #[no_mangle]
@@ -260,6 +297,8 @@ pub fn init() {
         (*idt)[14].set(pf, cs);
         // IRQ0 timer.
         (*idt)[TIMER_VECTOR].set(timer, cs);
+        // virtio-blk IRQ (B4).
+        (*idt)[VIRTIO_BLK_VECTOR].set(isr_virtio_blk as *const () as usize as u64, cs);
 
         let idtr = Idtr {
             limit: (core::mem::size_of::<[IdtEntry; 256]>() - 1) as u16,

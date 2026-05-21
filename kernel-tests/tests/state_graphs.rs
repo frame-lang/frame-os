@@ -122,3 +122,11 @@ fn elf_loader_state_graph_snapshot() {
     };
     insta::assert_snapshot!("elf_loader_state_graph", dot);
 }
+
+#[test]
+fn block_request_state_graph_snapshot() {
+    let Some(dot) = frame_to_dot("block_request.frs") else {
+        return; // framec unavailable; test skipped
+    };
+    insta::assert_snapshot!("block_request_state_graph", dot);
+}

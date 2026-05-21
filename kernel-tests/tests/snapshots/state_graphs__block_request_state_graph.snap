@@ -1,0 +1,54 @@
+---
+source: kernel-tests/tests/state_graphs.rs
+assertion_line: 131
+expression: dot
+---
+digraph BlockRequest {
+    compound=true
+    node [color="deepskyblue4" style="rounded, filled" fillcolor="azure"]
+    edge[color="red"]
+
+    Entry[width=0.2 shape="circle" style="filled" fillcolor="black" label=""]
+    Entry -> Queued
+
+    Queued [label = <
+        <table CELLBORDER="0" CELLPADDING="5" style="rounded">
+            <tr><td><b>Queued</b></td></tr>
+            <hr/>
+            <tr><td align="left"><font point-size="10">
+submit()<br ALIGN="LEFT"/>
+            </font></td></tr>
+        </table>
+    > margin=0 shape=none]
+    InFlight [label = <
+        <table CELLBORDER="0" CELLPADDING="5" style="rounded">
+            <tr><td><b>InFlight</b></td></tr>
+            <hr/>
+            <tr><td align="left"><font point-size="10">
+complete()<br ALIGN="LEFT"/>fail()<br ALIGN="LEFT"/>is_inflight()<br ALIGN="LEFT"/>
+            </font></td></tr>
+        </table>
+    > margin=0 shape=none]
+    Complete [label = <
+        <table CELLBORDER="0" CELLPADDING="5" style="rounded">
+            <tr><td><b>Complete</b></td></tr>
+            <hr/>
+            <tr><td align="left"><font point-size="10">
+is_complete()<br ALIGN="LEFT"/>
+            </font></td></tr>
+        </table>
+    > margin=0 shape=none]
+    Error [label = <
+        <table CELLBORDER="0" CELLPADDING="5" style="rounded">
+            <tr><td><b>Error</b></td></tr>
+            <hr/>
+            <tr><td align="left"><font point-size="10">
+is_error()<br ALIGN="LEFT"/>
+            </font></td></tr>
+        </table>
+    > margin=0 shape=none]
+
+    Queued -> InFlight [label=" submit "]
+    InFlight -> Complete [label=" complete "]
+    InFlight -> Error [label=" fail "]
+}

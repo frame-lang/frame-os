@@ -119,6 +119,34 @@ pub fn alloc_frame() -> Option<u64> {
     None
 }
 
+/// Allocate `n` *physically contiguous* frames. Returns the physical base of
+/// the run (4 KiB aligned), or None. Needed for DMA regions like the virtio
+/// virtqueue, which the device addresses as one contiguous physical block.
+pub fn alloc_contiguous(n: usize) -> Option<u64> {
+    if n == 0 {
+        return None;
+    }
+    let mut start = 1usize;
+    while start + n <= MAX_FRAMES {
+        let mut ok = true;
+        for k in 0..n {
+            if is_used(start + k) {
+                ok = false;
+                start += k + 1; // skip past the used frame
+                break;
+            }
+        }
+        if ok {
+            for k in 0..n {
+                mark_used(start + k);
+                adjust_free(-1);
+            }
+            return Some(start as u64 * FRAME_SIZE);
+        }
+    }
+    None
+}
+
 /// Free a frame previously returned by `alloc_frame`.
 pub fn free_frame(phys: u64) {
     let frame = (phys / FRAME_SIZE) as usize;

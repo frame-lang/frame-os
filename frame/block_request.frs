@@ -1,0 +1,53 @@
+// frame/block_request.frs
+//
+// BlockRequest — the lifecycle of one block-device I/O request (B4 Step 1).
+// The reference consumer of the post/drain split: a request is `submit`ted
+// ($Queued → $InFlight), and the *drained* completion (fired from normal
+// context, never the IRQ) moves it to $Complete or $Error.
+//
+// State graph (a tiny linear lifecycle with a success/error fork):
+//
+//   $Queued ── submit ──► $InFlight ── complete ──► $Complete
+//                            │
+//                            └──────── fail ──────► $Error
+//
+// Pure lifecycle bookkeeping — no native actions, so it is host-testable
+// directly and needs no test-double. The native virtio-blk driver owns the
+// virtqueue + DMA + the IRQ; this owns "where is this request in its life".
+
+@@[target("rust")]
+
+@@system BlockRequest {
+    interface:
+        submit()
+        complete()
+        fail()
+        is_inflight(): bool = false
+        is_complete(): bool = false
+        is_error(): bool = false
+
+    machine:
+        $Queued {
+            submit() {
+                -> $InFlight
+            }
+        }
+
+        $InFlight {
+            complete() {
+                -> $Complete
+            }
+            fail() {
+                -> $Error
+            }
+            is_inflight(): bool { @@:(true) }
+        }
+
+        $Complete {
+            is_complete(): bool { @@:(true) }
+        }
+
+        $Error {
+            is_error(): bool { @@:(true) }
+        }
+}

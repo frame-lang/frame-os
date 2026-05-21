@@ -36,12 +36,14 @@ mod gdt;
 mod interrupts;
 mod io;
 mod paging;
+mod pci;
 mod pic;
 mod pit;
 mod sched;
 mod sched_demo;
 mod serial;
 mod usermode;
+mod virtio_blk;
 mod vm;
 
 use frame_systems::Kernel;
@@ -239,6 +241,10 @@ unsafe extern "C" fn kmain() -> ! {
     // ever yielding; the timer ISR preempts them round-robin. Both digits
     // appearing proves preemption works.
     sched::run();
+
+    // B4 Step 1: init virtio-blk and round-trip a sector (write → IRQ → post →
+    // drain → BlockRequest), exercising the deferred-event path.
+    virtio_blk::run_demo();
 
     // B3 Step 1b: the user/kernel boundary. Enter ring 3 running a tiny
     // hand-crafted program that writes "AB" via syscalls and exits(42); the

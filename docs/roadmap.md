@@ -377,8 +377,8 @@ H3 is the H-track's final committed milestone. Further H-track work (a configura
 
 | # | Exit criterion | Validating test(s) |
 |---|---|---|
-| B4-1 | `BlockRequest`, `OpenFile`, `Mount` state graphs match committed designs | Snapshots (`kernel-tests`) |
-| B4-2 | I/O request + file + mount lifecycles correct | Behavioral tests (host) per system |
+| B4-1 | `BlockRequest`, `OpenFile`, `Mount` state graphs match committed designs | Snapshots (`kernel-tests`) — **`BlockRequest` done at Step 1** (`block_request_state_graph_snapshot`); `OpenFile`/`Mount` pending |
+| B4-2 | I/O request + file + mount lifecycles correct | Behavioral tests (host) — **`BlockRequest` done at Step 1** (6 tests); `OpenFile`/`Mount` pending |
 | B4-3 | create → write → read → delete round-trips; data survives across operations | QEMU smoke `fs_file_roundtrip_b4` |
 | B4-4 | `mount`/`unmount` work; the FS persists across a reboot of the same disk image | QEMU smoke `fs_persists_across_reboot_b4` |
 | B4-5 | The userspace shell `cat`s a file loaded from disk and runs a program from disk | QEMU smoke `userspace_shell_runs_program_from_disk_b4` |
@@ -386,6 +386,10 @@ H3 is the H-track's final committed milestone. Further H-track work (a configura
 | B4-7 | Diagrams + per-system docs; all CI gates + QEMU smoke | `cargo xtask check-diagrams`; review; full CI + `qemu-test` |
 
 **Estimated effort:** Very large.
+
+**Status:** In progress.
+- **Step 1 (virtio-blk + post/drain + `BlockRequest`):** Done. A legacy virtio-blk driver (`virtio_blk.rs`): PCI discovery (`pci.rs`), feature negotiation, a single virtqueue in contiguous DMA frames (`frames::alloc_contiguous`), and the completion IRQ on vector 43 (slave PIC IRQ 11). **The post/drain deferred-event pattern is born:** the IRQ handler (`on_irq`) only *posts* (acks the device ISR + sets a flag — no Frame dispatch); the kernel *drains* from normal context, reading the used ring and driving the `BlockRequest` Frame system (`$Queued → $InFlight → $Complete | $Error`) to completion. The first **async-interrupt → Frame** boundary (the timer ISR is pure-native; `#PF` is synchronous). Demo: write a pattern to a sector, read it back, verify. Host-tested (snapshot B4-1; 6 behavioral B4-2) and validated by `blk_roundtrip_b4` (17/17 QEMU smoke). The harness gained a per-invocation virtio-blk disk. Per-system doc + SVG committed.
+- **Remaining:** Step 2 — on-disk FS + buffer cache + `Mount` (mkfs, roundtrip, persistence). Step 3 — VFS + `OpenFile` + directories. Step 4 — the userspace shell.
 
 ### B5 — networking (the headline)
 
