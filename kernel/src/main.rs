@@ -99,10 +99,10 @@ unsafe extern "C" fn kmain() -> ! {
     // tick() events into it instead of halting here.)
     let _kernel = Kernel::__create();
 
-    // B2 Step 1: physical frame allocator. Init from Limine's memory map,
-    // then a self-test: two distinct page-aligned frames, free restores the
-    // count, realloc after free works. (Moves into $InitMemory at Step 5.)
-    frames::init();
+    // B2 Step 1: physical frame allocator. As of Step 5 the allocator is
+    // initialized by the boot HSM's $InitMemory phase (during __create
+    // above), so kmain only runs the self-test: two distinct page-aligned
+    // frames, free restores the count, realloc after free works.
     serial::write_str("[frames] usable frames: ");
     serial::write_u32_decimal(frames::free_count() as u32);
     serial::writeln("");

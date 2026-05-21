@@ -104,6 +104,14 @@ pub mod vm {
     }
 }
 
+/// Host test-double for the kernel's `frames` module. The Kernel HSM's
+/// `$InitMemory` phase calls `crate::frames::init()`; on the host there's no
+/// physical frame allocator to bring up, so it's a no-op (the boot chain
+/// still runs to `$Running` in the behavioral tests).
+pub mod frames {
+    pub fn init() {}
+}
+
 // Pull in the framec-generated systems. Each generated file ends with
 // `pub use _<name>_framec::*;`, re-exporting the system type at this crate's
 // root. SerialDriver first (Kernel holds one in its domain). Task and

@@ -312,7 +312,9 @@ H3 is the H-track's final committed milestone. Further H-track work (a configura
 
 **Estimated effort:** Large; mostly native (paging is unsafe-Rust-heavy). The Frame payload is concentrated in `PageFaultHandler`.
 
-**Status:** Core complete (Steps 1–3). Frame allocator (`7385208`), 4-level paging (`3835155`), and the `#PF` handler + `PageFaultHandler` HSM (this step) all land and QEMU-validate; B2-1 through B2-7 met. **Remaining (plan Steps 4–5, not numbered exit criteria):** per-process address-space construction (new PML4 + CR3 switch) — machinery for B3, build + smoke; and folding the frame-allocator/paging init into the `$InitMemory` HSM phase (retiring that stub). Both are tracked; B3 (user mode) needs the address-space machinery, so it lands next.
+**Status:** Done. Frame allocator (`7385208`), 4-level paging (`3835155`), `#PF` + `PageFaultHandler` HSM (`f25b5d0`), per-process address spaces (`3363eb1`), and `$InitMemory` made real (this step). B2-1 through B2-7 met; 10/10 QEMU smoke.
+- **`$InitMemory` is now real** — the boot HSM phase brings up the frame allocator (`crate::frames::init()`) instead of printing a stub; the same "shared `.frs`, different native actions per target" pattern means `kernel-tests` supplies a no-op `frames::init()` double so the host behavioral tests still drive the boot chain.
+- **Remaining cross-cutting refinement (not a B2 criterion):** `$InitIDT`/`$InitTimer` still print stubs (native IDT/PIC/PIT init runs in `kmain`); folding those into their HSM phases is a small follow-up. B3 (user mode) now has everything it needs — paging, address spaces, the `#PF` handler — and is next.
 
 ### B3 — user mode, processes, syscalls, ELF, fork/exec
 

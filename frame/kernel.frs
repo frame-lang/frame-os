@@ -62,6 +62,11 @@
         $InitMemory => $Booting {
             $>() {
                 serial::writeln("[boot] init memory");
+                // Real work as of B2: bring up the physical frame allocator
+                // over Limine's memory map. (The heap was initialized in
+                // kmain before this HSM ran, since the HSM constructor
+                // itself allocates.)
+                crate::frames::init();
                 -> $InitIDT
             }
             => $^
