@@ -196,6 +196,52 @@ pub unsafe fn fork_address_space(parent_pml4: u64) -> u64 {
     child
 }
 
+/// Free an address space's *user* half (B3 Step 5d teardown): every user leaf
+/// frame, the user page-table frames (PT/PD/PDPT under PML4 indices 0..256),
+/// and the PML4 frame itself. The shared kernel higher-half (256..512) is left
+/// untouched. Call only on a space no longer active (CR3 points elsewhere).
+///
+/// # Safety
+/// `pml4` must be a PML4 not currently loaded in CR3, with a private user half
+/// (as produced by `new_address_space` / `fork_address_space`).
+pub unsafe fn free_address_space(pml4: u64) {
+    let p4 = frames::phys_to_virt(pml4) as *const u64;
+    for i4 in 0..256u64 {
+        let e4 = *p4.add(i4 as usize);
+        if e4 & PRESENT == 0 {
+            continue;
+        }
+        let pdpt_phys = e4 & ADDR_MASK;
+        let pdpt = frames::phys_to_virt(pdpt_phys) as *const u64;
+        for i3 in 0..512u64 {
+            let e3 = *pdpt.add(i3 as usize);
+            if e3 & PRESENT == 0 {
+                continue;
+            }
+            let pd_phys = e3 & ADDR_MASK;
+            let pd = frames::phys_to_virt(pd_phys) as *const u64;
+            for i2 in 0..512u64 {
+                let e2 = *pd.add(i2 as usize);
+                if e2 & PRESENT == 0 || e2 & (1 << 7) != 0 {
+                    continue;
+                }
+                let pt_phys = e2 & ADDR_MASK;
+                let pt = frames::phys_to_virt(pt_phys) as *const u64;
+                for i1 in 0..512u64 {
+                    let e1 = *pt.add(i1 as usize);
+                    if e1 & PRESENT != 0 {
+                        frames::free_frame(e1 & ADDR_MASK); // user leaf page
+                    }
+                }
+                frames::free_frame(pt_phys);
+            }
+            frames::free_frame(pd_phys);
+        }
+        frames::free_frame(pdpt_phys);
+    }
+    frames::free_frame(pml4);
+}
+
 /// Switch the active address space (load CR3). Flushes the whole TLB.
 ///
 /// # Safety

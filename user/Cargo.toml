@@ -32,6 +32,11 @@ path = "src/forker.rs"
 name = "spawner"
 path = "src/spawner.rs"
 
+# fork + wait: the parent reaps the child (B3 Step 5d).
+[[bin]]
+name = "waiter"
+path = "src/waiter.rs"
+
 [profile.dev]
 panic = "abort"
 opt-level = 1

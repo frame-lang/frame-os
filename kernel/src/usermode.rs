@@ -61,6 +61,12 @@ static mut CURRENT_TRAP_FRAME: *mut TrapFrame = core::ptr::null_mut();
 // dispatch returns cleanly to $Validating. (IF=0 in syscalls, so single-flight.)
 static mut PENDING_EXIT: i64 = -1;
 
+// Likewise, `wait` BLOCKS — which must not happen inside the SyscallDispatcher
+// handler (it would hold the shared dispatcher in $Executing, so a concurrent
+// child's syscalls would be dropped). The handler sets this flag; the actual
+// block + reap happens in `syscall_dispatch` after the dispatch completes.
+static mut PENDING_WAIT: bool = false;
+
 // The freestanding user programs (B3 Step 4), built by kernel/build.rs from
 // the `user/` crate and baked into the kernel image. `hello` prints "hello
 // from ELF" and exit(42)s; `faulter` reads kernel memory to trigger the
@@ -71,6 +77,8 @@ static USER_FAULTER_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/user_
 static USER_FORKER_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/user_forker.elf"));
 // `spawner` (B3 Step 5c) forks + execs `hello` in the child.
 static USER_SPAWNER_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/user_spawner.elf"));
+// `waiter` (B3 Step 5d) forks a child and wait()s to reap it.
+static USER_WAITER_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/user_waiter.elf"));
 
 global_asm!(
     // syscall entry: rcx=user RIP, r11=user RFLAGS, rax=num, rdi/rsi=args.
@@ -213,6 +221,16 @@ extern "C" fn syscall_dispatch(frame: *mut TrapFrame) {
     d.request(num, a0, a1);
     f.rax = d.result();
 
+    // Honor a pending wait AFTER the dispatcher is back in $Validating — the
+    // block must not happen inside the handler. do_wait_loop blocks until a
+    // child exits, reaps it, and returns the status into the caller's frame.
+    if unsafe { (&raw const PENDING_WAIT).read() } {
+        unsafe {
+            (&raw mut PENDING_WAIT).write(false);
+        }
+        f.rax = do_wait_loop();
+    }
+
     // Honor a pending exit AFTER the dispatcher has returned to $Validating —
     // diverging inside the handler would leave it stuck in $Executing.
     let pending = unsafe { (&raw const PENDING_EXIT).read() };
@@ -233,9 +251,9 @@ fn proc_table() -> &'static mut ProcessTable {
 }
 
 /// Validation predicate, called by the dispatcher's `$Validating` state.
-/// 0 = write_char, 1 = exit, 2 = fork, 3 = exec(prog_id).
+/// 0 = write_char, 1 = exit, 2 = fork, 3 = exec(prog_id), 4 = wait.
 pub fn is_known_syscall(num: u64) -> bool {
-    num <= 3
+    num <= 4
 }
 
 /// Perform a (validated) syscall, called by the dispatcher's `$Executing`
@@ -258,7 +276,46 @@ pub fn perform_syscall(num: u64, a0: u64, _a1: u64) -> u64 {
         }
         2 => do_fork(),
         3 => do_exec(a0),
+        4 => {
+            // Record the wait; syscall_dispatch runs the (blocking) reap loop
+            // after the dispatcher returns to $Validating.
+            unsafe {
+                (&raw mut PENDING_WAIT).write(true);
+            }
+            0
+        }
         _ => u64::MAX, // unreachable: validated by is_known_syscall
+    }
+}
+
+/// `wait`: block until a child exits, reap it (collect status, free its
+/// `Process` slot + address space), and return its exit code. Returns
+/// `u64::MAX` (ECHILD) if the caller has no children. The blocking is the one
+/// place a syscall suspends: `sched::block_current` yields to the scheduler and
+/// returns once a child's exit (SIGCHLD) wakes us. Called from `syscall_dispatch`
+/// (not the handler) so the shared dispatcher stays available to the child.
+fn do_wait_loop() -> u64 {
+    let me = sched::current_pid();
+    loop {
+        if let Some((child_pid, child_pml4)) = sched::reap_dead_child(me) {
+            let status = proc_table().reap_pid(child_pid); // $Zombie → $Reaped, slot freed
+            unsafe { paging::free_address_space(child_pml4) }; // teardown
+            serial::write_str("[wait] pid ");
+            serial::write_u32_decimal(me);
+            serial::write_str(" reaped child pid ");
+            serial::write_u32_decimal(child_pid);
+            serial::write_str(" (exit ");
+            write_exit_code(status);
+            serial::write_str("); table count ");
+            serial::write_u32_decimal(proc_table().count());
+            serial::writeln("");
+            return status as u64;
+        }
+        if !sched::has_children(me) {
+            return u64::MAX; // ECHILD
+        }
+        // A living child exists but none have exited yet — block until one does.
+        sched::block_current();
     }
 }
 
@@ -343,12 +400,12 @@ fn do_fork() -> u64 {
     };
     let child_pml4 = unsafe { paging::fork_address_space(paging::current_pml4()) };
     let child_pid = proc_table().spawn(); // child Process: $Created → $Ready
+    let parent_pid = sched::current_pid();
     let mut child_frame = parent_frame;
     child_frame.rax = 0; // fork() returns 0 in the child
     unsafe {
-        sched::spawn_user_from_frame(child_pml4, &child_frame, child_pid);
+        sched::spawn_user_from_frame(child_pml4, &child_frame, child_pid, parent_pid);
     }
-    let parent_pid = sched::current_pid();
     serial::write_str("[fork] pid ");
     serial::write_u32_decimal(parent_pid);
     serial::write_str(" forked child pid ");
@@ -450,4 +507,5 @@ pub fn run() {
     run_one(USER_FAULTER_ELF, "faulter");
     run_one(USER_FORKER_ELF, "forker");
     run_one(USER_SPAWNER_ELF, "spawner");
+    run_one(USER_WAITER_ELF, "waiter");
 }

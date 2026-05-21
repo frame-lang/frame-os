@@ -659,6 +659,22 @@ const SMOKE_TESTS: &[SmokeTest] = &[
         expect_absent: &["KERNEL EXCEPTION", "KERNEL PANIC", "triple fault"],
         timeout_secs: 20,
     },
+    SmokeTest {
+        // B3 Step 5d: wait + reap. The `waiter` (pid 7) forks a child (pid 8),
+        // then BLOCKS in wait() — the one place a syscall suspends. The child
+        // runs concurrently (prints 'cccc'), exits(7), and its exit (SIGCHLD)
+        // wakes the parent, which reaps it: collects the status (7), frees the
+        // Process slot, and tears down the child's address space. Unlike the
+        // forker/spawner children (which linger as zombies), pid 8 is fully
+        // reaped — proving the blocking wait + teardown path.
+        name: "wait_reap_b3",
+        expect_contains: &[
+            "[fork] pid 7 forked child pid 8",
+            "[wait] pid 7 reaped child pid 8 (exit 7)",
+        ],
+        expect_absent: &["KERNEL EXCEPTION", "KERNEL PANIC", "triple fault"],
+        timeout_secs: 20,
+    },
 ];
 
 fn run_qemu_test() -> Result<()> {

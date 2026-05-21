@@ -299,6 +299,16 @@ pub fn wait_for_interrupt() {
     }
 }
 
+/// Enable interrupts and halt as one step (`sti; hlt`). Used by a blocking
+/// task (B3 Step 5d `wait`) to yield to the scheduler from an interrupts-off
+/// (syscall) context: `sti` takes effect after the next instruction, so the
+/// pair atomically enables-then-halts with no wake-losing window.
+pub fn wait_for_interrupt_enabled() {
+    unsafe {
+        asm!("sti; hlt", options(nomem, nostack));
+    }
+}
+
 /// Run `f` with interrupts disabled, restoring the previous interrupt-enable
 /// state afterward. Single-core mutual exclusion: a Frame system is
 /// non-reentrant, so when one is shared across preemptible threads (e.g. the

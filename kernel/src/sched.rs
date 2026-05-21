@@ -35,6 +35,7 @@ const ROUNDS_PER_WORKER: u32 = 4;
 enum RunState {
     Free,
     Runnable,
+    Blocked, // alive but not runnable (e.g. a parent in wait()) — skipped by the round-robin, still counted "alive"
     Dead,
 }
 
@@ -47,6 +48,7 @@ struct Tcb {
     pml4: u64,       // 0 ⇒ kernel address space; else this process's PML4 phys
     kstack_top: u64, // ring-0 stack top for TSS.RSP0 + the syscall path
     pid: u32,        // the owning Process's pid (0 if none)
+    parent_pid: u32, // the pid that forked this one (0 if none) — for wait()
 }
 
 const TCB_INIT: Tcb = Tcb {
@@ -55,6 +57,7 @@ const TCB_INIT: Tcb = Tcb {
     pml4: 0,
     kstack_top: 0,
     pid: 0,
+    parent_pid: 0,
 };
 
 static mut TCBS: [Tcb; MAX_THREADS] = [TCB_INIT; MAX_THREADS];
@@ -298,7 +301,12 @@ pub unsafe fn spawn_user(pml4: u64, entry: u64, user_rsp: u64, pid: u32) {
 ///
 /// # Safety
 /// `pml4` must be a valid (forked) address space matching `frame`'s user RSP.
-pub unsafe fn spawn_user_from_frame(pml4: u64, frame: &crate::usermode::TrapFrame, pid: u32) {
+pub unsafe fn spawn_user_from_frame(
+    pml4: u64,
+    frame: &crate::usermode::TrapFrame,
+    pid: u32,
+    parent_pid: u32,
+) {
     let n = (&raw const N).read();
     let base = (&raw mut KSTACKS) as *mut u8;
     let kstack_top = (base.add((n + 1) * STACK_SIZE) as u64) & !0xF;
@@ -310,8 +318,67 @@ pub unsafe fn spawn_user_from_frame(pml4: u64, frame: &crate::usermode::TrapFram
     (*t.add(n)).pml4 = pml4;
     (*t.add(n)).kstack_top = kstack_top;
     (*t.add(n)).pid = pid;
+    (*t.add(n)).parent_pid = parent_pid;
     (&raw mut N).write(n + 1);
     with_sched(|s| s.task_ready());
+}
+
+/// Block the current process (B3 Step 5d `wait`): mark it `Blocked` and yield
+/// to the scheduler, returning only once another context wakes it (`wake`) and
+/// it is rescheduled. A Blocked task is skipped by the round-robin but stays
+/// "alive" in the Frame Scheduler's count (no `task_unready`), so the boot
+/// context won't declare `$Idle` while a parent waits. Restores IF=0 on return
+/// (the caller is a syscall handler that must stay non-preemptible).
+pub fn block_current() {
+    unsafe {
+        let cur = (&raw const CURRENT).read();
+        interrupts::without_interrupts(|| {
+            (*tcbs().add(cur)).state = RunState::Blocked;
+        });
+        // Yield: enable interrupts so the timer reschedules us away. We resume
+        // here (post-hlt) only once `wake` has set us Runnable again.
+        while (*tcbs().add(cur)).state == RunState::Blocked {
+            interrupts::wait_for_interrupt_enabled();
+        }
+        // Back to non-preemptible for the rest of the syscall.
+        interrupts::disable();
+    }
+}
+
+/// Reap one *dead* (exited) child of `parent_pid`: free its scheduler slot and
+/// return its pid + PML4 so the caller can tear down the address space + the
+/// `Process`. Returns `None` if the parent has no exited-unreaped child.
+pub fn reap_dead_child(parent_pid: u32) -> Option<(u32, u64)> {
+    unsafe {
+        interrupts::without_interrupts(|| {
+            let t = tcbs();
+            let n = (&raw const N).read();
+            for i in 1..n {
+                if (*t.add(i)).parent_pid == parent_pid && (*t.add(i)).state == RunState::Dead {
+                    let pid = (*t.add(i)).pid;
+                    let pml4 = (*t.add(i)).pml4;
+                    (*t.add(i)) = TCB_INIT; // free the slot
+                    return Some((pid, pml4));
+                }
+            }
+            None
+        })
+    }
+}
+
+/// Whether `parent_pid` has any child still tracked by the scheduler (alive,
+/// blocked, or exited-unreaped). False ⇒ `wait` should return "no children".
+pub fn has_children(parent_pid: u32) -> bool {
+    unsafe {
+        let t = tcbs();
+        let n = (&raw const N).read();
+        for i in 1..n {
+            if (*t.add(i)).parent_pid == parent_pid && (*t.add(i)).state != RunState::Free {
+                return true;
+            }
+        }
+        false
+    }
 }
 
 /// Point the *current* process at a new address space (B3 Step 5c `exec`): the
@@ -366,6 +433,20 @@ pub fn exit_current() -> ! {
         let cur = (&raw const CURRENT).read();
         (*tcbs().add(cur)).state = RunState::Dead;
         with_sched(|s| s.task_unready());
+        // SIGCHLD: wake the parent if it's blocked in wait() — now that this
+        // child is Dead, the parent's reap will find it. (No-op if the parent
+        // isn't waiting, or for parentless kernel threads.)
+        let parent = (*tcbs().add(cur)).parent_pid;
+        if parent != 0 {
+            let t = tcbs();
+            let n = (&raw const N).read();
+            for i in 0..n {
+                if (*t.add(i)).pid == parent && (*t.add(i)).state == RunState::Blocked {
+                    (*t.add(i)).state = RunState::Runnable;
+                    break;
+                }
+            }
+        }
     });
     // A dead task MUST park with interrupts enabled so the next timer tick
     // switches away. Kernel-thread callers already run with IF=1, but a user
