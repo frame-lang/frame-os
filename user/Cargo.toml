@@ -17,6 +17,11 @@ edition = "2021"
 name = "hello"
 path = "src/main.rs"
 
+# A second program that faults by reading kernel memory (B3 Step 4b isolation).
+[[bin]]
+name = "faulter"
+path = "src/faulter.rs"
+
 [profile.dev]
 panic = "abort"
 opt-level = 1

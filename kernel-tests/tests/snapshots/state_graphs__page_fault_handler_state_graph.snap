@@ -1,5 +1,6 @@
 ---
 source: kernel-tests/tests/state_graphs.rs
+assertion_line: 91
 expression: dot
 ---
 digraph PageFaultHandler {
@@ -15,7 +16,9 @@ digraph PageFaultHandler {
             <table cellborder="0" border="0">
                 <tr><td>FaultActive</td></tr>
                 <hr/>
-                <tr><td></td></tr>
+                <tr><td align="left"><font point-size="10">
+unrecoverable()<br ALIGN="LEFT"/>
+                </font></td></tr>
             </table>
         >
         style = rounded
@@ -49,9 +52,19 @@ $&gt;()<br ALIGN="LEFT"/>is_fatal()<br ALIGN="LEFT"/>
             </font></td></tr>
         </table>
     > margin=0 shape=none]
+    Killing [label = <
+        <table CELLBORDER="0" CELLPADDING="5" style="rounded">
+            <tr><td><b>Killing</b></td></tr>
+            <hr/>
+            <tr><td align="left"><font point-size="10">
+$&gt;()<br ALIGN="LEFT"/>recover()<br ALIGN="LEFT"/>is_killing()<br ALIGN="LEFT"/>
+            </font></td></tr>
+        </table>
+    > margin=0 shape=none]
 
     Classifying -> LazyFault [label=" fault "]
-    Classifying -> Fatal [label=" fault "]
     LazyFault -> Classifying [label=" $> "]
-    LazyFault -> Fatal [label=" $> "]
+    FaultActive -> Killing [label=" unrecoverable " ltail="cluster_FaultActive"]
+    FaultActive -> Fatal [label=" unrecoverable " ltail="cluster_FaultActive"]
+    Killing -> Classifying [label=" recover "]
 }

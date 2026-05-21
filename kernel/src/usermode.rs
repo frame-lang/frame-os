@@ -59,6 +59,12 @@ static mut SYSCALL_STACK: [u8; SYSCALL_STACK_SIZE] = [0; SYSCALL_STACK_SIZE];
 // used. It prints "hello from ELF" via write_char syscalls and exit(42)s.
 static USER_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/user_hello.elf"));
 
+// A second user program (B3 Step 4b) that reads a kernel address — a ring-3
+// access to a supervisor page → #PF (U/S bit set). Proves isolation: the
+// PageFaultHandler routes it to $Killing, the process is torn down, and the
+// kernel survives instead of faulting/halting.
+static USER_FAULTER_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/user_faulter.elf"));
+
 global_asm!(
     // syscall entry: rcx=user RIP, r11=user RFLAGS, rax=num, rdi/rsi=args.
     // Switch to the kernel syscall stack (statics; single-core), marshal
@@ -222,16 +228,36 @@ pub fn perform_syscall(num: u64, a0: u64, _a1: u64) -> u64 {
     }
 }
 
-/// Run the user-mode demo: set up syscall MSRs, load the baked ELF via the
-/// `ElfLoader` HSM, admit it as a `Process`, enter ring 3, and return here when
-/// the user exits — then reap the process and free the ELF's pages.
-pub fn run() {
-    init();
+/// Kill the currently-running user process from inside the #PF handler (B3
+/// Step 4b). Marks the process `$Zombie` (killed sentinel) and longjmps back
+/// to the kernel — abandoning the faulting ring-3 thread and the #PF stack.
+/// Never returns. The kernel survives a misbehaving user program.
+pub fn kill_current_user_process() -> ! {
+    let pid = unsafe { (&raw const USER_PROC_PID).read() };
+    proc_table().kill_pid(pid); // $Ready → $Zombie (exit_code = -1)
+    serial::write_str("[proc] pid ");
+    serial::write_u32_decimal(pid);
+    serial::write_str(" killed -> ");
+    serial::writeln(&proc_table().pid_state(pid));
+    unsafe { resume_kernel_after_user() } // longjmp to enter_user's caller
+}
 
-    // Load the baked user ELF into the current address space (the ElfLoader
-    // phases cascade from construction; it rests in $Done or $Failed).
+/// Print an i32 exit code (negative for a killed process).
+fn write_exit_code(code: i32) {
+    if code < 0 {
+        serial::write_byte(b'-');
+        serial::write_u32_decimal((-code) as u32);
+    } else {
+        serial::write_u32_decimal(code as u32);
+    }
+}
+
+/// Load one baked ELF, admit it as a `Process`, run it in ring 3, then reap it.
+/// `enter_user` returns here both on a clean `exit` syscall and on a fatal user
+/// fault (the #PF handler longjmps back via `kill_current_user_process`).
+fn run_one(elf: &'static [u8], label: &str) {
     let pml4 = paging::current_pml4();
-    crate::elf::prepare(USER_ELF, pml4);
+    crate::elf::prepare(elf, pml4);
     let mut loader = ElfLoader::__create();
     if loader.is_failed() {
         serial::write_str("[elf] load failed: ");
@@ -240,15 +266,12 @@ pub fn run() {
     }
     let entry = loader.entry();
     let stack_top = loader.user_stack_top();
-    serial::write_str("[elf] loaded user program, entry 0x");
+    serial::write_str("[elf] loaded ");
+    serial::write_str(label);
+    serial::write_str(", entry 0x");
     serial::write_hex_u64(entry);
     serial::writeln("");
 
-    // Stand up the process table and admit the user program as a Process.
-    unsafe {
-        let p = &raw mut PROC_TABLE;
-        *p = Some(ProcessTable::__create(MAX_PROCS));
-    }
     let pid = proc_table().spawn(); // $Created → $Ready
     unsafe {
         (&raw mut USER_PROC_PID).write(pid);
@@ -264,18 +287,32 @@ pub fn run() {
         enter_user(entry, stack_top);
     }
 
-    serial::writeln("[user] back in kernel after user exit");
+    serial::writeln("[user] back in kernel");
 
-    // Reap the exited process: $Zombie → $Reaped, freeing its table slot.
+    // Reap the process ($Zombie → $Reaped, freeing the slot), then free the
+    // ELF's mapped pages.
     let code = proc_table().reap_pid(pid);
     serial::write_str("[proc] reaped pid ");
     serial::write_u32_decimal(pid);
     serial::write_str("; exit ");
-    serial::write_u32_decimal(code as u32);
+    write_exit_code(code);
     serial::write_str("; table count ");
     serial::write_u32_decimal(proc_table().count());
     serial::writeln("");
-
-    // Free the ELF's mapped pages (segments + user stack).
     crate::elf::cleanup();
+}
+
+/// Run the user-mode demo: set up syscall MSRs and the process table, then run
+/// two baked programs — `hello` (clean exit, B3 Step 4a) and `faulter` (reads
+/// kernel memory → #PF → killed, kernel survives, B3 Step 4b).
+pub fn run() {
+    init();
+
+    unsafe {
+        let p = &raw mut PROC_TABLE;
+        *p = Some(ProcessTable::__create(MAX_PROCS));
+    }
+
+    run_one(USER_ELF, "hello");
+    run_one(USER_FAULTER_ELF, "faulter");
 }

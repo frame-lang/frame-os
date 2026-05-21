@@ -550,7 +550,7 @@ const SMOKE_TESTS: &[SmokeTest] = &[
         name: "page_fault_fatal_b2",
         expect_contains: &[
             "[#PF] triggering a deliberate fatal fault",
-            "[#PF] FATAL unhandled fault at 0x0000600000000000",
+            "[#PF] FATAL unhandled kernel fault at 0x0000600000000000",
             "[#PF] halting.",
         ],
         expect_absent: &["KERNEL EXCEPTION", "triple fault"],
@@ -580,27 +580,43 @@ const SMOKE_TESTS: &[SmokeTest] = &[
         timeout_secs: 20,
     },
     SmokeTest {
-        // B3 Step 1b + Step 3: the user/kernel boundary, with the ring-3
-        // program tracked as a Process. A hand-crafted ring-3 program writes
-        // 'A'/'B' via write_char syscalls and exits(42); the exit syscall
-        // longjmps back to the kernel. "AB" proves syscalls from ring 3 reach
-        // the kernel; the exit + back-in-kernel lines prove sysret-less exit +
-        // the longjmp work.
-        //
-        // Step 3 adds the Process/ProcessTable lifecycle markers: the program
-        // is spawned ($Ready), runs, the exit syscall moves it to $Zombie, and
-        // the kernel reaps it ($Reaped) — freeing the slot (table count → 0).
-        // No exception/fault.
+        // B3 Step 1b + 3 + 4a: the user/kernel boundary running a real ELF as a
+        // Process. ElfLoader parses + maps the baked freestanding-Rust `hello`
+        // program; it's spawned ($Ready), runs in ring 3 printing "hello from
+        // ELF" via write_char syscalls, exits(42) (the exit syscall longjmps
+        // back to the kernel → $Zombie), and is reaped ($Reaped, slot freed).
         name: "ring3_syscall_b3",
         expect_contains: &[
-            "[elf] loaded user program, entry 0x",
+            "[elf] loaded hello, entry 0x",
             "[proc] spawned pid 1 (Ready)",
             "[user] entering ring 3",
             "hello from ELF",
             "[user] exited with code 42",
             "[proc] pid 1 exited -> Zombie",
-            "[user] back in kernel after user exit",
+            "[user] back in kernel",
             "[proc] reaped pid 1; exit 42; table count 0",
+        ],
+        expect_absent: &["KERNEL EXCEPTION", "KERNEL PANIC", "triple fault"],
+        timeout_secs: 20,
+    },
+    SmokeTest {
+        // B3 Step 4b: hardware isolation. A second user program (`faulter`,
+        // pid 2) reads a kernel-half address from ring 3 → #PF with the U/S
+        // bit set. The PageFaultHandler routes it (via $FaultActive's
+        // load-bearing `=> $^` funnel) to $Killing: the process is torn down
+        // (killed → $Zombie, reaped with exit -1) and the kernel SURVIVES,
+        // going on to the deliberate kernel fatal demo. A user fault must not
+        // halt or crash the kernel.
+        name: "user_fault_does_not_crash_kernel_b3",
+        expect_contains: &[
+            "[elf] loaded faulter",
+            "[proc] spawned pid 2 (Ready)",
+            "[#PF] user fault at 0xffffffff80000000 -> killing process (kernel survives)",
+            "[proc] pid 2 killed -> Zombie",
+            "[proc] reaped pid 2; exit -1; table count 0",
+            // Survival proof: the kernel keeps running past the user fault and
+            // reaches the (separate, deliberate) kernel-fault demo.
+            "[#PF] triggering a deliberate fatal fault",
         ],
         expect_absent: &["KERNEL EXCEPTION", "KERNEL PANIC", "triple fault"],
         timeout_secs: 20,

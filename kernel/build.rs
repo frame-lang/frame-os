@@ -110,25 +110,27 @@ fn build_user_program(workspace_root: &Path, out_dir: &Path) -> Result<()> {
         return Err(anyhow!("user program build failed"));
     }
 
-    let elf = user_target
-        .join("x86_64-unknown-none")
-        .join("release")
-        .join("hello");
-    if !elf.exists() {
-        return Err(anyhow!("user program ELF not found at {}", elf.display()));
+    // Stage each built binary's ELF where usermode.rs include_bytes!s it.
+    let release = user_target.join("x86_64-unknown-none").join("release");
+    for (bin, staged_name) in [("hello", "user_hello.elf"), ("faulter", "user_faulter.elf")] {
+        let elf = release.join(bin);
+        if !elf.exists() {
+            return Err(anyhow!("user program ELF not found at {}", elf.display()));
+        }
+        let staged = out_dir.join(staged_name);
+        std::fs::copy(&elf, &staged).with_context(|| {
+            format!(
+                "failed to stage user ELF {} -> {}",
+                elf.display(),
+                staged.display()
+            )
+        })?;
     }
-    let staged = out_dir.join("user_hello.elf");
-    std::fs::copy(&elf, &staged).with_context(|| {
-        format!(
-            "failed to stage user ELF {} -> {}",
-            elf.display(),
-            staged.display()
-        )
-    })?;
 
     // Rebuild whenever the user sources change.
     for f in [
         "src/main.rs",
+        "src/faulter.rs",
         "linker.ld",
         "Cargo.toml",
         ".cargo/config.toml",

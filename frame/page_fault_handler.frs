@@ -1,8 +1,8 @@
 // frame/page_fault_handler.frs
 //
 // PageFaultHandler — classifies a page fault and dispatches to the response
-// (B2 Step 3). The Frame showcase of B2: a hierarchical state machine
-// running *inside a CPU exception handler*.
+// (B2 Step 3; isolation added at B3 Step 4b). The Frame showcase of B2: a
+// hierarchical state machine running *inside a CPU exception handler*.
 //
 // The native #PF stub (interrupts.rs) reads CR2 + the error code and fires
 // `fault(addr, error_code)`. This is safe to drive synchronously: the #PF
@@ -11,55 +11,69 @@
 // non-reentrancy hazard that needs a queue for *async* interrupts does not
 // apply to a synchronous exception.
 //
-// State graph ($Fatal is a PEER, drawn outside the parent box — see below):
+// State graph ($Fatal and $Killing are PEERS, outside the parent box):
 //
 //   ┌──────────────────── $FaultActive (parent) ─────────────────────┐
+//   │   unrecoverable(): is_user ? -> $Killing : -> $Fatal            │
 //   │                                                                 │
 //   │   ┌──────────────┐  fault, addr in lazy region  ┌────────────┐ │
 //   │   │ $Classifying │ ────────────────────────────►│ $LazyFault │ │
 //   │   │  (initial)   │ ◄──── map ok (recovered) ─────│ $>: map it │ │
 //   │   └──────┬───────┘                               └─────┬──────┘ │
-//   │          │ fault, not a lazy region                    │ OOM    │
-//   └──────────┼──────────────────────────────────────────── ┼───────┘
-//              │                                              │
-//              └─────────────────────┐         ┌──────────────┘
-//                                     ▼         ▼
-//                                ┌──────────────────┐
-//                                │      $Fatal      │  (peer sink)
-//                                └──────────────────┘
+//   │          │ self.unrecoverable() ─┐      ┌─ OOM: self.unrecoverable()
+//   └──────────┼───────────────────────┼──────┼──────────────┼───────┘
+//              │            (=> $^ to $FaultActive.unrecoverable)
+//              ▼                                              ▼
+//      ┌──────────────┐  kernel fault          user fault  ┌──────────┐
+//      │    $Fatal    │ ◄──── unrecoverable ──────────────►│ $Killing │
+//      │  (halt)      │                                    │ (kill)   │
+//      └──────────────┘                                    └──────────┘
 //
-// Why `$Fatal` is a PEER, not a child of `$FaultActive`: the parent is a
-// superstate, and the condition it expresses is "still *attempting* to handle
-// this fault, sharing the forward-to-failure protocol" — true of $Classifying,
-// $LazyFault, and (at B4) $StackGrow / $CopyOnWrite. That condition is *false*
-// in $Fatal: recovery has been abandoned. So $Fatal sits outside the superstate
-// as the post-failure sink. (The committed .md and the generated graph both
-// reflect this — $Fatal carries no `=> $FaultActive`.)
+// The `=> $^` forwarding is LOAD-BEARING here (since B3 Step 4b): both recovery
+// children, on giving up, self-send `unrecoverable()` — unhandled in the child,
+// so `=> $^` forwards it to `$FaultActive.unrecoverable`, which makes the
+// disposition decision ONCE. Same self-send + forward shape as
+// SyscallDispatcher's `self.reject()` → `$Active.reject`. A ring-3 fault (error
+// code U/S bit set) kills the offending *process* and the kernel survives; a
+// kernel fault is a kernel bug → halt.
 //
-// The HSM parent `$FaultActive` exists for B4: there it hosts the shared
-// "unrecoverable → kill the process" handler that the recovery children
-// ($StackGrow / $CopyOnWrite / $LazyFault) forward to via `=> $^`; that handler
-// reaches the sink with a normal `-> $Fatal`. At B2 the two children fully
-// handle their cases, so the forwarding edge is declared (matching the
-// committed design) but not yet traversed — the same "declared now,
-// load-bearing later" pattern as `Task.$Blocked` at B1.
+// Why `$Fatal`/`$Killing` are PEERS, not children of `$FaultActive`: the parent
+// is the superstate "still *attempting* recovery, sharing the forward-to-failure
+// protocol" — true of $Classifying, $LazyFault, and (at B4) $StackGrow /
+// $CopyOnWrite. That condition is *false* in the disposition sinks (recovery
+// abandoned), so they sit outside the superstate. (The .md and the generated
+// graph reflect this — neither sink carries `=> $FaultActive`.)
 
 @@[target("rust")]
 
 @@system PageFaultHandler {
     interface:
         fault(addr: u64, error_code: u64)
+        // The "give up on recovery" funnel event. The children forward it to
+        // $FaultActive (it's unhandled in the children → `=> $^`); the parent
+        // decides the disposition. Public for the same reason SyscallDispatcher's
+        // reject() is — it is the funnel event the children self-send.
+        unrecoverable()
+        // Reset the handler back to $Classifying after a *surviving* disposition
+        // ($Killing). The kernel keeps running after killing a user process, so
+        // the handler must be ready to classify the next fault. (The recoverable
+        // path already returns to $Classifying; $Fatal halts, so never resets.)
+        recover()
         is_fatal(): bool = false
+        is_killing(): bool = false
         fault_addr(): u64 = self.fault_addr
 
     machine:
         $Classifying => $FaultActive {
             fault(addr: u64, error_code: u64) {
                 self.fault_addr = addr;
+                // Error-code bit 2 (U/S) set ⇒ the fault happened in ring 3.
+                self.is_user = (error_code & 4) != 0;
                 if crate::vm::is_lazy_region(addr) {
                     -> $LazyFault
                 } else {
-                    -> $Fatal
+                    // Not recoverable here → funnel to the parent's handler.
+                    self.unrecoverable()
                 }
             }
             => $^
@@ -70,20 +84,31 @@
                 if crate::vm::lazy_map(self.fault_addr) {
                     -> $Classifying
                 } else {
-                    -> $Fatal
+                    // Out of frames → unrecoverable; funnel to the parent.
+                    self.unrecoverable()
                 }
             }
             => $^
         }
 
-        // Parent. At B4 this hosts the shared unrecoverable handler the deep
-        // children forward to via `=> $^`.
+        // Parent: the single "unrecoverable" disposition the children forward
+        // to via `=> $^` (finally load-bearing at B3 Step 4b). A ring-3 fault
+        // kills the offending *process*; a kernel fault is a kernel bug → halt.
         $FaultActive {
+            unrecoverable() {
+                if self.is_user {
+                    -> $Killing
+                } else {
+                    -> $Fatal
+                }
+            }
         }
 
+        // Kernel fault (or OOM during one): unrecoverable, the kernel halts.
+        // Peer of $FaultActive — recovery has been abandoned (see header).
         $Fatal {
             $>() {
-                serial::write_str("\n[#PF] FATAL unhandled fault at 0x");
+                serial::write_str("\n[#PF] FATAL unhandled kernel fault at 0x");
                 serial::write_hex_u64(self.fault_addr);
                 serial::writeln("");
             }
@@ -91,6 +116,26 @@
             is_fatal(): bool { @@:(true) }
         }
 
+        // Ring-3 fault: the process is killed, the kernel survives. The native
+        // #PF handler reads is_killing() and tears the process down + returns
+        // to the kernel (rather than halting).
+        $Killing {
+            $>() {
+                serial::write_str("\n[#PF] user fault at 0x");
+                serial::write_hex_u64(self.fault_addr);
+                serial::writeln(" -> killing process (kernel survives)");
+            }
+
+            // After the kernel has torn down the process, recover() readies the
+            // handler for the next fault.
+            recover() {
+                -> $Classifying
+            }
+
+            is_killing(): bool { @@:(true) }
+        }
+
     domain:
         fault_addr: u64 = 0
+        is_user: bool = false
 }

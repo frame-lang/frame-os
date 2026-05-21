@@ -84,16 +84,28 @@ pub fn lazy_map(addr: u64) -> bool {
 
 /// The #PF Rust entry, invoked by the `isr_page_fault` stub with the
 /// faulting address (CR2) and the CPU's error code. Drives the
-/// PageFaultHandler HSM; on a fatal classification, halts (never returns to
-/// retry); otherwise returns so the stub `iretq`s and retries the faulting
-/// instruction.
+/// PageFaultHandler HSM, then acts on its disposition:
+///   - `$Killing` (ring-3 fault): tear down the offending process and longjmp
+///     back to the kernel — the kernel survives (B3 Step 4b). Never returns.
+///   - `$Fatal` (kernel fault): a kernel bug; halt. Never returns.
+///   - otherwise recoverable (e.g. demand fault mapped): return so the stub
+///     `iretq`s and retries the faulting instruction.
 #[no_mangle]
 extern "C" fn page_fault_handler(addr: u64, error_code: u64) {
     let pfh = unsafe {
         let p = &raw mut PFH;
         (*p).as_mut().expect("PageFaultHandler initialized")
     };
+    // A prior surviving disposition ($Killing) leaves the handler parked in
+    // that sink; reset it so this new fault re-classifies from $Classifying.
+    if pfh.is_killing() {
+        pfh.recover();
+    }
     pfh.fault(addr, error_code);
+    if pfh.is_killing() {
+        // The HSM already printed the "user fault → killing process" line.
+        crate::usermode::kill_current_user_process(); // never returns
+    }
     if pfh.is_fatal() {
         serial::writeln("[#PF] halting.");
         crate::halt_forever();
