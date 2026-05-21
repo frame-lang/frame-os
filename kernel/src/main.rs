@@ -85,26 +85,26 @@ unsafe extern "C" fn kmain() -> ! {
     }
 
     serial::writeln("Frame OS kernel — B0 Step 2");
-    serial::writeln("entering boot HSM...");
 
-    // Heap must be live before any allocating code. framec's generated
-    // Kernel constructor allocates Vec/String/Rc for compartment + event
-    // plumbing, so init the allocator first.
+    // Heap must be live before the Kernel HSM constructor (framec's
+    // generated code allocates Vec/String/Rc for event + compartment
+    // plumbing).
     allocator::init();
 
-    // Create the Kernel system. Construction synchronously drives the
-    // boot chain: $InitMemory.$> fires first, transitions to $InitIDT,
-    // etc., until $Running ($LaunchInit.$> finishes). The returned
-    // instance is unused at B0 — its only purpose was running the chain.
-    // (When B1 adds a scheduler, kmain will hold the Kernel and pump
-    // tick() events into it instead of halting here.)
-    let _kernel = Kernel::__create();
-
-    // B3 Step 1a: install our own GDT + TSS (required for ring 3 +
-    // syscall/sysret). Reaching the next line proves the GDT load + segment
-    // reload + ltr didn't fault.
+    // B3 Step 1a: our own GDT + TSS, installed BEFORE the boot HSM so that
+    // $InitIDT's interrupts::init() builds its gate descriptors with our
+    // kernel CS (0x08). Reaching the marker proves the lgdt + segment reload
+    // + ltr didn't fault.
     gdt::init();
     serial::writeln("[gdt] loaded our GDT + TSS");
+
+    serial::writeln("entering boot HSM...");
+
+    // Drive the boot chain. As of B2/B3 the init phases do real work:
+    // $InitMemory (frame allocator) → $InitIDT (IDT) → $InitTimer (PIC+PIT)
+    // → $InitConsole (SerialDriver) → $LaunchInit → $Running. The returned
+    // instance is unused here; its purpose was running the chain.
+    let _kernel = Kernel::__create();
 
     // B2 Step 1: physical frame allocator. As of Step 5 the allocator is
     // initialized by the boot HSM's $InitMemory phase (during __create
@@ -190,10 +190,9 @@ unsafe extern "C" fn kmain() -> ! {
         frames::free_frame(frame);
     }
 
-    // B1 Step 3a: install the IDT and prove the interrupt path works by
-    // firing a software breakpoint. The handler prints "[int3 ok]" and
-    // `iretq`s; the "[idt] survived int3" line proves we returned.
-    interrupts::init();
+    // B1 Step 3a: prove the interrupt path with a software breakpoint. The
+    // IDT was installed by the boot HSM's $InitIDT phase; the handler prints
+    // "[int3 ok]" and `iretq`s, and "[idt] survived int3" proves we returned.
     serial::write_str("[idt] firing int3: ");
     interrupts::test_breakpoint();
     serial::writeln("\n[idt] survived int3");
@@ -216,13 +215,10 @@ unsafe extern "C" fn kmain() -> ! {
         }
     }
 
-    // B1 Step 3b: remap the PIC, start the PIT at 100 Hz, enable
-    // interrupts, and wait for ~20 timer ticks. Reaching the "elapsed"
-    // line proves IRQ0 is firing (otherwise the hlt loop blocks forever
-    // and the smoke test times out). Disable again before the cooperative
-    // demo so the two don't interleave.
-    pic::remap();
-    pit::init(100);
+    // B1 Step 3b: the PIC was remapped + the PIT started by the boot HSM's
+    // $InitTimer phase. Enable interrupts and wait for ~20 ticks (reaching
+    // "elapsed" proves IRQ0 fires; otherwise the hlt loop blocks forever and
+    // the smoke test times out), then disable before the cooperative demo.
     interrupts::enable();
     serial::writeln("[timer] waiting for ticks...");
     let target = interrupts::ticks() + 20;

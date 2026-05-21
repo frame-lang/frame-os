@@ -104,12 +104,25 @@ pub mod vm {
     }
 }
 
-/// Host test-double for the kernel's `frames` module. The Kernel HSM's
-/// `$InitMemory` phase calls `crate::frames::init()`; on the host there's no
-/// physical frame allocator to bring up, so it's a no-op (the boot chain
-/// still runs to `$Running` in the behavioral tests).
+/// Host test-doubles for the native modules the Kernel HSM's init phases
+/// call. On the host there's no hardware to program, so each is a no-op —
+/// the boot chain still runs to `$Running` in the behavioral tests. Same
+/// "shared `.frs`, different native actions per target" pattern as `serial`
+/// and `vm`.
 pub mod frames {
     pub fn init() {}
+}
+
+pub mod interrupts {
+    pub fn init() {}
+}
+
+pub mod pic {
+    pub fn remap() {}
+}
+
+pub mod pit {
+    pub fn init(_hz: u32) {}
 }
 
 // Pull in the framec-generated systems. Each generated file ends with

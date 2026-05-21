@@ -75,6 +75,11 @@
         $InitIDT => $Booting {
             $>() {
                 serial::writeln("[boot] init IDT");
+                // Real work as of B3: install the IDT (exceptions,
+                // breakpoint, #PF, timer vector). Requires our GDT to be
+                // loaded first (kmain does that before __create), so the
+                // gate descriptors get our kernel CS.
+                crate::interrupts::init();
                 -> $InitTimer
             }
             => $^
@@ -83,6 +88,11 @@
         $InitTimer => $Booting {
             $>() {
                 serial::writeln("[boot] init timer");
+                // Real work: remap the 8259 PIC off the exception vectors
+                // and start the PIT at 100 Hz. Interrupts stay masked until
+                // a later `sti`.
+                crate::pic::remap();
+                crate::pit::init(100);
                 -> $InitConsole
             }
             => $^
