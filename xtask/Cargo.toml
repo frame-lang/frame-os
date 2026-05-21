@@ -11,3 +11,6 @@ publish = false
 [dependencies]
 anyhow = { workspace = true }
 clap = { workspace = true }
+# Shared on-disk FS format (B4) — the `mkfs` subcommand formats a disk image
+# using the same layout the kernel reads.
+frame-os-shared = { path = "../shared" }

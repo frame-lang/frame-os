@@ -249,3 +249,5 @@ include!(concat!(env!("OUT_DIR"), "/process_table.rs"));
 include!(concat!(env!("OUT_DIR"), "/elf_loader.rs"));
 // BlockRequest (B4 Step 1): I/O request lifecycle. Pure (no native deps).
 include!(concat!(env!("OUT_DIR"), "/block_request.rs"));
+// Mount (B4 Step 2): filesystem mount/unmount lifecycle. Pure (no native deps).
+include!(concat!(env!("OUT_DIR"), "/mount.rs"));

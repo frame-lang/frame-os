@@ -260,6 +260,7 @@ name = "frame-os-kernel"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "frame-os-shared",
  "limine",
  "linked_list_allocator",
 ]
@@ -1037,6 +1038,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "frame-os-shared",
 ]
 
 [[package]]

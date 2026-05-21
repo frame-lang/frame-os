@@ -130,3 +130,11 @@ fn block_request_state_graph_snapshot() {
     };
     insta::assert_snapshot!("block_request_state_graph", dot);
 }
+
+#[test]
+fn mount_state_graph_snapshot() {
+    let Some(dot) = frame_to_dot("mount.frs") else {
+        return; // framec unavailable; test skipped
+    };
+    insta::assert_snapshot!("mount_state_graph", dot);
+}

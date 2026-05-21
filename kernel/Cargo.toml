@@ -35,6 +35,10 @@ limine = "0.5"
 # real mapped region instead. See src/allocator.rs.
 linked_list_allocator = "0.10"
 
+# Shared on-disk FS format (B4) — the byte layout, used by both the kernel
+# driver and the host `mkfs` tool so it's defined exactly once. no_std.
+frame-os-shared = { path = "../shared" }
+
 [build-dependencies]
 # build.rs invokes framec on frame/kernel.frs and uses anyhow for error
 # context, mirroring the shell crate's build script.

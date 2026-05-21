@@ -44,6 +44,7 @@ These run inside the bare-metal kernel image. They do not appear in the hosted-m
 | [`ProcessTable`](process_table.md) | B3 | Documented | Manager holding `Vec<Process>`; forwards lifecycle by pid. `$HasCapacity ⇄ $Full` under `$Managing`. The B3 instance of the manager+instances pattern. |
 | [`ElfLoader`](elf_loader.md) | B3 | Documented | Loads a static ELF into a process address space. `$ReadingHeader → $ValidatingHeader → $MappingSegments → $BuildingStack → $Done`, any phase → `$Failed` (rolls back partial mappings). Flat phase pipeline; the `$Failed`-funnel showcase. |
 | [`BlockRequest`](block_request.md) | B4 | Documented | One block-I/O request's lifecycle: `$Queued → $InFlight → $Complete \| $Error`. Driven by the virtio-blk completion via the post/drain deferred-event pattern (first async-interrupt → Frame boundary). |
+| [`Mount`](mount.md) | B4 | Documented | A filesystem's mount/unmount lifecycle: `$Unmounted → $Mounting → $Mounted → $Unmounting`. Gates FS reads on `is_mounted()`. |
 
 ## Shared systems
 

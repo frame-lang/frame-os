@@ -32,6 +32,7 @@ mod context;
 mod elf;
 mod frame_systems;
 mod frames;
+mod fs;
 mod gdt;
 mod interrupts;
 mod io;
@@ -245,6 +246,10 @@ unsafe extern "C" fn kmain() -> ! {
     // B4 Step 1: init virtio-blk and round-trip a sector (write → IRQ → post →
     // drain → BlockRequest), exercising the deferred-event path.
     virtio_blk::run_demo();
+
+    // B4 Step 2: mount the FS, read a baked file, and create/write/read/delete
+    // round-trip — over the buffer cache + the Mount HSM.
+    fs::run_demo();
 
     // B3 Step 1b: the user/kernel boundary. Enter ring 3 running a tiny
     // hand-crafted program that writes "AB" via syscalls and exits(42); the

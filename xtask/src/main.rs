@@ -162,6 +162,7 @@ const DIAGRAMS: &[(&str, &str)] = &[
     ("process_table.frs", "process_table.svg"),
     ("elf_loader.frs", "elf_loader.svg"),
     ("block_request.frs", "block_request.svg"),
+    ("mount.frs", "mount.svg"),
 ];
 
 fn diagrams(mode: DiagramMode) -> Result<()> {
@@ -301,7 +302,7 @@ struct QemuArtifacts {
     qemu_dir: PathBuf,
 }
 
-const BLK_DISK_BYTES: u64 = 1024 * 1024; // 1 MiB virtio-blk disk
+const BLK_DISK_BLOCKS: u32 = 2048; // 1 MiB / 512
 
 fn prepare_qemu_artifacts(workspace: &Path) -> Result<QemuArtifacts> {
     let kernel_elf = build_kernel(workspace)?;
@@ -312,12 +313,12 @@ fn prepare_qemu_artifacts(workspace: &Path) -> Result<QemuArtifacts> {
     let qemu_dir = workspace.join("target").join("qemu");
     std::fs::create_dir_all(&qemu_dir)?;
 
-    // A blank 1 MiB raw disk template for the virtio-blk device.
+    // An mkfs'd virtio-blk disk template (B4): formatted with the Frame OS FS
+    // and pre-populated with a couple of files. Each invocation copies it.
     let blk_template = qemu_dir.join("blk-template.img");
-    let f = std::fs::File::create(&blk_template)
-        .with_context(|| format!("failed to create {}", blk_template.display()))?;
-    f.set_len(BLK_DISK_BYTES)
-        .with_context(|| format!("failed to size {}", blk_template.display()))?;
+    let image = build_fs_image(BLK_DISK_BLOCKS, FS_FILES);
+    std::fs::write(&blk_template, &image)
+        .with_context(|| format!("failed to write {}", blk_template.display()))?;
 
     Ok(QemuArtifacts {
         esp_img,
@@ -326,6 +327,78 @@ fn prepare_qemu_artifacts(workspace: &Path) -> Result<QemuArtifacts> {
         blk_template,
         qemu_dir,
     })
+}
+
+/// Files baked into the FS image by `mkfs` (name, contents).
+const FS_FILES: &[(&str, &[u8])] = &[
+    ("motd", b"Frame OS B4 filesystem online.\n"),
+    ("readme", b"hello from the disk\n"),
+];
+
+/// `mkfs`: build a Frame OS FS disk image (`total_blocks` × 512 bytes) and bake
+/// in `files`. Mirrors the on-disk layout the kernel reads (shared::fs).
+fn build_fs_image(total_blocks: u32, files: &[(&str, &[u8])]) -> Vec<u8> {
+    use frame_os_shared::fs;
+    let mut disk = vec![0u8; total_blocks as usize * fs::BLOCK_SIZE];
+
+    // Byte range of block `b` within the image.
+    let blk = |b: u32| {
+        let s = b as usize * fs::BLOCK_SIZE;
+        s..s + fs::BLOCK_SIZE
+    };
+    // Mark a block used in the free-block bitmap (block 1).
+    fn set_used(disk: &mut [u8], b: u32) {
+        let byte = fs::BITMAP_BLOCK as usize * fs::BLOCK_SIZE + (b as usize / 8);
+        disk[byte] |= 1 << (b % 8);
+    }
+
+    // Metadata blocks (superblock, bitmap, inode table) are always used.
+    for b in 0..fs::DATA_START {
+        set_used(&mut disk, b);
+    }
+
+    // Root directory: inode 1, one data block of dirents.
+    let root_data = fs::DATA_START;
+    set_used(&mut disk, root_data);
+    let mut root = fs::Inode::empty();
+    root.kind = fs::T_DIR;
+    root.nlink = 1;
+    root.direct[0] = root_data;
+    let mut next_data = fs::DATA_START + 1;
+    let mut dirent_off = 0usize;
+
+    for (ino, (name, data)) in (2u32..).zip(files) {
+        let mut node = fs::Inode::empty();
+        node.kind = fs::T_FILE;
+        node.nlink = 1;
+        node.size = data.len() as u32;
+        let nb = data.len().div_ceil(fs::BLOCK_SIZE);
+        for (i, item) in node.direct.iter_mut().enumerate().take(nb) {
+            let b = next_data;
+            next_data += 1;
+            set_used(&mut disk, b);
+            *item = b;
+            let lo = i * fs::BLOCK_SIZE;
+            let hi = ((i + 1) * fs::BLOCK_SIZE).min(data.len());
+            let r = blk(b);
+            disk[r.start..r.start + (hi - lo)].copy_from_slice(&data[lo..hi]);
+        }
+        let (iblk, ioff) = fs::inode_loc(ino);
+        node.write(&mut disk[blk(iblk)], ioff);
+        fs::write_dirent(&mut disk[blk(root_data)], dirent_off, name.as_bytes(), ino);
+        dirent_off += fs::DIRENT_SIZE;
+    }
+    root.size = dirent_off as u32;
+
+    let (rblk, roff) = fs::inode_loc(fs::ROOT_INODE);
+    root.write(&mut disk[blk(rblk)], roff);
+
+    let sb = fs::Superblock {
+        magic: fs::MAGIC,
+        total_blocks,
+    };
+    sb.write(&mut disk[0..fs::BLOCK_SIZE]);
+    disk
 }
 
 /// Produce a fresh copy of the virtio-blk disk for one QEMU invocation.
@@ -729,6 +802,39 @@ const SMOKE_TESTS: &[SmokeTest] = &[
         expect_absent: &["KERNEL EXCEPTION", "KERNEL PANIC", "triple fault"],
         timeout_secs: 20,
     },
+    SmokeTest {
+        // B4 Step 2: the on-disk filesystem over the buffer cache + the Mount
+        // HSM. The disk is mkfs'd by the host (xtask build_fs_image) with a
+        // `motd` file; the kernel mounts it, reads `motd` back (proving the
+        // on-disk format round-trips host-write → kernel-read), then runs a
+        // create → write → read → delete cycle (proving the write + bitmap +
+        // inode paths).
+        name: "fs_file_roundtrip_b4",
+        expect_contains: &[
+            "[fs] mounted",
+            "[fs] /motd: Frame OS B4 filesystem online.",
+            "[fs] create/write/read round-trip: ok",
+            "[fs] delete: ok",
+        ],
+        expect_absent: &["KERNEL EXCEPTION", "KERNEL PANIC", "triple fault"],
+        timeout_secs: 20,
+    },
+    SmokeTest {
+        // B4 Step 2: the FS persists across a reboot of the same disk image.
+        // The harness boots TWICE on one disk: boot 1 creates a `persist`
+        // marker file (kernel write), boot 2 reads it back. We check boot 2's
+        // capture — "persistence verified across reboot" only prints when a
+        // prior boot's write survived. (See `run_smoke_test`'s reboot path.)
+        name: "fs_persists_across_reboot_b4",
+        expect_contains: &["[fs] mounted", "[fs] persistence verified across reboot"],
+        expect_absent: &[
+            "KERNEL EXCEPTION",
+            "KERNEL PANIC",
+            "triple fault",
+            "marker CORRUPT",
+        ],
+        timeout_secs: 20,
+    },
 ];
 
 fn run_qemu_test() -> Result<()> {
@@ -753,7 +859,9 @@ fn run_qemu_test() -> Result<()> {
             })?;
         }
 
-        match run_smoke_test(test, &artifacts, &serial_path) {
+        // Reboot-persistence tests boot twice on one disk (B4-4).
+        let reboot = test.name.contains("persists_across_reboot");
+        match run_smoke_test(test, &artifacts, &serial_path, reboot) {
             Ok(()) => eprintln!("  PASS"),
             Err(err) => {
                 eprintln!("  FAIL: {err}");
@@ -775,14 +883,17 @@ fn run_qemu_test() -> Result<()> {
     }
 }
 
-fn run_smoke_test(test: &SmokeTest, artifacts: &QemuArtifacts, serial_path: &Path) -> Result<()> {
-    // Spawn QEMU with serial routed to a file so we can read it after
-    // the timeout. `-display none` (set in qemu_base_command) keeps it
-    // headless. We discard QEMU's own stdout/stderr — the interesting
-    // stream is the captured serial output.
-    let ovmf_vars = fresh_ovmf_vars(artifacts, test.name)?;
-    let blk_disk = fresh_blk_disk(artifacts, test.name)?;
-    let mut cmd = qemu_base_command(artifacts, &ovmf_vars, &blk_disk);
+/// Boot the kernel once in QEMU on a given disk + NVRAM, routing serial to
+/// `serial_path`. Returns when QEMU exits (clean isa-debug-exit) or the
+/// timeout forces a kill. `-display none` is set in `qemu_base_command`.
+fn run_qemu_once(
+    artifacts: &QemuArtifacts,
+    ovmf_vars: &Path,
+    blk_disk: &Path,
+    serial_path: &Path,
+    timeout_secs: u64,
+) -> Result<()> {
+    let mut cmd = qemu_base_command(artifacts, ovmf_vars, blk_disk);
     cmd.args(["-serial"])
         .arg(format!("file:{}", serial_path.display()))
         .stdout(Stdio::null())
@@ -798,19 +909,14 @@ fn run_smoke_test(test: &SmokeTest, artifacts: &QemuArtifacts, serial_path: &Pat
     // failure here: the isa-debug-exit code is non-zero by construction,
     // and a triple-fault that reboots into firmware would also exit
     // non-zero. Either way the verdict comes from the captured serial
-    // output below — a clean halt produces the full marker sequence; a
-    // crash produces a truncated capture that fails the substring check
-    // (and prints the partial capture for diagnosis).
-    let deadline = Instant::now() + Duration::from_secs(test.timeout_secs);
+    // output — a clean halt produces the full marker sequence; a crash
+    // produces a truncated capture that fails the substring check.
+    let deadline = Instant::now() + Duration::from_secs(timeout_secs);
     loop {
         match child.try_wait().context("failed to poll qemu process")? {
             Some(_status) => break,
             None => {
                 if Instant::now() >= deadline {
-                    // Force-kill QEMU. SIGKILL guarantees exit even if
-                    // QEMU's monitor is wedged; we don't need a clean
-                    // shutdown because we already captured serial to
-                    // file synchronously as the kernel wrote it.
                     let _ = child.kill();
                     let _ = child.wait();
                     break;
@@ -819,6 +925,33 @@ fn run_smoke_test(test: &SmokeTest, artifacts: &QemuArtifacts, serial_path: &Pat
             }
         }
     }
+    Ok(())
+}
+
+fn run_smoke_test(
+    test: &SmokeTest,
+    artifacts: &QemuArtifacts,
+    serial_path: &Path,
+    reboot: bool,
+) -> Result<()> {
+    // One fresh disk for the test. A `reboot` test boots TWICE on the *same*
+    // disk (so the first boot's writes persist into the second) with fresh
+    // NVRAM each boot; the second boot's capture is the one we check.
+    let blk_disk = fresh_blk_disk(artifacts, test.name)?;
+    if reboot {
+        let ovmf1 = fresh_ovmf_vars(artifacts, &format!("{}-boot1", test.name))?;
+        let boot1_log = serial_path.with_extension("boot1.log");
+        let _ = std::fs::remove_file(&boot1_log);
+        run_qemu_once(artifacts, &ovmf1, &blk_disk, &boot1_log, test.timeout_secs)?;
+    }
+    let ovmf_vars = fresh_ovmf_vars(artifacts, test.name)?;
+    run_qemu_once(
+        artifacts,
+        &ovmf_vars,
+        &blk_disk,
+        serial_path,
+        test.timeout_secs,
+    )?;
 
     // Read the captured serial output.
     let mut captured = String::new();

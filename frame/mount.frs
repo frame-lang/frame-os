@@ -1,0 +1,58 @@
+// frame/mount.frs
+//
+// Mount — a filesystem's mount/unmount lifecycle (B4 Step 2). A small linear
+// state machine that makes the legal mount sequence structural: you can't read
+// the FS until it's $Mounted, and the mount can fail back to $Unmounted.
+//
+// State graph:
+//
+//   $Unmounted ── begin_mount ──► $Mounting ── mounted_ok ──► $Mounted
+//        ▲                            │                          │
+//        │                            └── mount_failed ──────────┘ (back to $Unmounted)
+//        │                                                       │ begin_unmount
+//        └────────────── unmounted ◄── $Unmounting ◄─────────────┘
+//
+// Pure lifecycle bookkeeping — no native actions. The kernel's fs::run_demo
+// drives it: begin_mount, then validate the superblock and either mounted_ok
+// or mount_failed; reads happen only while is_mounted().
+
+@@[target("rust")]
+
+@@system Mount {
+    interface:
+        begin_mount()
+        mounted_ok()
+        mount_failed()
+        begin_unmount()
+        unmounted()
+        is_mounted(): bool = false
+
+    machine:
+        $Unmounted {
+            begin_mount() {
+                -> $Mounting
+            }
+        }
+
+        $Mounting {
+            mounted_ok() {
+                -> $Mounted
+            }
+            mount_failed() {
+                -> $Unmounted
+            }
+        }
+
+        $Mounted {
+            begin_unmount() {
+                -> $Unmounting
+            }
+            is_mounted(): bool { @@:(true) }
+        }
+
+        $Unmounting {
+            unmounted() {
+                -> $Unmounted
+            }
+        }
+}

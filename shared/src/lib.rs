@@ -13,3 +13,7 @@
 // rustc happy when the workspace builds.
 
 #![no_std]
+
+/// On-disk filesystem format (B4), shared by the kernel driver and the host
+/// `mkfs` tool so the byte layout is defined exactly once.
+pub mod fs;

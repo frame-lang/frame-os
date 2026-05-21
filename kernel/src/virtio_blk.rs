@@ -324,16 +324,20 @@ pub fn run_demo() {
     if !init() {
         return;
     }
+    // Use a high sector well clear of the filesystem's metadata + likely data
+    // (the FS lives near the start of the disk); a raw write here can't corrupt
+    // it, and the FS zeroes any block it later allocates.
+    const SCRATCH_SECTOR: u64 = 1000;
     let mut wbuf = [0u8; SECTOR_SIZE];
     for (i, b) in wbuf.iter_mut().enumerate() {
         *b = (i as u8) ^ 0xA5;
     }
-    if !write_sector(2, &wbuf) {
+    if !write_sector(SCRATCH_SECTOR, &wbuf) {
         serial::writeln("[blk] write failed");
         return;
     }
     let mut rbuf = [0u8; SECTOR_SIZE];
-    if !read_sector(2, &mut rbuf) {
+    if !read_sector(SCRATCH_SECTOR, &mut rbuf) {
         serial::writeln("[blk] read failed");
         return;
     }

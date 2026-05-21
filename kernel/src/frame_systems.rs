@@ -57,3 +57,5 @@ include!(concat!(env!("OUT_DIR"), "/elf_loader.rs"));
 // BlockRequest (B4 Step 1): the block-I/O request lifecycle, driven by the
 // drained virtio-blk completion. Pure (no native action deps).
 include!(concat!(env!("OUT_DIR"), "/block_request.rs"));
+// Mount (B4 Step 2): the filesystem mount/unmount lifecycle. Pure.
+include!(concat!(env!("OUT_DIR"), "/mount.rs"));
