@@ -16,9 +16,16 @@
 // clears it), so they aren't preempted and the single `USER_RSP_SAVE` is safe.
 // Per-CPU GS arrives at B7 (SMP).
 //
-// Syscall ABI: rax = number, args in rdi/rsi, return in rax.
-//   0 = write_char(rdi = byte) → serial; returns 1
-//   1 = exit(rdi = code)       → mark the Process $Zombie + yield (never returns)
+// Syscall ABI: rax = number, args in rdi/rsi/rdx, return in rax.
+//   0 = write_char(rdi = byte)               → serial; returns 1
+//   1 = exit(rdi = code)                      → mark the Process $Zombie + yield
+//   2 = fork()                                → child pid (parent) / 0 (child)
+//   3 = exec(rdi = prog_id)                   → replace image (baked program)
+//   4 = wait()                                → reap a child, returns its status
+//   5 = open(rdi = path_ptr, rsi = path_len)  → fd, or u64::MAX (B4 Step 4)
+//   6 = read(rdi = fd, rsi = buf, rdx = len)  → bytes read, 0 = EOF (B4 Step 4)
+//   7 = close(rdi = fd)                       → (B4 Step 4)
+//   8 = exec(rdi = path_ptr, rsi = path_len)  → replace image from disk (B4 4)
 
 use core::arch::{asm, global_asm};
 
@@ -79,6 +86,14 @@ static USER_FORKER_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/user_f
 static USER_SPAWNER_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/user_spawner.elf"));
 // `waiter` (B3 Step 5d) forks a child and wait()s to reap it.
 static USER_WAITER_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/user_waiter.elf"));
+// `shell` (B4 Step 4) cats `/motd` then execs `/bin/hello` from disk by path.
+static USER_SHELL_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/user_shell.elf"));
+
+// Scratch buffer for `exec`-from-disk: the ELF is read off the filesystem into
+// this static, then handed to the loader as a `'static` slice. Single-flight
+// (IF=0 in syscalls, one process exec'ing at a time), so one buffer is safe.
+// 64 KiB comfortably holds the freestanding user programs.
+static mut ELF_BUF: [u8; 64 * 1024] = [0u8; 64 * 1024];
 
 global_asm!(
     // syscall entry: rcx=user RIP, r11=user RFLAGS, rax=num, rdi/rsi=args.
@@ -251,9 +266,26 @@ fn proc_table() -> &'static mut ProcessTable {
 }
 
 /// Validation predicate, called by the dispatcher's `$Validating` state.
-/// 0 = write_char, 1 = exit, 2 = fork, 3 = exec(prog_id), 4 = wait.
+/// 0=write_char 1=exit 2=fork 3=exec(prog_id) 4=wait 5=open 6=read 7=close
+/// 8=exec(path). (B4 Step 4 added the file-I/O + exec-from-disk syscalls.)
 pub fn is_known_syscall(num: u64) -> bool {
-    num <= 4
+    num <= 8
+}
+
+/// The third syscall argument (rdx), read from the current trap frame. The
+/// SyscallDispatcher only carries num/a0/a1; 3-arg syscalls (`read`) read the
+/// extra arg here, the same way `fork`/`exec` read the frame directly.
+fn arg2() -> u64 {
+    unsafe { (*(&raw const CURRENT_TRAP_FRAME).read()).rdx }
+}
+
+/// Copy up to `out.len()` bytes from a user pointer into `out`, returning the
+/// count. Safe because a syscall runs in the caller's address space (CR3
+/// unchanged), so user VAs are mapped.
+unsafe fn copy_from_user(ptr: u64, len: usize, out: &mut [u8]) -> usize {
+    let n = len.min(out.len());
+    core::ptr::copy_nonoverlapping(ptr as *const u8, out.as_mut_ptr(), n);
+    n
 }
 
 /// Perform a (validated) syscall, called by the dispatcher's `$Executing`
@@ -284,6 +316,28 @@ pub fn perform_syscall(num: u64, a0: u64, _a1: u64) -> u64 {
             }
             0
         }
+        5 => {
+            // open(path_ptr=a0, path_len=a1) → fd, or u64::MAX on failure.
+            let mut path = [0u8; 256];
+            let n = unsafe { copy_from_user(a0, _a1 as usize, &mut path) };
+            match crate::vfs::open_read(&path[..n]) {
+                Some(fd) => fd as u64,
+                None => u64::MAX,
+            }
+        }
+        6 => {
+            // read(fd=a0, buf_ptr=a1, len=rdx) → bytes read. The buffer is a
+            // user VA, mapped in the current address space (CR3 unchanged
+            // during a syscall), so we write into it directly.
+            let len = arg2() as usize;
+            let buf = unsafe { core::slice::from_raw_parts_mut(_a1 as *mut u8, len) };
+            crate::vfs::read(a0 as usize, buf) as u64
+        }
+        7 => {
+            crate::vfs::close(a0 as usize);
+            0
+        }
+        8 => do_exec_path(a0, _a1),
         _ => u64::MAX, // unreachable: validated by is_known_syscall
     }
 }
@@ -328,15 +382,63 @@ fn exec_elf(prog_id: u64) -> Option<&'static [u8]> {
     }
 }
 
-/// `exec`: replace the calling process's image with a freshly loaded program.
-/// The process keeps its pid + kernel stack; its address space + trap frame are
-/// replaced so the syscall returns into the new program at its entry. On an
-/// unknown program id, returns u64::MAX and the caller keeps running.
+/// `exec(prog_id)`: replace the calling process's image with a baked program
+/// selected by id (B3, no filesystem). Returns u64::MAX on an unknown id (the
+/// caller keeps running); otherwise never "returns" to the old image — the
+/// syscall resumes into the new program. See `exec_image`.
 fn do_exec(prog_id: u64) -> u64 {
     let Some(elf) = exec_elf(prog_id) else {
         return u64::MAX;
     };
-    // Load the new program into a fresh address space.
+    serial::write_str("[exec] pid ");
+    serial::write_u32_decimal(sched::current_pid());
+    serial::write_str(" exec'd program ");
+    serial::write_u32_decimal(prog_id as u32);
+    serial::writeln("");
+    exec_image(elf)
+}
+
+/// `exec(path)`: replace the calling process's image with a program loaded from
+/// the filesystem by path (B4 Step 4). Reads the ELF into `ELF_BUF`, then hands
+/// it to the shared `exec_image`. Returns u64::MAX if the path doesn't resolve
+/// to a regular file or the image doesn't fit `ELF_BUF` (the caller keeps
+/// running and sees the failure).
+fn do_exec_path(path_ptr: u64, path_len: u64) -> u64 {
+    let mut path = [0u8; 256];
+    let n = unsafe { copy_from_user(path_ptr, path_len as usize, &mut path) };
+    let Some(ino) = crate::fs::namei(&path[..n]) else {
+        return u64::MAX;
+    };
+    if !crate::fs::is_file(ino) {
+        return u64::MAX;
+    }
+    // Read the whole file into the scratch buffer; reborrow it as 'static for
+    // the loader (single-flight: only one exec is in flight at a time).
+    let elf: &'static [u8] = unsafe {
+        let buf = &raw mut ELF_BUF;
+        let len = crate::fs::read_file(ino, &mut *buf);
+        let full: &'static [u8] = &*buf; // explicit deref+borrow (no implicit autoref)
+        &full[..len]
+    };
+
+    serial::write_str("[exec] pid ");
+    serial::write_u32_decimal(sched::current_pid());
+    serial::write_str(" exec'd ");
+    for &c in &path[..n] {
+        serial::write_byte(c);
+    }
+    serial::write_str(" from disk (");
+    serial::write_u32_decimal(elf.len() as u32);
+    serial::writeln(" bytes)");
+    exec_image(elf)
+}
+
+/// Replace the current process's image with `elf`: load it into a fresh address
+/// space, swap the process onto it, and reset its trap frame to enter the new
+/// program (zeroed GPRs, new RIP/RSP). The process keeps its pid + kernel stack.
+/// The syscall stub's `iretq` then resumes into the new program; `rax` is set to
+/// 0 by `syscall_dispatch`. Returns u64::MAX if the ELF fails to load.
+fn exec_image(elf: &'static [u8]) -> u64 {
     let new_pml4 = unsafe { paging::new_address_space() };
     crate::elf::prepare(elf, new_pml4);
     let mut loader = ElfLoader::__create();
@@ -346,15 +448,6 @@ fn do_exec(prog_id: u64) -> u64 {
     let entry = loader.entry();
     let user_rsp = loader.user_stack_top();
 
-    serial::write_str("[exec] pid ");
-    serial::write_u32_decimal(sched::current_pid());
-    serial::write_str(" exec'd program ");
-    serial::write_u32_decimal(prog_id as u32);
-    serial::writeln("");
-
-    // Swap the current process onto the new address space, then reset its trap
-    // frame to enter the new program fresh (zeroed GPRs, new RIP/RSP). The
-    // syscall stub's iretq returns into it. rax is set to 0 by syscall_dispatch.
     unsafe {
         sched::exec_into(new_pml4);
         let f = &mut *(&raw const CURRENT_TRAP_FRAME).read();
@@ -508,4 +601,10 @@ pub fn run() {
     run_one(USER_FORKER_ELF, "forker");
     run_one(USER_SPAWNER_ELF, "spawner");
     run_one(USER_WAITER_ELF, "waiter");
+
+    // B4 Step 4: a scripted shell that uses the file-I/O syscalls (open/read/
+    // close) to `cat /motd`, then `exec`s `/bin/hello` *from disk by path* —
+    // the new image replaces the shell and runs to its own exit(42). Requires
+    // the FS to be mounted (kmain runs fs::run_demo before usermode::run).
+    run_one(USER_SHELL_ELF, "shell");
 }

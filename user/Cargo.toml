@@ -37,6 +37,11 @@ path = "src/spawner.rs"
 name = "waiter"
 path = "src/waiter.rs"
 
+# Scripted shell: cat /motd + exec /bin/hello from disk (B4 Step 4).
+[[bin]]
+name = "shell"
+path = "src/shell.rs"
+
 [profile.dev]
 panic = "abort"
 opt-level = 1

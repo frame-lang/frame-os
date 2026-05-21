@@ -315,9 +315,14 @@ fn prepare_qemu_artifacts(workspace: &Path) -> Result<QemuArtifacts> {
     std::fs::create_dir_all(&qemu_dir)?;
 
     // An mkfs'd virtio-blk disk template (B4): formatted with the Frame OS FS
-    // and pre-populated with a couple of files. Each invocation copies it.
+    // and pre-populated with a couple of files plus a real ELF at /bin/hello,
+    // which the userspace shell `exec`s from disk (B4 Step 4). Each invocation
+    // copies the template.
     let blk_template = qemu_dir.join("blk-template.img");
-    let image = build_fs_image(BLK_DISK_BLOCKS, FS_FILES);
+    let hello_elf = build_user_disk_elf(workspace)?;
+    let mut files: Vec<(&str, &[u8])> = FS_FILES.to_vec();
+    files.push(("/bin/hello", &hello_elf));
+    let image = build_fs_image(BLK_DISK_BLOCKS, &files);
     std::fs::write(&blk_template, &image)
         .with_context(|| format!("failed to write {}", blk_template.display()))?;
 
@@ -438,6 +443,37 @@ fn build_fs_image(total_blocks: u32, files: &[(&str, &[u8])]) -> Vec<u8> {
     };
     sb.write(&mut disk[0..fs::BLOCK_SIZE]);
     disk
+}
+
+/// Build the freestanding `hello` user program and return its ELF bytes, for
+/// baking onto the FS image at `/bin/hello` (which the shell `exec`s from
+/// disk). Mirrors the kernel build.rs nested-cargo invocation: own target dir,
+/// scrubbed RUSTFLAGS + rustc wrapper so the outer build's link args / clippy
+/// can't leak into the user link.
+fn build_user_disk_elf(workspace: &Path) -> Result<Vec<u8>> {
+    let user_dir = workspace.join("user");
+    let user_target = workspace.join("target").join("user-disk-elf");
+
+    let status = Command::new(std::env::var("CARGO").unwrap_or_else(|_| "cargo".into()))
+        .current_dir(&user_dir)
+        .env("CARGO_TARGET_DIR", &user_target)
+        .env_remove("RUSTFLAGS")
+        .env_remove("CARGO_ENCODED_RUSTFLAGS")
+        .env_remove("CARGO_BUILD_RUSTFLAGS")
+        .env_remove("RUSTC_WORKSPACE_WRAPPER")
+        .env_remove("RUSTC_WRAPPER")
+        .args(["build", "--release", "--bin", "hello"])
+        .status()
+        .with_context(|| format!("failed to invoke cargo for user crate at {}", user_dir.display()))?;
+    if !status.success() {
+        bail!("user `hello` build failed");
+    }
+
+    let elf = user_target
+        .join("x86_64-unknown-none")
+        .join("release")
+        .join("hello");
+    std::fs::read(&elf).with_context(|| format!("failed to read user ELF {}", elf.display()))
 }
 
 /// Produce a fresh copy of the virtio-blk disk for one QEMU invocation.
@@ -886,6 +922,32 @@ const SMOKE_TESTS: &[SmokeTest] = &[
             "[vfs] read after close returns 0: ok",
         ],
         expect_absent: &["KERNEL EXCEPTION", "KERNEL PANIC", "triple fault"],
+        timeout_secs: 20,
+    },
+    SmokeTest {
+        // B4 Step 4: the userspace shell. A ring-3 program uses the file-I/O
+        // syscalls to `cat /motd`, then `exec`s `/bin/hello` *from disk by
+        // path* — the on-disk ELF replaces the shell's image and runs to its
+        // own exit(42). Asserting the shell's cat output, the exec line, and
+        // hello's output + exit code (in order) proves open/read/close and
+        // exec-from-disk all work end to end.
+        name: "userspace_shell_runs_program_from_disk_b4",
+        expect_contains: &[
+            "[shell] cat /motd:",
+            "Frame OS B4 filesystem online.",
+            "[shell] exec /bin/hello:",
+            "[exec] pid",
+            "from disk",
+            "hello from ELF",
+            "[user] exited with code 42",
+        ],
+        expect_absent: &[
+            "KERNEL EXCEPTION",
+            "KERNEL PANIC",
+            "triple fault",
+            "[shell] open /motd failed",
+            "[shell] exec /bin/hello failed",
+        ],
         timeout_secs: 20,
     },
 ];
