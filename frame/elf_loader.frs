@@ -1,0 +1,103 @@
+// frame/elf_loader.frs
+//
+// ElfLoader — load a static ELF executable into a process address space, as a
+// sequential phase machine with a single failure sink (B3 Step 4). The B3
+// showcase of the "$Failed funnel": every phase can fail for its own reason,
+// and they all route to one `$Failed` state that rolls back the partial work —
+// no `Result<>` ladder threaded through the load sequence.
+//
+// State graph (a straight pipeline; any phase can drop to the $Failed sink):
+//
+//   $ReadingHeader → $ValidatingHeader → $MappingSegments → $BuildingStack → $Done
+//        │                  │                  │                 │
+//        └──────────────────┴───── on failure ─┴─────────────────┘
+//                                   ▼
+//                              $Failed  ($>: crate::elf::cleanup — unmap + free)
+//
+// The phases cascade from construction (each `$>` does its work and transitions
+// to the next), the same way the Kernel boot HSM drives its init chain at
+// __create(). After construction the loader rests in $Done or $Failed; the
+// caller reads is_done()/is_failed() + entry()/user_stack_top().
+//
+// This is a flat FSM, not an HSM: there is no shared *handler* to centralize on
+// a parent (the failure detection differs per phase; the shared work is the
+// cleanup, which lives in $Failed.$>). The funnel is "many phases → one sink,"
+// not `=> $^` forwarding — Process/SyscallDispatcher already demonstrate that,
+// and adding a parent here would be ceremony.
+//
+// crate::elf owns the bytes + mapping mechanics (read_header / validate_header
+// / map_segments / build_stack / cleanup / entry_va / stack_top); ElfLoader
+// owns the phase order + the failure routing.
+
+@@[target("rust")]
+
+@@system ElfLoader {
+    interface:
+        // Queries — valid once the load has settled (is_done or is_failed).
+        entry(): u64 = crate::elf::entry_va()
+        user_stack_top(): u64 = crate::elf::stack_top()
+        is_done(): bool = false
+        is_failed(): bool = false
+        error(): String = self.err.clone()
+
+    machine:
+        $ReadingHeader {
+            $>() {
+                if crate::elf::read_header() {
+                    -> $ValidatingHeader
+                } else {
+                    self.err = "truncated ELF header".to_string();
+                    -> $Failed
+                }
+            }
+        }
+
+        $ValidatingHeader {
+            $>() {
+                if crate::elf::validate_header() {
+                    -> $MappingSegments
+                } else {
+                    self.err = "not a valid x86-64 executable".to_string();
+                    -> $Failed
+                }
+            }
+        }
+
+        $MappingSegments {
+            $>() {
+                if crate::elf::map_segments() {
+                    -> $BuildingStack
+                } else {
+                    self.err = "segment mapping failed".to_string();
+                    -> $Failed
+                }
+            }
+        }
+
+        $BuildingStack {
+            $>() {
+                if crate::elf::build_stack() {
+                    -> $Done
+                } else {
+                    self.err = "user stack setup failed".to_string();
+                    -> $Failed
+                }
+            }
+        }
+
+        $Done {
+            is_done(): bool { @@:(true) }
+        }
+
+        // The single failure sink. Rolls back whatever was mapped before the
+        // failure (partial segments + a stack if we got that far).
+        $Failed {
+            $>() {
+                crate::elf::cleanup();
+            }
+            is_failed(): bool { @@:(true) }
+        }
+
+    domain:
+        err: String = String::new()
+}

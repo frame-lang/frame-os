@@ -7,6 +7,12 @@ members = [
     "shared",
     "xtask",
 ]
+# The freestanding user program is its own bare-metal package with a custom
+# linker script; the kernel's build.rs compiles it and bakes the ELF in. It is
+# excluded so workspace-wide commands don't try to build it for the host target.
+exclude = [
+    "user",
+]
 
 # `default-members` excludes the kernel from `cargo build` / `cargo test` at the
 # workspace root, because the kernel requires a bare-metal target

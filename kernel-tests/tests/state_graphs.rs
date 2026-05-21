@@ -114,3 +114,11 @@ fn process_table_state_graph_snapshot() {
     };
     insta::assert_snapshot!("process_table_state_graph", dot);
 }
+
+#[test]
+fn elf_loader_state_graph_snapshot() {
+    let Some(dot) = frame_to_dot("elf_loader.frs") else {
+        return; // framec unavailable; test skipped
+    };
+    insta::assert_snapshot!("elf_loader_state_graph", dot);
+}

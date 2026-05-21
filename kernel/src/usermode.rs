@@ -16,8 +16,8 @@
 
 use core::arch::{asm, global_asm};
 
-use crate::frame_systems::{ProcessTable, SyscallDispatcher};
-use crate::{frames, paging, serial};
+use crate::frame_systems::{ElfLoader, ProcessTable, SyscallDispatcher};
+use crate::{paging, serial};
 
 // The syscall dispatcher HSM (B3 Step 2). Driven synchronously from the
 // syscall entry; single instance, single-core.
@@ -53,21 +53,11 @@ static mut KERNEL_LONGJMP_RSP: u64 = 0;
 const SYSCALL_STACK_SIZE: usize = 16 * 1024;
 static mut SYSCALL_STACK: [u8; SYSCALL_STACK_SIZE] = [0; SYSCALL_STACK_SIZE];
 
-// Hand-assembled ring-3 program: write 'A', write 'B', exit(42).
-//   mov rax,0; mov rdi,'A'; syscall;  mov rax,0; mov rdi,'B'; syscall;
-//   mov rax,1; mov rdi,42; syscall
-#[rustfmt::skip]
-static USER_BLOB: [u8; 48] = [
-    0x48, 0xC7, 0xC0, 0x00, 0x00, 0x00, 0x00, // mov rax, 0 (write_char)
-    0x48, 0xC7, 0xC7, 0x41, 0x00, 0x00, 0x00, // mov rdi, 0x41 'A'
-    0x0F, 0x05,                               // syscall
-    0x48, 0xC7, 0xC0, 0x00, 0x00, 0x00, 0x00, // mov rax, 0
-    0x48, 0xC7, 0xC7, 0x42, 0x00, 0x00, 0x00, // mov rdi, 0x42 'B'
-    0x0F, 0x05,                               // syscall
-    0x48, 0xC7, 0xC0, 0x01, 0x00, 0x00, 0x00, // mov rax, 1 (exit)
-    0x48, 0xC7, 0xC7, 0x2A, 0x00, 0x00, 0x00, // mov rdi, 42
-    0x0F, 0x05,                               // syscall
-];
+// The freestanding user program (B3 Step 4), built by kernel/build.rs from the
+// `user/` crate and baked into the kernel image. A real ELF — the `ElfLoader`
+// HSM parses + maps it, replacing the hand-assembled blob the Step-1b demo
+// used. It prints "hello from ELF" via write_char syscalls and exit(42)s.
+static USER_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/user_hello.elf"));
 
 global_asm!(
     // syscall entry: rcx=user RIP, r11=user RFLAGS, rax=num, rdi/rsi=args.
@@ -77,12 +67,30 @@ global_asm!(
     "syscall_entry:",
     "  mov [rip + USER_RSP_SAVE], rsp",
     "  mov rsp, [rip + KERNEL_SYSCALL_RSP]",
-    "  push rcx",     // user RIP (sysret needs it)
-    "  push r11",     // user RFLAGS
-    "  mov rdx, rsi", // arg1
-    "  mov rsi, rdi", // arg0
-    "  mov rdi, rax", // syscall number
-    "  call syscall_dispatch",
+    // Preserve the user's registers across the kernel call. Per the syscall
+    // ABI only rax (return) and rcx/r11 (clobbered by `syscall` itself) may
+    // change; everything else must come back intact. `call syscall_dispatch`
+    // is a SysV C call that preserves rbx/rbp/r12-r15 but clobbers the
+    // caller-saved set, so we save rcx/r11 (also needed for sysretq) plus the
+    // caller-saved GPRs the user may have live across the syscall.
+    "  push rcx", // user RIP (sysret needs it in rcx)
+    "  push r11", // user RFLAGS (sysret needs it in r11)
+    "  push rdi",
+    "  push rsi",
+    "  push rdx",
+    "  push r8",
+    "  push r9",
+    "  push r10",
+    "  mov rdx, rsi",          // arg1  → SysV 3rd
+    "  mov rsi, rdi",          // arg0  → SysV 2nd
+    "  mov rdi, rax",          // number → SysV 1st
+    "  call syscall_dispatch", // result in rax
+    "  pop r10",
+    "  pop r9",
+    "  pop r8",
+    "  pop rdx",
+    "  pop rsi",
+    "  pop rdi",
     "  pop r11",
     "  pop rcx",
     "  mov rsp, [rip + USER_RSP_SAVE]",
@@ -214,10 +222,27 @@ pub fn perform_syscall(num: u64, a0: u64, _a1: u64) -> u64 {
     }
 }
 
-/// Run the Step 1b demo: set up syscall MSRs, map a user code page (the
-/// blob) + a user stack, enter ring 3, and return here when the user exits.
+/// Run the user-mode demo: set up syscall MSRs, load the baked ELF via the
+/// `ElfLoader` HSM, admit it as a `Process`, enter ring 3, and return here when
+/// the user exits — then reap the process and free the ELF's pages.
 pub fn run() {
     init();
+
+    // Load the baked user ELF into the current address space (the ElfLoader
+    // phases cascade from construction; it rests in $Done or $Failed).
+    let pml4 = paging::current_pml4();
+    crate::elf::prepare(USER_ELF, pml4);
+    let mut loader = ElfLoader::__create();
+    if loader.is_failed() {
+        serial::write_str("[elf] load failed: ");
+        serial::writeln(&loader.error());
+        return;
+    }
+    let entry = loader.entry();
+    let stack_top = loader.user_stack_top();
+    serial::write_str("[elf] loaded user program, entry 0x");
+    serial::write_hex_u64(entry);
+    serial::writeln("");
 
     // Stand up the process table and admit the user program as a Process.
     unsafe {
@@ -234,23 +259,9 @@ pub fn run() {
     serial::write_str(&proc_table().pid_state(pid));
     serial::writeln(")");
 
-    const CODE_VA: u64 = 0x0000_0000_1000_0000;
-    const STACK_VA: u64 = 0x0000_0000_2000_0000;
-
-    let code_frame = frames::alloc_frame().expect("frame alloc");
-    let stack_frame = frames::alloc_frame().expect("frame alloc");
-
     serial::writeln("[user] entering ring 3...");
     unsafe {
-        // Copy the blob into the code frame via the HHDM, then map it
-        // user-executable (no WRITABLE) and a user-writable stack.
-        let dst = frames::phys_to_virt(code_frame);
-        core::ptr::copy_nonoverlapping((&raw const USER_BLOB) as *const u8, dst, USER_BLOB.len());
-        let pml4 = paging::current_pml4();
-        paging::map_in(pml4, CODE_VA, code_frame, paging::USER);
-        paging::map_in(pml4, STACK_VA, stack_frame, paging::USER | paging::WRITABLE);
-
-        enter_user(CODE_VA, STACK_VA + 4096 - 16);
+        enter_user(entry, stack_top);
     }
 
     serial::writeln("[user] back in kernel after user exit");
@@ -265,6 +276,6 @@ pub fn run() {
     serial::write_u32_decimal(proc_table().count());
     serial::writeln("");
 
-    frames::free_frame(code_frame);
-    frames::free_frame(stack_frame);
+    // Free the ELF's mapped pages (segments + user stack).
+    crate::elf::cleanup();
 }

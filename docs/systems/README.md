@@ -42,7 +42,7 @@ These run inside the bare-metal kernel image. They do not appear in the hosted-m
 | [`SyscallDispatcher`](syscall_dispatcher.md) | B3 | Documented | Validate + execute a syscall, errors funneled to the `$Active` parent via `=> $^`. `$Validating → $Executing` under `$Active`. |
 | [`Process`](process.md) | B3 | Documented | Per-process lifecycle: `$Created → $Ready ⇄ $Blocked → $Zombie → $Reaped`. Successor to `Task`; `kill()` funneled to the `$Alive` parent via `=> $^`. No `$Running` (native scheduler state). |
 | [`ProcessTable`](process_table.md) | B3 | Documented | Manager holding `Vec<Process>`; forwards lifecycle by pid. `$HasCapacity ⇄ $Full` under `$Managing`. The B3 instance of the manager+instances pattern. |
-| `ElfLoader` | B3 | Planned | Parses ELF bytes and produces a process image. Phase-by-phase loading with cleanup on failure. |
+| [`ElfLoader`](elf_loader.md) | B3 | Documented | Loads a static ELF into a process address space. `$ReadingHeader → $ValidatingHeader → $MappingSegments → $BuildingStack → $Done`, any phase → `$Failed` (rolls back partial mappings). Flat phase pipeline; the `$Failed`-funnel showcase. |
 
 ## Shared systems
 

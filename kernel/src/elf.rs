@@ -1,0 +1,246 @@
+// kernel/src/elf.rs
+//
+// Native ELF parsing + segment mapping (B3 Step 4). The mechanism behind the
+// `ElfLoader` Frame system: `ElfLoader` owns the *phase sequence* (read →
+// validate → map → stack → done, with a `$Failed` cleanup funnel); this module
+// owns the *bytes* — parsing the ELF64 header + program headers and mapping
+// PT_LOAD segments into the target address space. Same "Frame owns lifecycle,
+// native owns mechanism" split as serial / vm.
+//
+// Single load at a time (one process at B3): the input + parse results + the
+// list of mapped pages live in one global, set by `prepare()` before the
+// `ElfLoader` is constructed. `kernel-tests` supplies a host double of this
+// module so the loader's phase logic is testable without real paging.
+//
+// ELF64 layout we read (little-endian, the only encoding we accept):
+//   header:  e_type@16(u16) e_machine@18(u16) e_entry@24(u64)
+//            e_phoff@32(u64) e_phentsize@54(u16) e_phnum@56(u16)
+//   phdr:    p_type@0(u32) p_flags@4(u32) p_offset@8(u64) p_vaddr@16(u64)
+//            p_filesz@32(u64) p_memsz@40(u64)
+
+use crate::{frames, paging};
+
+const PAGE: u64 = 4096;
+const USER_STACK_VA: u64 = 0x0000_0000_2000_0000; // proven-free user VA
+const MAX_TRACKED: usize = 64; // mapped pages we can roll back on failure
+
+struct ElfState {
+    bytes: &'static [u8],
+    pml4: u64,
+    entry: u64,
+    phoff: u64,
+    phentsize: u16,
+    phnum: u16,
+    stack_top: u64,
+    mapped: [(u64, u64); MAX_TRACKED], // (virt, frame_phys)
+    mapped_n: usize,
+}
+
+static mut ELF: ElfState = ElfState {
+    bytes: &[],
+    pml4: 0,
+    entry: 0,
+    phoff: 0,
+    phentsize: 0,
+    phnum: 0,
+    stack_top: 0,
+    mapped: [(0, 0); MAX_TRACKED],
+    mapped_n: 0,
+};
+
+fn elf() -> &'static mut ElfState {
+    // Bind the raw pointer first, then deref: avoids both `static_mut_refs`
+    // (no `&mut ELF`) and `clippy::deref_addrof` (no `*(&raw mut ELF)`).
+    let p = &raw mut ELF;
+    unsafe { &mut *p }
+}
+
+// --- little-endian readers (bounds-checked) --------------------------------
+
+fn rd_u16(b: &[u8], off: usize) -> Option<u16> {
+    let s = b.get(off..off + 2)?;
+    Some(u16::from_le_bytes([s[0], s[1]]))
+}
+
+fn rd_u32(b: &[u8], off: usize) -> Option<u32> {
+    let s = b.get(off..off + 4)?;
+    Some(u32::from_le_bytes([s[0], s[1], s[2], s[3]]))
+}
+
+fn rd_u64(b: &[u8], off: usize) -> Option<u64> {
+    let s = b.get(off..off + 8)?;
+    let mut a = [0u8; 8];
+    a.copy_from_slice(s);
+    Some(u64::from_le_bytes(a))
+}
+
+// --- public API (called from the ElfLoader handlers) -----------------------
+
+/// Stash the ELF image + target page table for the load that follows.
+pub fn prepare(bytes: &'static [u8], pml4: u64) {
+    let e = elf();
+    e.bytes = bytes;
+    e.pml4 = pml4;
+    e.entry = 0;
+    e.phoff = 0;
+    e.phentsize = 0;
+    e.phnum = 0;
+    e.stack_top = 0;
+    e.mapped_n = 0;
+}
+
+/// Phase 1: read the ELF header fields. False if the image is too short.
+pub fn read_header() -> bool {
+    let e = elf();
+    let b = e.bytes;
+    let (Some(entry), Some(phoff), Some(phentsize), Some(phnum)) =
+        (rd_u64(b, 24), rd_u64(b, 32), rd_u16(b, 54), rd_u16(b, 56))
+    else {
+        return false;
+    };
+    e.entry = entry;
+    e.phoff = phoff;
+    e.phentsize = phentsize;
+    e.phnum = phnum;
+    true
+}
+
+/// Phase 2: validate magic + that this is a 64-bit little-endian x86-64
+/// executable, and that the program-header table is in bounds.
+pub fn validate_header() -> bool {
+    let e = elf();
+    let b = e.bytes;
+    if b.len() < 64 || &b[0..4] != b"\x7fELF" {
+        return false;
+    }
+    if b[4] != 2 || b[5] != 1 {
+        return false; // EI_CLASS=ELFCLASS64, EI_DATA=ELFDATA2LSB
+    }
+    match (rd_u16(b, 16), rd_u16(b, 18)) {
+        (Some(2), Some(0x3E)) => {} // ET_EXEC, EM_X86_64
+        _ => return false,
+    }
+    let ph_end = e.phoff + (e.phnum as u64) * (e.phentsize as u64);
+    (ph_end as usize) <= b.len() && e.phentsize >= 56
+}
+
+/// Phase 3: map every PT_LOAD segment at its p_vaddr. False on allocation
+/// failure (the loader then transitions to $Failed, which calls `cleanup`).
+pub fn map_segments() -> bool {
+    let e = elf();
+    for i in 0..e.phnum as u64 {
+        let off = (e.phoff + i * e.phentsize as u64) as usize;
+        let b = e.bytes;
+        let (
+            Some(p_type),
+            Some(p_flags),
+            Some(p_offset),
+            Some(p_vaddr),
+            Some(p_filesz),
+            Some(p_memsz),
+        ) = (
+            rd_u32(b, off),
+            rd_u32(b, off + 4),
+            rd_u64(b, off + 8),
+            rd_u64(b, off + 16),
+            rd_u64(b, off + 32),
+            rd_u64(b, off + 40),
+        )
+        else {
+            return false;
+        };
+        if p_type != 1 {
+            continue; // not PT_LOAD
+        }
+        let mut flags = paging::USER;
+        if p_flags & 2 != 0 {
+            flags |= paging::WRITABLE; // PF_W
+        }
+        if !map_one_segment(p_offset, p_vaddr, p_filesz, p_memsz, flags) {
+            return false;
+        }
+    }
+    true
+}
+
+fn map_one_segment(p_offset: u64, p_vaddr: u64, p_filesz: u64, p_memsz: u64, flags: u64) -> bool {
+    let seg_end = p_vaddr + p_memsz;
+    let mut va = p_vaddr & !(PAGE - 1); // align down (our linker keeps p_vaddr aligned)
+    while va < seg_end {
+        let Some(frame) = frames::alloc_frame() else {
+            return false;
+        };
+        unsafe {
+            let dst = frames::phys_to_virt(frame);
+            core::ptr::write_bytes(dst, 0, PAGE as usize); // zero (covers .bss)
+                                                           // Copy whatever file bytes fall in this page.
+            let seg_off = va.saturating_sub(p_vaddr); // page-aligned multiple
+            if seg_off < p_filesz {
+                let n = core::cmp::min(PAGE, p_filesz - seg_off) as usize;
+                let src_off = (p_offset + seg_off) as usize;
+                let e = elf();
+                if let Some(src) = e.bytes.get(src_off..src_off + n) {
+                    core::ptr::copy_nonoverlapping(src.as_ptr(), dst, n);
+                } else {
+                    frames::free_frame(frame);
+                    return false; // file offsets out of range — corrupt
+                }
+            }
+            paging::map_in(elf().pml4, va, frame, flags);
+        }
+        track(va, frame);
+        va += PAGE;
+    }
+    true
+}
+
+/// Phase 4: allocate + map a one-page user stack. Returns false on OOM.
+pub fn build_stack() -> bool {
+    let e = elf();
+    let Some(frame) = frames::alloc_frame() else {
+        return false;
+    };
+    unsafe {
+        paging::map_in(
+            e.pml4,
+            USER_STACK_VA,
+            frame,
+            paging::USER | paging::WRITABLE,
+        );
+    }
+    track(USER_STACK_VA, frame);
+    e.stack_top = USER_STACK_VA + PAGE - 16; // 16-aligned-ish top
+    true
+}
+
+/// The program entry VA (valid once `read_header` succeeded).
+pub fn entry_va() -> u64 {
+    elf().entry
+}
+
+/// The top of the mapped user stack (valid once `build_stack` succeeded).
+pub fn stack_top() -> u64 {
+    elf().stack_top
+}
+
+/// Roll back every mapped page: unmap + free. Used by `$Failed` cleanup and by
+/// the demo's teardown after the process exits.
+pub fn cleanup() {
+    let e = elf();
+    for i in 0..e.mapped_n {
+        let (va, frame) = e.mapped[i];
+        unsafe {
+            paging::unmap(va);
+        }
+        frames::free_frame(frame);
+    }
+    e.mapped_n = 0;
+}
+
+fn track(va: u64, frame: u64) {
+    let e = elf();
+    if e.mapped_n < MAX_TRACKED {
+        e.mapped[e.mapped_n] = (va, frame);
+        e.mapped_n += 1;
+    }
+}

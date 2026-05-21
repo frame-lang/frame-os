@@ -21,6 +21,7 @@ const FRAME_SYSTEMS: &[(&str, &str)] = &[
     ("syscall_dispatcher", "syscall_dispatcher.frs"),
     ("process", "process.frs"),
     ("process_table", "process_table.frs"),
+    ("elf_loader", "elf_loader.frs"),
 ];
 
 fn main() -> Result<()> {

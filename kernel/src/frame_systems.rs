@@ -51,3 +51,6 @@ include!(concat!(env!("OUT_DIR"), "/syscall_dispatcher.rs"));
 // live ring-3 process through a global ProcessTable.
 include!(concat!(env!("OUT_DIR"), "/process.rs"));
 include!(concat!(env!("OUT_DIR"), "/process_table.rs"));
+// ElfLoader (B3 Step 4): the load-phase FSM. Actions call crate::elf::* (the
+// native byte parser + segment mapper); $Failed funnels cleanup.
+include!(concat!(env!("OUT_DIR"), "/elf_loader.rs"));

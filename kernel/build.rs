@@ -26,6 +26,7 @@ const FRAME_SYSTEMS: &[(&str, &str)] = &[
     ("syscall_dispatcher", "syscall_dispatcher.frs"),
     ("process", "process.frs"),
     ("process_table", "process_table.frs"),
+    ("elf_loader", "elf_loader.frs"),
     ("kernel", "kernel.frs"),
 ];
 
@@ -64,6 +65,76 @@ fn main() -> Result<()> {
         println!("cargo:rerun-if-changed={}", input.display());
     }
     println!("cargo:rerun-if-changed={}", frame_dir.display());
+
+    // --- User program (B3 Step 4) -----------------------------------------
+    // Build the freestanding user crate and stage its ELF where usermode.rs
+    // can `include_bytes!` it (concat!(env!("OUT_DIR"), "/user_hello.elf")).
+    build_user_program(workspace_root, &out_dir)?;
+
+    Ok(())
+}
+
+/// Compile the freestanding `user/` crate (a standalone, workspace-excluded
+/// bare-metal package) into a static ELF and copy it to OUT_DIR/user_hello.elf.
+///
+/// The nested `cargo` runs with its own target dir (no lock contention with
+/// the kernel build) and with the outer build's RUSTFLAGS scrubbed, so the
+/// kernel's link args can't leak into the user link — the user crate's own
+/// `.cargo/config.toml` supplies its target + linker script.
+fn build_user_program(workspace_root: &Path, out_dir: &Path) -> Result<()> {
+    let user_dir = workspace_root.join("user");
+    let user_target = out_dir.join("user-target");
+
+    let status = Command::new(env_var("CARGO").unwrap_or_else(|_| "cargo".into()))
+        .current_dir(&user_dir)
+        .env("CARGO_TARGET_DIR", &user_target)
+        .env_remove("RUSTFLAGS")
+        .env_remove("CARGO_ENCODED_RUSTFLAGS")
+        .env_remove("CARGO_BUILD_RUSTFLAGS")
+        // Scrub the rustc wrapper too: when the kernel is *clippy*-checked,
+        // cargo sets RUSTC_WORKSPACE_WRAPPER=clippy-driver, and without this
+        // the nested user build would inherit it and get clippy-checked
+        // (failing on user-code lints). The baked ELF must build identically
+        // regardless of whether the outer command is build/clippy/test.
+        .env_remove("RUSTC_WORKSPACE_WRAPPER")
+        .env_remove("RUSTC_WRAPPER")
+        .args(["build", "--release"])
+        .status()
+        .with_context(|| {
+            format!(
+                "failed to invoke cargo for user crate at {}",
+                user_dir.display()
+            )
+        })?;
+    if !status.success() {
+        return Err(anyhow!("user program build failed"));
+    }
+
+    let elf = user_target
+        .join("x86_64-unknown-none")
+        .join("release")
+        .join("hello");
+    if !elf.exists() {
+        return Err(anyhow!("user program ELF not found at {}", elf.display()));
+    }
+    let staged = out_dir.join("user_hello.elf");
+    std::fs::copy(&elf, &staged).with_context(|| {
+        format!(
+            "failed to stage user ELF {} -> {}",
+            elf.display(),
+            staged.display()
+        )
+    })?;
+
+    // Rebuild whenever the user sources change.
+    for f in [
+        "src/main.rs",
+        "linker.ld",
+        "Cargo.toml",
+        ".cargo/config.toml",
+    ] {
+        println!("cargo:rerun-if-changed={}", user_dir.join(f).display());
+    }
 
     Ok(())
 }

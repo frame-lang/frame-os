@@ -160,6 +160,7 @@ const DIAGRAMS: &[(&str, &str)] = &[
     ("syscall_dispatcher.frs", "syscall_dispatcher.svg"),
     ("process.frs", "process.svg"),
     ("process_table.frs", "process_table.svg"),
+    ("elf_loader.frs", "elf_loader.svg"),
 ];
 
 fn diagrams(mode: DiagramMode) -> Result<()> {
@@ -592,9 +593,10 @@ const SMOKE_TESTS: &[SmokeTest] = &[
         // No exception/fault.
         name: "ring3_syscall_b3",
         expect_contains: &[
+            "[elf] loaded user program, entry 0x",
             "[proc] spawned pid 1 (Ready)",
             "[user] entering ring 3",
-            "AB",
+            "hello from ELF",
             "[user] exited with code 42",
             "[proc] pid 1 exited -> Zombie",
             "[user] back in kernel after user exit",

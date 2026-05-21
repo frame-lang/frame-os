@@ -1,0 +1,28 @@
+# Freestanding user program for Frame OS (B3 Step 4).
+#
+# This crate is deliberately OUTSIDE the workspace (see the root Cargo.toml
+# `exclude`): it builds for the bare-metal `x86_64-unknown-none` target with a
+# custom linker script, and the kernel's build.rs compiles it into a static
+# ELF that gets baked into the kernel image via `include_bytes!`.
+#
+# No std, no alloc, no libc/crt0 — it makes raw `syscall`s (the Frame OS ABI:
+# rax = number, rdi/rsi = args) and `exit`s. The first real user program; the
+# `ElfLoader` HSM parses + maps it.
+[package]
+name = "frame-os-user-hello"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "hello"
+path = "src/main.rs"
+
+[profile.dev]
+panic = "abort"
+opt-level = 1
+
+[profile.release]
+panic = "abort"
+opt-level = "s"
+lto = true
+strip = true

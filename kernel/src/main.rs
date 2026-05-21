@@ -29,6 +29,7 @@ use core::panic::PanicInfo;
 
 mod allocator;
 mod context;
+mod elf;
 mod frame_systems;
 mod frames;
 mod gdt;

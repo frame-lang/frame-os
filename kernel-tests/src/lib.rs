@@ -141,6 +141,94 @@ pub mod usermode {
     }
 }
 
+/// Host test-double for the kernel's `elf` module. The `ElfLoader` actions
+/// call `crate::elf::{read_header, validate_header, map_segments, build_stack,
+/// cleanup, entry_va, stack_top}`. Here the *header parsing* is real (so
+/// corrupt / truncated ELF tests are meaningful), but mapping is stubbed
+/// (`map_segments`/`build_stack` succeed without touching paging). A test sets
+/// the input with `prepare(&BYTES)`, then constructs an `ElfLoader`.
+pub mod elf {
+    use std::cell::Cell;
+
+    thread_local! {
+        static BYTES: Cell<&'static [u8]> = const { Cell::new(&[]) };
+        static ENTRY: Cell<u64> = const { Cell::new(0) };
+        static PHOFF: Cell<u64> = const { Cell::new(0) };
+        static PHENTSIZE: Cell<u16> = const { Cell::new(0) };
+        static PHNUM: Cell<u16> = const { Cell::new(0) };
+        static STACK_TOP: Cell<u64> = const { Cell::new(0) };
+    }
+
+    fn rd_u16(b: &[u8], o: usize) -> Option<u16> {
+        let s = b.get(o..o + 2)?;
+        Some(u16::from_le_bytes([s[0], s[1]]))
+    }
+    fn rd_u64(b: &[u8], o: usize) -> Option<u64> {
+        let s = b.get(o..o + 8)?;
+        let mut a = [0u8; 8];
+        a.copy_from_slice(s);
+        Some(u64::from_le_bytes(a))
+    }
+
+    /// Set the ELF image for the load that follows (test-only entry point).
+    pub fn prepare(bytes: &'static [u8]) {
+        BYTES.with(|c| c.set(bytes));
+        ENTRY.with(|c| c.set(0));
+        STACK_TOP.with(|c| c.set(0));
+    }
+
+    pub fn read_header() -> bool {
+        BYTES.with(|c| {
+            let b = c.get();
+            match (rd_u64(b, 24), rd_u64(b, 32), rd_u16(b, 54), rd_u16(b, 56)) {
+                (Some(entry), Some(phoff), Some(phentsize), Some(phnum)) => {
+                    ENTRY.with(|e| e.set(entry));
+                    PHOFF.with(|e| e.set(phoff));
+                    PHENTSIZE.with(|e| e.set(phentsize));
+                    PHNUM.with(|e| e.set(phnum));
+                    true
+                }
+                _ => false,
+            }
+        })
+    }
+
+    pub fn validate_header() -> bool {
+        BYTES.with(|c| {
+            let b = c.get();
+            if b.len() < 64 || &b[0..4] != b"\x7fELF" || b[4] != 2 || b[5] != 1 {
+                return false;
+            }
+            if !matches!((rd_u16(b, 16), rd_u16(b, 18)), (Some(2), Some(0x3E))) {
+                return false;
+            }
+            let ph_end = PHOFF.with(|e| e.get())
+                + PHNUM.with(|e| e.get()) as u64 * PHENTSIZE.with(|e| e.get()) as u64;
+            (ph_end as usize) <= b.len() && PHENTSIZE.with(|e| e.get()) >= 56
+        })
+    }
+
+    // Mapping is stubbed on the host (no paging). Both succeed.
+    pub fn map_segments() -> bool {
+        true
+    }
+
+    pub fn build_stack() -> bool {
+        STACK_TOP.with(|c| c.set(0x2000_0000 + 4096 - 16));
+        true
+    }
+
+    pub fn entry_va() -> u64 {
+        ENTRY.with(|c| c.get())
+    }
+
+    pub fn stack_top() -> u64 {
+        STACK_TOP.with(|c| c.get())
+    }
+
+    pub fn cleanup() {}
+}
+
 // Pull in the framec-generated systems. Each generated file ends with
 // `pub use _<name>_framec::*;`, re-exporting the system type at this crate's
 // root. SerialDriver first (Kernel holds one in its domain). Task and
@@ -156,3 +244,6 @@ include!(concat!(env!("OUT_DIR"), "/syscall_dispatcher.rs"));
 // instantiates @@Process, so the Process type must be in scope first.
 include!(concat!(env!("OUT_DIR"), "/process.rs"));
 include!(concat!(env!("OUT_DIR"), "/process_table.rs"));
+// ElfLoader (B3 Step 4): the load-phase FSM. Actions call crate::elf::* (the
+// host double above does real header parsing, stubs the mapping).
+include!(concat!(env!("OUT_DIR"), "/elf_loader.rs"));
