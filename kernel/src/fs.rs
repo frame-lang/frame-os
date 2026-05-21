@@ -113,12 +113,15 @@ pub fn check_superblock() -> bool {
     fs::Superblock::parse(&read_block(fs::SB_BLOCK)).magic == fs::MAGIC
 }
 
-/// Look up `name` in the root directory; returns its inode number.
-pub fn lookup(name: &[u8]) -> Option<u32> {
-    let root = read_inode(fs::ROOT_INODE);
-    let entries = root.size as usize / fs::DIRENT_SIZE;
+/// Look up `name` in directory inode `dir_ino`; returns its inode number.
+pub fn dir_lookup(dir_ino: u32, name: &[u8]) -> Option<u32> {
+    let dir = read_inode(dir_ino);
+    if dir.kind != fs::T_DIR {
+        return None;
+    }
+    let entries = dir.size as usize / fs::DIRENT_SIZE;
     let mut seen = 0usize;
-    for &blk in root.direct.iter() {
+    for &blk in dir.direct.iter() {
         if blk == 0 {
             continue;
         }
@@ -134,6 +137,54 @@ pub fn lookup(name: &[u8]) -> Option<u32> {
         }
     }
     None
+}
+
+/// Look up `name` in the root directory.
+pub fn lookup(name: &[u8]) -> Option<u32> {
+    dir_lookup(fs::ROOT_INODE, name)
+}
+
+/// Resolve an absolute path (`/a/b/c`) to an inode by walking directories from
+/// the root. Empty components (leading/trailing/double slashes) are skipped.
+pub fn namei(path: &[u8]) -> Option<u32> {
+    let mut ino = fs::ROOT_INODE;
+    for comp in path.split(|&c| c == b'/') {
+        if comp.is_empty() {
+            continue;
+        }
+        ino = dir_lookup(ino, comp)?;
+    }
+    Some(ino)
+}
+
+/// Read up to `out.len()` bytes of file `ino` starting at byte `offset`.
+/// Returns bytes read (0 at or past EOF).
+pub fn read_at(ino: u32, offset: usize, out: &mut [u8]) -> usize {
+    let node = read_inode(ino);
+    let size = node.size as usize;
+    if offset >= size {
+        return 0;
+    }
+    let want = (size - offset).min(out.len());
+    let mut done = 0;
+    while done < want {
+        let pos = offset + done;
+        let bi = pos / fs::BLOCK_SIZE;
+        if bi >= node.direct.len() || node.direct[bi] == 0 {
+            break;
+        }
+        let within = pos % fs::BLOCK_SIZE;
+        let block = read_block(node.direct[bi]);
+        let n = (want - done).min(fs::BLOCK_SIZE - within);
+        out[done..done + n].copy_from_slice(&block[within..within + n]);
+        done += n;
+    }
+    done
+}
+
+/// Whether `ino` is a regular file.
+pub fn is_file(ino: u32) -> bool {
+    read_inode(ino).kind == fs::T_FILE
 }
 
 /// Read up to `out.len()` bytes of file `ino` into `out`. Returns bytes read.

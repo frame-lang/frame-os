@@ -24,6 +24,7 @@ const FRAME_SYSTEMS: &[(&str, &str)] = &[
     ("elf_loader", "elf_loader.frs"),
     ("block_request", "block_request.frs"),
     ("mount", "mount.frs"),
+    ("open_file", "open_file.frs"),
 ];
 
 fn main() -> Result<()> {

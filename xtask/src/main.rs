@@ -163,6 +163,7 @@ const DIAGRAMS: &[(&str, &str)] = &[
     ("elf_loader.frs", "elf_loader.svg"),
     ("block_request.frs", "block_request.svg"),
     ("mount.frs", "mount.svg"),
+    ("open_file.frs", "open_file.svg"),
 ];
 
 fn diagrams(mode: DiagramMode) -> Result<()> {
@@ -329,45 +330,73 @@ fn prepare_qemu_artifacts(workspace: &Path) -> Result<QemuArtifacts> {
     })
 }
 
-/// Files baked into the FS image by `mkfs` (name, contents).
+/// Files baked into the FS image by `mkfs` (absolute path, contents). Paths may
+/// name one directory level (`/bin/info`); intermediate dirs are created.
 const FS_FILES: &[(&str, &[u8])] = &[
-    ("motd", b"Frame OS B4 filesystem online.\n"),
-    ("readme", b"hello from the disk\n"),
+    ("/motd", b"Frame OS B4 filesystem online.\n"),
+    ("/readme", b"hello from the disk\n"),
+    ("/bin/info", b"nested directory works\n"),
 ];
 
 /// `mkfs`: build a Frame OS FS disk image (`total_blocks` × 512 bytes) and bake
 /// in `files`. Mirrors the on-disk layout the kernel reads (shared::fs).
+/// Supports one directory level: a path `/bin/info` creates a `/bin` directory.
 fn build_fs_image(total_blocks: u32, files: &[(&str, &[u8])]) -> Vec<u8> {
     use frame_os_shared::fs;
     let mut disk = vec![0u8; total_blocks as usize * fs::BLOCK_SIZE];
 
-    // Byte range of block `b` within the image.
     let blk = |b: u32| {
         let s = b as usize * fs::BLOCK_SIZE;
         s..s + fs::BLOCK_SIZE
     };
-    // Mark a block used in the free-block bitmap (block 1).
     fn set_used(disk: &mut [u8], b: u32) {
         let byte = fs::BITMAP_BLOCK as usize * fs::BLOCK_SIZE + (b as usize / 8);
         disk[byte] |= 1 << (b % 8);
     }
 
-    // Metadata blocks (superblock, bitmap, inode table) are always used.
     for b in 0..fs::DATA_START {
         set_used(&mut disk, b);
     }
 
-    // Root directory: inode 1, one data block of dirents.
-    let root_data = fs::DATA_START;
-    set_used(&mut disk, root_data);
-    let mut root = fs::Inode::empty();
-    root.kind = fs::T_DIR;
-    root.nlink = 1;
-    root.direct[0] = root_data;
-    let mut next_data = fs::DATA_START + 1;
-    let mut dirent_off = 0usize;
+    // Directory registry: (name "" = root, inode, data block, running dirent
+    // offset). Root is inode 1.
+    let mut next_ino = fs::ROOT_INODE; // 1
+    let mut next_data = fs::DATA_START;
+    let alloc_dir = |next_ino: &mut u32, next_data: &mut u32, disk: &mut [u8]| -> (u32, u32) {
+        let ino = *next_ino;
+        *next_ino += 1;
+        let dblk = *next_data;
+        *next_data += 1;
+        set_used(disk, dblk);
+        (ino, dblk)
+    };
+    let (root_ino, root_data) = alloc_dir(&mut next_ino, &mut next_data, &mut disk);
+    // dirs: (name, ino, data_block, dirent_off)
+    let mut dirs: Vec<(&str, u32, u32, usize)> = vec![("", root_ino, root_data, 0)];
 
-    for (ino, (name, data)) in (2u32..).zip(files) {
+    for (path, data) in files {
+        let p = path.trim_start_matches('/');
+        let (dirname, name) = match p.rsplit_once('/') {
+            Some((d, n)) => (d, n),
+            None => ("", p),
+        };
+        // Get or create the parent directory (one level under root).
+        let di = match dirs.iter().position(|d| d.0 == dirname) {
+            Some(i) => i,
+            None => {
+                let (ino, dblk) = alloc_dir(&mut next_ino, &mut next_data, &mut disk);
+                // Add the subdir's dirent to root.
+                let (rblk, roff) = (dirs[0].2, dirs[0].3);
+                fs::write_dirent(&mut disk[blk(rblk)], roff, dirname.as_bytes(), ino);
+                dirs[0].3 += fs::DIRENT_SIZE;
+                dirs.push((dirname, ino, dblk, 0));
+                dirs.len() - 1
+            }
+        };
+
+        // Allocate the file inode + data blocks.
+        let ino = next_ino;
+        next_ino += 1;
         let mut node = fs::Inode::empty();
         node.kind = fs::T_FILE;
         node.nlink = 1;
@@ -385,13 +414,23 @@ fn build_fs_image(total_blocks: u32, files: &[(&str, &[u8])]) -> Vec<u8> {
         }
         let (iblk, ioff) = fs::inode_loc(ino);
         node.write(&mut disk[blk(iblk)], ioff);
-        fs::write_dirent(&mut disk[blk(root_data)], dirent_off, name.as_bytes(), ino);
-        dirent_off += fs::DIRENT_SIZE;
-    }
-    root.size = dirent_off as u32;
 
-    let (rblk, roff) = fs::inode_loc(fs::ROOT_INODE);
-    root.write(&mut disk[blk(rblk)], roff);
+        // Add the file's dirent to its parent directory.
+        let (pblk, poff) = (dirs[di].2, dirs[di].3);
+        fs::write_dirent(&mut disk[blk(pblk)], poff, name.as_bytes(), ino);
+        dirs[di].3 += fs::DIRENT_SIZE;
+    }
+
+    // Write every directory inode with its final size.
+    for &(_, ino, dblk, off) in &dirs {
+        let mut d = fs::Inode::empty();
+        d.kind = fs::T_DIR;
+        d.nlink = 1;
+        d.direct[0] = dblk;
+        d.size = off as u32;
+        let (iblk, ioff) = fs::inode_loc(ino);
+        d.write(&mut disk[blk(iblk)], ioff);
+    }
 
     let sb = fs::Superblock {
         magic: fs::MAGIC,
@@ -833,6 +872,20 @@ const SMOKE_TESTS: &[SmokeTest] = &[
             "triple fault",
             "marker CORRUPT",
         ],
+        timeout_secs: 20,
+    },
+    SmokeTest {
+        // B4 Step 3: VFS + OpenFile + path lookup. The kernel opens files by
+        // absolute path through the fd table (each fd an OpenFile in $Reading),
+        // reads `/motd` and the nested `/bin/info` (proving directory walking),
+        // and confirms a closed fd reads nothing.
+        name: "vfs_path_lookup_b4",
+        expect_contains: &[
+            "[vfs] read /motd via fd: Frame OS B4 filesystem online.",
+            "[vfs] read /bin/info via fd: nested directory works",
+            "[vfs] read after close returns 0: ok",
+        ],
+        expect_absent: &["KERNEL EXCEPTION", "KERNEL PANIC", "triple fault"],
         timeout_secs: 20,
     },
 ];

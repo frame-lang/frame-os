@@ -251,3 +251,5 @@ include!(concat!(env!("OUT_DIR"), "/elf_loader.rs"));
 include!(concat!(env!("OUT_DIR"), "/block_request.rs"));
 // Mount (B4 Step 2): filesystem mount/unmount lifecycle. Pure (no native deps).
 include!(concat!(env!("OUT_DIR"), "/mount.rs"));
+// OpenFile (B4 Step 3): per-fd access-mode lifecycle. Pure (no native deps).
+include!(concat!(env!("OUT_DIR"), "/open_file.rs"));

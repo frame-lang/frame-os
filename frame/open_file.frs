@@ -1,0 +1,69 @@
+// frame/open_file.frs
+//
+// OpenFile — the lifecycle of one open file descriptor (B4 Step 3). The access
+// *mode* is the state: an fd is opened for reading or for writing, and that
+// gates which operations are legal until it's closed. State-dependent dispatch
+// makes "can't write a read-only fd" / "can't touch a closed fd" structural.
+//
+// State graph:
+//
+//   $Open ── open_read ──► $Reading ── read ──► (stays $Reading)
+//     │                       │
+//     │                       └── close ──► $Closed
+//     │── open_write ─► $Writing ── write ─► (stays $Writing)
+//     │                       └── close ──► $Closed
+//     └── close ──────────────────────────► $Closed
+//
+// Pure lifecycle bookkeeping — the VFS (kernel) owns the fd table, inode, and
+// byte offset; this owns "what mode is this fd, and is it still open". `read`
+// is only handled in $Reading and `write` only in $Writing, so the wrong
+// operation on an fd is silently ignored (per explicit-only-forwarding) rather
+// than corrupting data.
+
+@@[target("rust")]
+
+@@system OpenFile {
+    interface:
+        open_read()
+        open_write()
+        read()
+        write()
+        close()
+        is_open(): bool = false
+        is_reading(): bool = false
+        is_writing(): bool = false
+
+    machine:
+        $Open {
+            open_read() {
+                -> $Reading
+            }
+            open_write() {
+                -> $Writing
+            }
+            close() {
+                -> $Closed
+            }
+        }
+
+        $Reading {
+            read() {}
+            close() {
+                -> $Closed
+            }
+            is_open(): bool { @@:(true) }
+            is_reading(): bool { @@:(true) }
+        }
+
+        $Writing {
+            write() {}
+            close() {
+                -> $Closed
+            }
+            is_open(): bool { @@:(true) }
+            is_writing(): bool { @@:(true) }
+        }
+
+        $Closed {
+        }
+}

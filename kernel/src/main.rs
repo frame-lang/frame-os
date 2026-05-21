@@ -44,6 +44,7 @@ mod sched;
 mod sched_demo;
 mod serial;
 mod usermode;
+mod vfs;
 mod virtio_blk;
 mod vm;
 
@@ -250,6 +251,10 @@ unsafe extern "C" fn kmain() -> ! {
     // B4 Step 2: mount the FS, read a baked file, and create/write/read/delete
     // round-trip — over the buffer cache + the Mount HSM.
     fs::run_demo();
+
+    // B4 Step 3: open files by path through the VFS (incl. a nested directory)
+    // and exercise the OpenFile lifecycle.
+    vfs::run_demo();
 
     // B3 Step 1b: the user/kernel boundary. Enter ring 3 running a tiny
     // hand-crafted program that writes "AB" via syscalls and exits(42); the

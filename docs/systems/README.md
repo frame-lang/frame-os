@@ -45,6 +45,7 @@ These run inside the bare-metal kernel image. They do not appear in the hosted-m
 | [`ElfLoader`](elf_loader.md) | B3 | Documented | Loads a static ELF into a process address space. `$ReadingHeader → $ValidatingHeader → $MappingSegments → $BuildingStack → $Done`, any phase → `$Failed` (rolls back partial mappings). Flat phase pipeline; the `$Failed`-funnel showcase. |
 | [`BlockRequest`](block_request.md) | B4 | Documented | One block-I/O request's lifecycle: `$Queued → $InFlight → $Complete \| $Error`. Driven by the virtio-blk completion via the post/drain deferred-event pattern (first async-interrupt → Frame boundary). |
 | [`Mount`](mount.md) | B4 | Documented | A filesystem's mount/unmount lifecycle: `$Unmounted → $Mounting → $Mounted → $Unmounting`. Gates FS reads on `is_mounted()`. |
+| [`OpenFile`](open_file.md) | B4 | Documented | One open file descriptor's lifecycle, access mode as state: `$Open → $Reading \| $Writing → $Closed`. The VFS holds one per fd; wrong-mode ops are gated out. |
 
 ## Shared systems
 
