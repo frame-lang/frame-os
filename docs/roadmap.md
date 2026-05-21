@@ -334,9 +334,9 @@ H3 is the H-track's final committed milestone. Further H-track work (a configura
 
 | # | Exit criterion | Validating test(s) |
 |---|---|---|
-| B3-1 | `Process`, `ProcessTable`, `SyscallDispatcher`, `ElfLoader` state graphs match committed designs | Snapshots (`kernel-tests`) |
+| B3-1 | `Process`, `ProcessTable`, `SyscallDispatcher`, `ElfLoader` state graphs match committed designs | Snapshots (`kernel-tests`) — **`SyscallDispatcher` done at Step 2** (`syscall_dispatcher_state_graph_snapshot`); `Process`/`ProcessTable`/`ElfLoader` pending |
 | B3-2 | `Process` traverses its full lifecycle incl `$Zombie`/`$Reaped`; `kill()` is state-dependent | Behavioral `kernel-tests/tests/process_behavior.rs` (host) |
-| B3-3 | `SyscallDispatcher` forwards errors to `$Active` via `=> $^` | Behavioral `..._forwards_to_active` per error class (host) |
+| B3-3 | `SyscallDispatcher` forwards errors to `$Active` via `=> $^` | Behavioral `syscall_dispatcher_behavior.rs` (host, 5 tests incl `unknown_syscall_is_rejected_via_parent`) — **done at Step 2.** Multiple error *classes* (bad-arg/perm/OOM) arrive with the richer ABI at B4; B3 funnels the one `ENOSYS` path through `$Active.reject` |
 | B3-4 | `ElfLoader` loads a valid ELF; a corrupt ELF lands in `$Failed` with cleanup | Behavioral `elf_loader_behavior.rs` incl corrupt-ELF (host) |
 | B3-5 | A user-mode hello-world runs (ring 3, via `exec`) | QEMU smoke `hello_world_runs_in_user_mode_b3` |
 | B3-6 | Hardware isolation: a user read of kernel memory page-faults and does **not** crash the kernel | QEMU smoke `user_kernel_read_faults_b3`, `user_fault_does_not_crash_kernel_b3` |
@@ -346,6 +346,12 @@ H3 is the H-track's final committed milestone. Further H-track work (a configura
 | B3-10 | All CI gates pass, plus QEMU smoke on Linux | Full CI matrix + `qemu-test` |
 
 **Estimated effort:** Very large. Ring transitions, the syscall boundary, `fork`/COW, and ELF loading are each substantial. This is the xv6-class core.
+
+**Status:** In progress.
+- **Step 1 (user/kernel boundary):** Done. Our own GDT + TSS (`gdt.rs`, far-return reload via `retfq`, `ltr`), the `syscall`/`sysret` MSR fast path (STAR/LSTAR/FMASK + EFER.SCE), full register save/restore at the boundary, and ring-3 entry/exit (`iretq` down, `longjmp` back up). A hand-assembled user blob writes two bytes and `exit(42)`s through the syscall path. Validated by QEMU smoke `gdt_loaded_b3` and `ring3_syscall_b3`.
+- **Step 2 (`SyscallDispatcher` HSM):** Done. `frame/syscall_dispatcher.frs` — `$Validating → $Executing` under a `$Active` parent, with the unknown-syscall path forwarding `self.reject(ENOSYS)` to `$Active.reject` via `=> $^` (the HSM forwarding showcase; relies on lang-reference §9.5 self-event-send). Compiled into the kernel (the ring-3 demo routes every syscall through a global `SyscallDispatcher`) and host-tested in `kernel-tests` (snapshot B3-1 + 5 behavioral B3-3). Per-system doc + SVG committed.
+- **Smoke-harness hardening (this step):** the kernel's `halt_forever()` now writes QEMU's `isa-debug-exit` (port 0xf4) so a healthy boot exits the VM promptly instead of racing the timeout; each smoke test gets a fresh OVMF NVRAM copy (a SIGKILL-corrupted vars file can no longer cascade into the next boot); and a `task_unready` scheduler race in `sched::exit_current` (mark-dead and notify must be one critical section) was fixed. Result: 12/12 QEMU smoke, reliably.
+- **Remaining:** `Process` + `ProcessTable` (Step 3), `ElfLoader` + a real user ELF (Step 4), `fork`/`exec` + signals (Step 5).
 
 ### B4 — block device & filesystem
 

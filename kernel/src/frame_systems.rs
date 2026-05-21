@@ -40,3 +40,7 @@ include!(concat!(env!("OUT_DIR"), "/scheduler.rs"));
 // `crate::vm::{is_lazy_region,lazy_map}` (full paths, resolved per crate)
 // and `serial::*` (imported above).
 include!(concat!(env!("OUT_DIR"), "/page_fault_handler.rs"));
+// SyscallDispatcher: validate + execute syscalls, errors funneled to its
+// $Active parent via `=> $^`. Actions call crate::usermode::{is_known_syscall,
+// perform_syscall}.
+include!(concat!(env!("OUT_DIR"), "/syscall_dispatcher.rs"));

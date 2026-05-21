@@ -157,6 +157,7 @@ const DIAGRAMS: &[(&str, &str)] = &[
     ("task.frs", "task.svg"),
     ("scheduler.frs", "scheduler.svg"),
     ("page_fault_handler.frs", "page_fault_handler.svg"),
+    ("syscall_dispatcher.frs", "syscall_dispatcher.svg"),
 ];
 
 fn diagrams(mode: DiagramMode) -> Result<()> {
@@ -279,9 +280,17 @@ const LIMINE_REPO: &str = "https://github.com/limine-bootloader/limine.git";
 struct QemuArtifacts {
     esp_img: PathBuf,
     ovmf_code: PathBuf,
-    /// A writable copy of QEMU's read-only vars template. QEMU needs
-    /// this writable because UEFI mutates NVRAM during boot.
-    ovmf_vars: PathBuf,
+    /// QEMU's read-only vars template. UEFI mutates NVRAM during boot, so
+    /// QEMU needs a *writable* copy — but we never hand it this template
+    /// directly. Instead each invocation gets its own fresh copy (see
+    /// `fresh_ovmf_vars`). That isolation matters: if a smoke test times
+    /// out and QEMU is SIGKILLed mid-NVRAM-write, a shared vars file would
+    /// be left corrupt and every *subsequent* boot would hang in firmware
+    /// (serial capture shows only the OVMF screen-clear escapes, no kernel
+    /// output). Per-invocation copies make that impossible to cascade.
+    ovmf_vars_template: PathBuf,
+    /// Directory under `target/` where per-invocation vars copies live.
+    qemu_dir: PathBuf,
 }
 
 fn prepare_qemu_artifacts(workspace: &Path) -> Result<QemuArtifacts> {
@@ -290,25 +299,38 @@ fn prepare_qemu_artifacts(workspace: &Path) -> Result<QemuArtifacts> {
     let esp_img = build_esp_image(workspace, &kernel_elf, &limine_dir)?;
 
     let (ovmf_code, ovmf_vars_template) = find_ovmf()?;
-    let ovmf_vars = workspace.join("target").join("qemu").join("ovmf-vars.fd");
-    std::fs::create_dir_all(ovmf_vars.parent().unwrap())?;
-    if !ovmf_vars.exists() {
-        std::fs::copy(&ovmf_vars_template, &ovmf_vars)
-            .with_context(|| format!("failed to copy {}", ovmf_vars_template.display()))?;
-    }
+    let qemu_dir = workspace.join("target").join("qemu");
+    std::fs::create_dir_all(&qemu_dir)?;
 
     Ok(QemuArtifacts {
         esp_img,
         ovmf_code,
-        ovmf_vars,
+        ovmf_vars_template,
+        qemu_dir,
     })
+}
+
+/// Produce a fresh, writable copy of the OVMF NVRAM vars for a single QEMU
+/// invocation, named after `tag`. Always overwrites any prior copy so a
+/// corrupted file from an earlier (timed-out, SIGKILLed) run can never
+/// poison the next boot.
+fn fresh_ovmf_vars(artifacts: &QemuArtifacts, tag: &str) -> Result<PathBuf> {
+    let vars = artifacts.qemu_dir.join(format!("ovmf-vars-{tag}.fd"));
+    std::fs::copy(&artifacts.ovmf_vars_template, &vars).with_context(|| {
+        format!(
+            "failed to copy OVMF vars template {} -> {}",
+            artifacts.ovmf_vars_template.display(),
+            vars.display()
+        )
+    })?;
+    Ok(vars)
 }
 
 /// Build a QEMU `Command` with the standard machine + firmware + disk
 /// arguments. Callers add the serial routing they want
 /// (`-serial stdio` for interactive, `-serial file:<path>` for smoke
 /// tests) and then either spawn or run.
-fn qemu_base_command(artifacts: &QemuArtifacts) -> Command {
+fn qemu_base_command(artifacts: &QemuArtifacts, ovmf_vars: &Path) -> Command {
     let mut cmd = Command::new("qemu-system-x86_64");
     cmd.args(["-machine", "q35", "-cpu", "qemu64", "-m", "256M"])
         // UEFI firmware (split into read-only code + writable NVRAM).
@@ -318,18 +340,25 @@ fn qemu_base_command(artifacts: &QemuArtifacts) -> Command {
             artifacts.ovmf_code.display()
         ))
         .args(["-drive"])
-        .arg(format!(
-            "if=pflash,format=raw,file={}",
-            artifacts.ovmf_vars.display()
-        ))
+        .arg(format!("if=pflash,format=raw,file={}", ovmf_vars.display()))
         // Boot drive — real FAT image with our ESP layout.
         .args(["-drive"])
         .arg(format!("format=raw,file={}", artifacts.esp_img.display()))
         .args(["-display", "none"])
-        // Don't reboot on triple fault; hold QEMU open after halt so
-        // smoke tests can read the full serial log instead of racing
-        // QEMU's exit.
-        .args(["-no-reboot", "-no-shutdown"]);
+        // isa-debug-exit: the kernel's halt path writes port 0xf4, which
+        // makes QEMU exit cleanly (code (val<<1)|1) once the boot/demos are
+        // done — so the smoke harness gets the complete serial capture
+        // immediately instead of racing a timeout. Harmless on real hardware.
+        .args(["-device", "isa-debug-exit,iobase=0xf4,iosize=0x04"])
+        // `-no-reboot`: on a triple fault QEMU exits (instead of looping
+        // through firmware), so the smoke harness surfaces an incomplete
+        // capture rather than hanging to the timeout.
+        //
+        // We deliberately do NOT pass `-no-shutdown`: it intercepts the
+        // isa-debug-exit device's process-exit path, which would leave QEMU
+        // running after the kernel's clean halt and force every smoke test
+        // to wait out its full timeout.
+        .args(["-no-reboot"]);
     cmd
 }
 
@@ -338,13 +367,17 @@ fn run_qemu() -> Result<()> {
     let artifacts = prepare_qemu_artifacts(&workspace)?;
 
     eprintln!("booting kernel in QEMU (Ctrl-C or Ctrl-A x to quit)...");
-    let mut cmd = qemu_base_command(&artifacts);
+    let ovmf_vars = fresh_ovmf_vars(&artifacts, "run")?;
+    let mut cmd = qemu_base_command(&artifacts, &ovmf_vars);
     cmd.args(["-serial", "stdio"]);
     let status = cmd
         .status()
         .context("failed to invoke qemu-system-x86_64")?;
 
-    if !status.success() {
+    // The kernel's halt path writes `isa-debug-exit` (port 0xf4), which
+    // makes QEMU exit with code 33 = `(0x10 << 1) | 1`. That's the normal,
+    // healthy "kernel reached halt_forever()" outcome, so accept it.
+    if !status.success() && status.code() != Some(33) {
         bail!("qemu exited with status: {status}");
     }
     Ok(())
@@ -610,7 +643,8 @@ fn run_smoke_test(test: &SmokeTest, artifacts: &QemuArtifacts, serial_path: &Pat
     // the timeout. `-display none` (set in qemu_base_command) keeps it
     // headless. We discard QEMU's own stdout/stderr — the interesting
     // stream is the captured serial output.
-    let mut cmd = qemu_base_command(artifacts);
+    let ovmf_vars = fresh_ovmf_vars(artifacts, test.name)?;
+    let mut cmd = qemu_base_command(artifacts, &ovmf_vars);
     cmd.args(["-serial"])
         .arg(format!("file:{}", serial_path.display()))
         .stdout(Stdio::null())
@@ -620,18 +654,19 @@ fn run_smoke_test(test: &SmokeTest, artifacts: &QemuArtifacts, serial_path: &Pat
     let mut child = cmd.spawn().context("failed to invoke qemu-system-x86_64")?;
 
     // Poll for QEMU's natural exit, otherwise force-kill at timeout.
-    // The kernel sits in `hlt` forever at B0 Step 1 so the natural
-    // exit basically never happens — but checking anyway lets us
-    // shorten future tests once `isa-debug-exit` is wired up.
+    // The kernel's `halt_forever()` writes `isa-debug-exit` (port 0xf4)
+    // before parking, so a healthy boot exits QEMU promptly (exit code 33)
+    // — no timeout race. We deliberately do NOT treat a non-zero exit as a
+    // failure here: the isa-debug-exit code is non-zero by construction,
+    // and a triple-fault that reboots into firmware would also exit
+    // non-zero. Either way the verdict comes from the captured serial
+    // output below — a clean halt produces the full marker sequence; a
+    // crash produces a truncated capture that fails the substring check
+    // (and prints the partial capture for diagnosis).
     let deadline = Instant::now() + Duration::from_secs(test.timeout_secs);
     loop {
         match child.try_wait().context("failed to poll qemu process")? {
-            Some(status) => {
-                if !status.success() {
-                    return Err(anyhow!("qemu exited non-zero: {status}"));
-                }
-                break;
-            }
+            Some(_status) => break,
             None => {
                 if Instant::now() >= deadline {
                     // Force-kill QEMU. SIGKILL guarantees exit even if

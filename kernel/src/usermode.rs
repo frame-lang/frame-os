@@ -16,7 +16,12 @@
 
 use core::arch::{asm, global_asm};
 
+use crate::frame_systems::SyscallDispatcher;
 use crate::{frames, paging, serial};
+
+// The syscall dispatcher HSM (B3 Step 2). Driven synchronously from the
+// syscall entry; single instance, single-core.
+static mut DISPATCHER: Option<SyscallDispatcher> = None;
 
 // MSR numbers.
 const IA32_EFER: u32 = 0xC000_0080;
@@ -137,29 +142,46 @@ fn init() {
     wrmsr(IA32_STAR, (0x08u64 << 32) | (0x10u64 << 48));
     wrmsr(IA32_LSTAR, syscall_entry as *const () as u64);
     wrmsr(IA32_FMASK, 0x200); // clear IF on syscall entry
+    unsafe {
+        let p = &raw mut DISPATCHER;
+        *p = Some(SyscallDispatcher::__create());
+    }
 }
 
-/// The syscall dispatcher (Rust half of the entry stub). `num`/`a0`/`a1`
-/// are the syscall number and first two args.
+/// Rust half of the syscall entry stub. Routes the syscall through the
+/// `SyscallDispatcher` HSM (validate → execute, or `=> $^` reject) and
+/// returns its result.
 #[no_mangle]
-extern "C" fn syscall_dispatch(num: u64, a0: u64, _a1: u64) -> u64 {
+extern "C" fn syscall_dispatch(num: u64, a0: u64, a1: u64) -> u64 {
+    let d = unsafe {
+        let p = &raw mut DISPATCHER;
+        (*p).as_mut().expect("dispatcher initialized")
+    };
+    d.request(num, a0, a1);
+    d.result()
+}
+
+/// Validation predicate, called by the dispatcher's `$Validating` state.
+pub fn is_known_syscall(num: u64) -> bool {
+    num == 0 || num == 1
+}
+
+/// Perform a (validated) syscall, called by the dispatcher's `$Executing`
+/// enter handler. `write_char` returns 1; `exit` longjmps back to the kernel
+/// (never returns).
+pub fn perform_syscall(num: u64, a0: u64, _a1: u64) -> u64 {
     match num {
         0 => {
-            // write_char
             serial::write_byte(a0 as u8);
             1
         }
         1 => {
-            // exit
             serial::write_str("\n[user] exited with code ");
             serial::write_u32_decimal(a0 as u32);
             serial::writeln("");
             unsafe { resume_kernel_after_user() } // never returns
         }
-        _ => {
-            serial::writeln("[user] unknown syscall");
-            u64::MAX
-        }
+        _ => u64::MAX, // unreachable: validated by is_known_syscall
     }
 }
 

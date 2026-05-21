@@ -1,0 +1,81 @@
+// frame/syscall_dispatcher.frs
+//
+// SyscallDispatcher — validate + execute a system call, with errors funneled
+// to a single parent handler (B3 Step 2). The HSM `=> $^` showcase: a child
+// forwards the error path to the `$Active` parent rather than handling it
+// itself, so "how an error is reported" is written once.
+//
+// Reentrancy (frame_v4_lang_reference §9.5): a handler may fire an event on
+// `self` (it pushes its own context and runs to completion). `$Validating`
+// uses that on the bad path: `self.reject(...)` is not handled in
+// `$Validating`, so `=> $^` forwards it to `$Active.reject`.
+//
+//   ┌──────────────────────── $Active (parent) ─────────────────────────┐
+//   │   reject(code): result = code, is_err = true, -> $Validating       │
+//   │                                                                    │
+//   │   ┌──────────────┐  request, known num     ┌──────────────┐        │
+//   │   │ $Validating  │ ───────────────────────►│  $Executing  │        │
+//   │   │  (initial)   │ ◄── $>: perform+result ──│  $>: execute │        │
+//   │   └──────┬───────┘                          └──────────────┘        │
+//   │          │ request, unknown num                                     │
+//   │          └── self.reject(ENOSYS) ───=> $^──► (parent reject)        │
+//   └────────────────────────────────────────────────────────────────────┘
+//
+// The native side (crate::usermode) provides is_known_syscall (validation)
+// and perform_syscall (the actual work). `$Validating`/`$Executing` are thin
+// at B3 but the structure + the `=> $^` funnel scale to multi-phase syscalls
+// at B4.
+
+@@[target("rust")]
+
+@@system SyscallDispatcher {
+    interface:
+        request(num: u64, a0: u64, a1: u64)
+        reject(code: u64)
+        result(): u64 = self.result
+        is_error(): bool = self.is_err
+
+    machine:
+        $Validating => $Active {
+            request(num: u64, a0: u64, a1: u64) {
+                self.num = num;
+                self.a0 = a0;
+                self.a1 = a1;
+                if crate::usermode::is_known_syscall(num) {
+                    -> $Executing
+                } else {
+                    // Unknown syscall → forward to the parent's error
+                    // handler (reject is unhandled here → `=> $^`). ENOSYS=38.
+                    self.reject(38)
+                }
+            }
+            => $^
+        }
+
+        $Executing => $Active {
+            $>() {
+                // Run the syscall natively, record the return value, and
+                // return to $Validating ready for the next request.
+                self.result = crate::usermode::perform_syscall(self.num, self.a0, self.a1);
+                self.is_err = false;
+                -> $Validating
+            }
+            => $^
+        }
+
+        // Parent: the single error handler the children forward to.
+        $Active {
+            reject(code: u64) {
+                self.result = code;
+                self.is_err = true;
+                -> $Validating
+            }
+        }
+
+    domain:
+        num: u64 = 0
+        a0: u64 = 0
+        a1: u64 = 0
+        result: u64 = 0
+        is_err: bool = false
+}

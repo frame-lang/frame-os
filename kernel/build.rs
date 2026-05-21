@@ -23,6 +23,7 @@ const FRAME_SYSTEMS: &[(&str, &str)] = &[
     ("serial_driver", "serial_driver.frs"),
     ("scheduler", "scheduler.frs"),
     ("page_fault_handler", "page_fault_handler.frs"),
+    ("syscall_dispatcher", "syscall_dispatcher.frs"),
     ("kernel", "kernel.frs"),
 ];
 

@@ -90,3 +90,11 @@ fn page_fault_handler_state_graph_snapshot() {
     };
     insta::assert_snapshot!("page_fault_handler_state_graph", dot);
 }
+
+#[test]
+fn syscall_dispatcher_state_graph_snapshot() {
+    let Some(dot) = frame_to_dot("syscall_dispatcher.frs") else {
+        return; // framec unavailable; test skipped
+    };
+    insta::assert_snapshot!("syscall_dispatcher_state_graph", dot);
+}

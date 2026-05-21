@@ -125,6 +125,22 @@ pub mod pit {
     pub fn init(_hz: u32) {}
 }
 
+/// Host test-double for the kernel's `usermode` module. The
+/// `SyscallDispatcher` actions call `crate::usermode::{is_known_syscall,
+/// perform_syscall}`; here they're simple deterministic stubs (no ring-3 /
+/// longjmp) so behavioral tests can drive the validate / execute / reject
+/// paths. `perform_syscall` echoes `a0` so a test can assert the value
+/// flowed through `$Executing`.
+pub mod usermode {
+    pub fn is_known_syscall(num: u64) -> bool {
+        num < 2
+    }
+
+    pub fn perform_syscall(_num: u64, a0: u64, _a1: u64) -> u64 {
+        a0
+    }
+}
+
 // Pull in the framec-generated systems. Each generated file ends with
 // `pub use _<name>_framec::*;`, re-exporting the system type at this crate's
 // root. SerialDriver first (Kernel holds one in its domain). Task and
@@ -135,3 +151,4 @@ include!(concat!(env!("OUT_DIR"), "/kernel.rs"));
 include!(concat!(env!("OUT_DIR"), "/task.rs"));
 include!(concat!(env!("OUT_DIR"), "/scheduler.rs"));
 include!(concat!(env!("OUT_DIR"), "/page_fault_handler.rs"));
+include!(concat!(env!("OUT_DIR"), "/syscall_dispatcher.rs"));

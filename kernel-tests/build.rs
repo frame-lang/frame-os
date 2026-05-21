@@ -18,6 +18,7 @@ const FRAME_SYSTEMS: &[(&str, &str)] = &[
     ("task", "task.frs"),
     ("scheduler", "scheduler.frs"),
     ("page_fault_handler", "page_fault_handler.frs"),
+    ("syscall_dispatcher", "syscall_dispatcher.frs"),
 ];
 
 fn main() -> Result<()> {

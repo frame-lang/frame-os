@@ -30,7 +30,7 @@ use crate::serial;
 
 const MAX_THREADS: usize = 8;
 const STACK_SIZE: usize = 16 * 1024;
-const ROUNDS_PER_WORKER: u32 = 6;
+const ROUNDS_PER_WORKER: u32 = 4;
 
 #[derive(Clone, Copy, PartialEq)]
 enum RunState {
@@ -185,11 +185,18 @@ unsafe fn spawn(stack_top: *mut u8, entry: extern "C" fn() -> !) {
 /// fire the Frame Scheduler's `task_unready`, then park. Never returns — the
 /// next tick switches away and this thread is never resumed.
 fn exit_current() -> ! {
+    // Mark Dead *and* fire `task_unready` in a single critical section. If
+    // these were separate sections a timer tick could land in between:
+    // `schedule()` would see this thread is Dead and switch away, and since
+    // a Dead thread is never picked again, `task_unready` would never run —
+    // the Frame Scheduler would never reach $Idle and the boot loop would
+    // hang. (`with_sched`/`without_interrupts` nest safely: the inner cli
+    // sees IF already clear and leaves it that way.)
     interrupts::without_interrupts(|| unsafe {
         let cur = (&raw const CURRENT).read();
         (*tcbs().add(cur)).state = RunState::Dead;
+        with_sched(|s| s.task_unready());
     });
-    with_sched(|s| s.task_unready());
     loop {
         interrupts::wait_for_interrupt();
     }
@@ -200,7 +207,10 @@ fn exit_current() -> ! {
 // ---------------------------------------------------------------------------
 
 fn pace() {
-    for _ in 0..50_000u64 {
+    // Small spin: under TCG the 100 Hz timer still preempts mid-spin (TCG
+    // runs far slower than host wall-clock), so the threads interleave;
+    // keeping it small keeps total boot time well inside the smoke timeout.
+    for _ in 0..8_000u64 {
         core::hint::spin_loop();
     }
 }

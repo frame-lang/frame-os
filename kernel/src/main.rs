@@ -262,6 +262,21 @@ unsafe extern "C" fn kmain() -> ! {
 // ---------------------------------------------------------------------------
 
 fn halt_forever() -> ! {
+    // Signal a clean stop to the host. QEMU's `isa-debug-exit` device
+    // (wired up by the smoke harness at iobase 0xf4) turns a port write
+    // into a process exit with code `(value << 1) | 1` — so writing 0x10
+    // yields exit code 33, which the harness recognizes as "the kernel
+    // finished and parked." On real hardware (and under a QEMU without the
+    // device) the write goes to an unclaimed I/O port and is harmless; we
+    // fall through to the `hlt` loop and park the CPU as before.
+    unsafe {
+        core::arch::asm!(
+            "out dx, al",
+            in("dx") 0xf4u16,
+            in("al") 0x10u8,
+            options(nomem, nostack, preserves_flags),
+        );
+    }
     loop {
         unsafe {
             core::arch::asm!("hlt", options(nomem, nostack, preserves_flags));

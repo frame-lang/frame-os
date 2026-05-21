@@ -34,18 +34,15 @@ These run inside the bare-metal kernel image. They do not appear in the hosted-m
 
 | System | Milestone | Status | Description |
 |---|---|---|---|
-| `Kernel` | B0 | Planned | Top-level kernel lifecycle. HSM: `$Booting` parent over per-phase children, then `$Running`, then `$Halting`. |
-| `SerialDriver` | B0 | Planned | UART driver. `$Idle → $Transmitting → $Draining`. The first bare-metal Frame system. |
-| `Scheduler` | B1 | Planned | Picks the next task on each tick. `$Idle → $PickingNext → $Running → $ContextSwitching`. |
-| `Task` | B1 | Planned | Pre-Tier-3 task lifecycle. Evolves into `Process` at B4. |
-| `KernelTimer` | B1 | Planned | Periodic interrupt source. Borderline state machine; may collapse to plain Rust. |
-| `Shell` (bare-metal variant) | B2 | Planned | Same Frame source as the hosted shell, with bare-metal action implementations. |
-| `Interpreter` | B3 | Planned | Bytecode VM. Each opcode is a state; fetch-decode-execute is the dispatch loop. |
-| `Process` | B4 (stretch) | Planned | Replaces `Task`. Full process lifecycle including `$Zombie` and `$Reaped`. |
-| `ProcessTable` | B4 (stretch) | Planned | Slot management for the process array. One state machine per slot. |
-| `SyscallDispatcher` | B4 (stretch) | Planned | Routes incoming syscalls. HSM with error handlers on the parent. |
-| `ElfLoader` | B4 (stretch) | Planned | Parses ELF bytes and produces a process image. Phase-by-phase loading with cleanup on failure. |
-| `PageFaultHandler` | B4 (stretch) | Planned | Classifies page faults and dispatches to the appropriate response. |
+| [`Kernel`](kernel.md) | B0 | Documented | Top-level kernel lifecycle. HSM: `$Booting` parent over per-phase init children, then `$Running`, then `$Halted`. |
+| [`SerialDriver`](serial_driver.md) | B0 | Documented | COM1 console driver. `$Uninitialized → $Ready` (enforces "program the UART before you transmit"). The first bare-metal Frame system. |
+| [`Scheduler`](scheduler.md) | B1 | Documented | Run/halt mode for the preemptive scheduler. `$Idle` (halt) / `$Active` (≥1 runnable). The native ISR does the round-robin picking. |
+| [`Task`](task.md) | B1 | Documented | Task lifecycle. `$Created → $Ready ⇄ $Blocked → $Terminated`. Host-validated; becomes load-bearing as `Process` at B3. |
+| [`PageFaultHandler`](page_fault_handler.md) | B2 | Documented | Classifies a page fault and dispatches the response from inside the `#PF` handler. `$Classifying → $LazyFault \| $Fatal` under `$FaultActive`. |
+| [`SyscallDispatcher`](syscall_dispatcher.md) | B3 | Documented | Validate + execute a syscall, errors funneled to the `$Active` parent via `=> $^`. `$Validating → $Executing` under `$Active`. |
+| `Process` | B3 | Planned | Replaces `Task`. Full process lifecycle including `$Zombie` and `$Reaped`. |
+| `ProcessTable` | B3 | Planned | Slot management for the process array. One state machine per slot. |
+| `ElfLoader` | B3 | Planned | Parses ELF bytes and produces a process image. Phase-by-phase loading with cleanup on failure. |
 
 ## Shared systems
 
