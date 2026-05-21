@@ -4,12 +4,12 @@
 
 | Property | Value |
 |---|---|
-| Track | Hosted (will be reused in Bare-metal at B2) |
+| Track | Hosted (planned for reuse in a **ring-3 userspace program** at B4 Step 4b — not yet built) |
 | Milestone introduced | H1 |
 | Source file | [`../../frame/parser.frs`](../../frame/parser.frs) |
 | State diagram | [`parser.svg`](parser.svg) |
 | Instances at runtime | One per Shell `$Parsing` activation — `Parser::__create()` per line |
-| Status | In progress (H1) |
+| Status | Documented (H1) |
 
 ## State diagram
 
@@ -133,7 +133,7 @@ Tokenization is the textbook case for explicit state-machine implementation. Eac
 
 As Frame, the diagram (`parser.svg`) is directly readable as the scanner's mode graph: which state goes to which on which input is visible without reading the source. Adding a new scanning mode — say, `$InEscape` to handle backslash-escapes — is a localized change: a new state declaration, two new transitions, and the framepiler regenerates the dispatch. The bug class "I added an escape mode but forgot to handle it from `$InQuotedString`" disappears at compile time.
 
-What's lost by not using Frame here is modest in absolute terms: shell command tokenization has four meaningful states, and a competent Rust programmer can write the equivalent `match` ladder in 50 lines. What's gained is the diagram-as-documentation property: a reader can see the scanner's state graph without reading any Rust. That property is what scales as the project adds the more complex scanners (the bytecode `Interpreter` at B3 with 30+ states).
+What's lost by not using Frame here is modest in absolute terms: shell command tokenization has four meaningful states, and a competent Rust programmer can write the equivalent `match` ladder in 50 lines. What's gained is the diagram-as-documentation property: a reader can see the scanner's state graph without reading any Rust. That property is what scales as the project adds the more complex protocol/lifecycle machines (the TCP state machine at B5, the deepest Frame system in the project).
 
 This system is also a good test case for using Frame in places where per-event dispatch *is* the work — the same shape framec itself uses internally for its own scanners (the `attribute_scanner`, `output_block_lexer`, and similar FSMs in framec's codebase). Frame OS's Parser is the consumer-side proof of the same pattern.
 
@@ -141,7 +141,7 @@ This system is also a good test case for using Frame in places where per-event d
 
 **Calls into:** none. `Parser` is a pure tokenizer — no Frame system or native module is invoked from its handlers other than the `String`/`Vec` operations on its own domain fields.
 
-**Called from:** `Shell.$Parsing.$>()` at H1 — drives Parser to completion for each typed line. The Shell holds a `Parser` instance in its `domain:` block (decision documented in [shell.md](shell.md)). Future bare-metal usage (B2) will call `Parser` the same way from the bare-metal `Shell`'s `$Parsing` handler.
+**Called from:** `Shell.$Parsing.$>()` at H1 — drives Parser to completion for each typed line. The Shell holds a `Parser` instance in its `domain:` block (decision documented in [shell.md](shell.md)). Planned ring-3 userspace usage (B4 Step 4b) will call `Parser` the same way from the userspace `Shell`'s `$Parsing` handler.
 
 **Native modules used by actions:** none. The Parser has no `actions:` block at H1 — all behavior is in the per-state handlers, which use only `String`/`Vec` operations on domain fields.
 
@@ -206,7 +206,7 @@ Test file: [`../../shell/tests/parser_behavior.rs`](../../shell/tests/parser_beh
 
 **E2E tests (Level 6):** N/A on its own — `Parser` isn't directly invoked by the binary. E2E tests for builtins exercise the Shell+Parser composition transitively.
 
-**QEMU smoke tests (Level 7):** N/A — `Parser` is currently hosted-only. Bare-metal reuse at B2 will add QEMU coverage.
+**QEMU smoke tests (Level 7):** N/A — `Parser` is currently hosted-only. Ring-3 userspace reuse at B4 Step 4b will add QEMU coverage.
 
 **Hardware tests (Level 8):** N/A — same reason.
 

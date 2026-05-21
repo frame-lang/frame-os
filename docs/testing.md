@@ -108,12 +108,12 @@ mod tests {
 
 **What:** The kernel boots in QEMU, executes a test scenario, and writes its result to a known serial port. The test runner on the host reads that output and asserts.
 
-**Where:** `kernel/tests/qemu_smoke.rs`, using the bootimage-style pattern that the Rust OS-dev community has converged on.
+**Where:** the `xtask` harness (`xtask/src/main.rs` — the `SMOKE_TESTS` table + `run_smoke_test`), run via `cargo xtask qemu-test`. (The original plan named `kernel/tests/qemu_smoke.rs`, but the kernel crate is `#![no_std]`/`#![no_main]` for `x86_64-unknown-none` and can't host host-target `cargo test` integration tests, so the runner moved to xtask. The boot-capture-assert behavior is unchanged.)
 
 **Mechanics:**
-- The kernel itself contains a `#[cfg(test)]` test runner that writes pass/fail markers to the serial port and exits via QEMU's `isa-debug-exit` device
-- The host-side test runner invokes QEMU with the test kernel ELF, captures serial output, and parses the markers
-- Each test is a `#[test_case]` function inside the kernel that runs in the QEMU environment
+- The kernel boots normally, runs its demo scenarios writing markers to the serial port, and exits via QEMU's `isa-debug-exit` device (port `0xf4`, exit code 33)
+- The xtask runner boots QEMU (Limine + OVMF) per test with serial captured to a file, then asserts on expected/absent substrings; each test gets fresh NVRAM + a fresh virtio-blk disk copy for isolation
+- Each test is a `SmokeTest` entry (`name`, `expect_contains`, `expect_absent`, `timeout_secs`); some run two boots on one disk (the persistence test)
 
 **Conventions:**
 - Test names mirror the milestone they validate (`boot_prints_banner_b0`, `scheduler_runs_three_tasks_b1`)
@@ -195,7 +195,7 @@ Frame OS tests rely on these crates and tools, all of which are standard in the 
 | `cargo test` | Standard test runner | Always |
 | `insta` | Snapshot testing | Level 2, Level 7 (expected output) |
 | `assert_cmd` + `predicates` | Process-level E2E tests | Level 6 |
-| `bootimage` (or equivalent) | QEMU-bootable kernel image creation | Level 7 |
+| Limine + `xtask` (mtools/OVMF) | QEMU-bootable kernel image creation | Level 7 |
 | QEMU | Bare-metal kernel host | Level 7 |
 | `cargo clippy` | Lint pass | Level 9 (partial) |
 | `dot` (GraphViz) | Diagram rendering | Level 10 |
@@ -218,5 +218,5 @@ If any of these become relevant later, they get their own doc — they don't sne
 ## Open questions
 
 - **When does `cargo xtask check-diagrams` run?** Pre-commit hook, CI-only, or both? Pre-commit is friendlier to contributors but adds setup cost. Defer until the first `.svg` is committed.
-- **Should the Level 7 QEMU smoke tests use the `bootimage` crate or a custom `xtask`-based runner?** `bootimage` is the most-traveled path but adds a dependency. A custom runner is small but reinvents a wheel. Decide when B0 lands.
+- **Should the Level 7 QEMU smoke tests use the `bootimage` crate or a custom `xtask`-based runner?** *Resolved at B0: a custom `xtask`-based runner* (`SMOKE_TESTS` + `run_smoke_test` in `xtask/src/main.rs`), booting Limine + OVMF. `bootimage` assumes the BIOS/`bootloader`-crate path and didn't fit the Limine UEFI setup; the xtask runner is small and gives per-test serial capture + disk/NVRAM isolation.
 - **Coverage targets?** No line-coverage target is set today. The risk of "high coverage but low signal" is real for a state-machine-heavy codebase where the interesting thing is *which* transitions are exercised, not *how many lines* are touched. Defer.

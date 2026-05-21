@@ -62,7 +62,7 @@ No domain block. The driver's only state is which state is active (`$Uninitializ
 
 **What does Frame buy?** The init-before-write invariant becomes *structural* rather than a convention: the write events simply don't exist as handled operations in `$Uninitialized`, so there's no `if ready` to forget and no code path that writes to an unprogrammed UART. The state graph ([`serial_driver.svg`](serial_driver.svg)) documents the lifecycle at a glance — one edge, `init`, gates everything.
 
-**What would be lost by not using Frame here?** Honestly, not a lot — this is a small machine, and a disciplined `bool` flag would work. The doc is upfront about that: SerialDriver is deliberately *minimal*. Its value as a Frame system is twofold and modest: (1) it removes a class of "forgot the ready check" bug by construction, and (2) it's the smallest honest demonstration of `Kernel` → child-system composition and the "shared `.frs`, different native actions per target" pattern (see Composition / Testing) before that pattern carries real weight at B2 (`Shell`/`Parser` reused in the kernel).
+**What would be lost by not using Frame here?** Honestly, not a lot — this is a small machine, and a disciplined `bool` flag would work. The doc is upfront about that: SerialDriver is deliberately *minimal*. Its value as a Frame system is twofold and modest: (1) it removes a class of "forgot the ready check" bug by construction, and (2) it's the smallest honest demonstration of `Kernel` → child-system composition and the "shared `.frs`, different native actions per target" pattern (see Composition / Testing) before that pattern carries real weight at B4 Step 4b (`Shell`/`Parser` reused in a ring-3 userspace program).
 
 What this system pointedly does **not** do is invent an `$Idle → $Transmitting → $Draining` graph. At B0 the target is QEMU, where COM1 writes are synchronous — there is no asynchronous transmit phase, no TX interrupt, no FIFO-drain wait beyond the THRE poll inside `serial::write_byte`. Modeling transmit/drain states with no behavior behind them would be ceremony. Those states become real on hardware with interrupt-driven TX (a later track) and get added then. Choosing the smaller machine *is* the Frame discipline: model the invariant that exists, not the one a textbook UART diagram suggests.
 
@@ -76,7 +76,7 @@ The `serial` module is resolved at the include site, so it differs per target �
 - In the **kernel** (`kernel/src/frame_systems.rs`): `serial` is `crate::serial` (real COM1 port I/O, `kernel/src/serial.rs`).
 - In **host tests** (`kernel-tests/src/lib.rs`): `serial` is a capturing module that appends to a thread-local buffer, with `init_uart()` a no-op (no UART on the host).
 
-The *same generated `SerialDriver`* runs in both; only the native `serial` actions differ. This is the bare-metal-vs-host action split the roadmap relies on at B2.
+The *same generated `SerialDriver`* runs in both; only the native `serial` actions differ. This is the bare-metal-vs-host action split the roadmap relies on at B4 Step 4b (the `Shell`/`Parser` userspace reuse).
 
 **Called from:**
 - `Kernel` holds a `SerialDriver` in its `console` domain field (`console: SerialDriver = @@SerialDriver()`).

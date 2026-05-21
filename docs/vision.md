@@ -42,8 +42,8 @@ Concrete, falsifiable criteria. If we achieve these, the project has succeeded; 
 
 - Hosted-mode Frame OS shell runs on Linux, macOS, and Windows, with builtins, external command execution, and signal handling. (H3)
 - Bare-metal Frame OS boots in QEMU x86_64, prints a banner over serial, runs at least three concurrent Frame-defined tasks under a Frame scheduler. (B1)
-- Bare-metal Frame OS runs a shell over serial, responding to typed commands. (B2)
-- Bare-metal Frame OS loads and executes bytecode programs through a Frame interpreter. (B3)
+- Bare-metal Frame OS runs real user programs in ring 3 — static ELF binaries with `fork`/`exec`/`wait`, isolated per-process address spaces, and preemptive multitasking. (B3)
+- Bare-metal Frame OS has an on-disk filesystem and loads + runs programs from disk; a userspace shell `cat`s a file and `exec`s a program from disk. (B4)
 
 **Quality milestones:**
 
@@ -81,7 +81,7 @@ Equally important to what we're doing is what we're explicitly *not* doing. List
 
 **Frame OS is not a research vehicle for novel OS design.** The OS designs being demonstrated — cooperative tasks, classical Unix process model, classical scheduler designs — are well-understood and conventional. The novelty is in *how* they're expressed, not *what* is expressed. We are not proposing new OS concepts.
 
-**Frame OS does not run Frame programs at the user level (initially).** The bytecode VM in B3 runs its own custom instruction set, not Frame. A "Frame at the user level" extension is conceivable but not committed.
+**Frame OS does not run Frame programs at the user level.** User programs are ordinary freestanding native binaries (static ELF, raw syscalls); the Frame state machines live in the kernel and the shell, not in the user programs. A "Frame at the user level" extension is conceivable but not committed. (An earlier plan had a B3 bytecode VM with its own instruction set; that was removed in the 2026-05-20 re-baseline in favor of real ELF user programs.)
 
 ## Project values
 

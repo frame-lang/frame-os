@@ -121,10 +121,10 @@ To make the architecture/target picture concrete:
 
 | Target | Tier supported | Status | Primary purpose |
 |--------|----------------|--------|-----------------|
-| Hosted shell on Linux | n/a | Planned for H0-H3 | Reference development environment |
-| Hosted shell on macOS | n/a | Planned for H0-H3 | Mac developer accessibility |
-| Hosted shell on Windows | n/a | Planned for H0-H3 | Windows developer accessibility |
-| Bare-metal in QEMU x86_64 | Tier 1, 2, 3 | Planned for B0-B4 | Primary kernel development |
+| Hosted shell on Linux | n/a | Done (H0–H3) | Reference development environment |
+| Hosted shell on macOS | n/a | Done (H0–H3) | Mac developer accessibility |
+| Hosted shell on Windows | n/a | Done (H0–H3) | Windows developer accessibility |
+| Bare-metal in QEMU x86_64 | Tier 1, 2, 3 | B0–B3 done; B4 in progress (Step 4a) | Primary kernel development |
 | Bare-metal in QEMU AArch64 | Tier 1, 2, 3 | Future port after B3 | Mac developer dogfood |
 | Pi Pico | Tier 1 only | Future port after B1 | Microcontroller demonstration |
 | Pi 4/5 | Tier 1, 2, 3 | Future port after B3 | Real hardware demonstration |

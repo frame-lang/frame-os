@@ -23,10 +23,10 @@ These run inside the hosted-mode shell (`cargo run --bin frame-os-shell`) on Lin
 
 | System | Milestone | Status | Description |
 |---|---|---|---|
-| [`Shell` (hosted variant)](shell.md) | H0–H3 | In progress (H3 complete) | Top-level shell lifecycle: prompt, parse, run builtins or external commands, repeat. State-dependent Ctrl-C and Ctrl-Z handling. `&` background launch and `jobs`/`fg`/`bg`/`wait`/`kill` builtins. |
-| [`Parser`](parser.md) | H1 | In progress (H1) | Per-char event-driven tokenizer. `$ReadingWord → $InWord → $InQuotedString → $Done / $Failed`. Handles whitespace separation and double/single quoted substrings. |
-| [`JobControl`](job_control.md) | H3 | In progress (H3 Step 2 — standalone FSM landed; integration at Step 3) | Manager system for background jobs. Holds `Vec<Job>`. 2 states, 6 edges, 19 behavioral tests. |
-| [`Job`](job.md) | H3 | In progress (H3 Step 1 — standalone FSM landed; integration at Step 3) | Per-instance job state machine. One instance per running, stopped, or completed external command. 5 states, 14 edges, 16 behavioral tests. |
+| [`Shell` (hosted variant)](shell.md) | H0–H3 | Documented (H0–H3) | Top-level shell lifecycle: prompt, parse, run builtins or external commands, repeat. State-dependent Ctrl-C and Ctrl-Z handling. `&` background launch and `jobs`/`fg`/`bg`/`wait`/`kill` builtins. |
+| [`Parser`](parser.md) | H1 | Documented (H1) | Per-char event-driven tokenizer. `$ReadingWord → $InWord → $InQuotedString → $Done / $Failed`. Handles whitespace separation and double/single quoted substrings. |
+| [`JobControl`](job_control.md) | H3 | Documented (H3 — integrated) | Manager system for background jobs. Holds `Vec<Job>`. 2 states, 6 edges, 19 behavioral tests. |
+| [`Job`](job.md) | H3 | Documented (H3 — integrated) | Per-instance job state machine. One instance per running, stopped, or completed external command. 5 states, 14 edges, 16 behavioral tests. |
 
 ## Bare-metal kernel systems
 
@@ -49,12 +49,12 @@ These run inside the bare-metal kernel image. They do not appear in the hosted-m
 
 ## Shared systems
 
-Some Frame source files are reused between the hosted and bare-metal tracks. The Frame state machines are identical; the native action implementations differ.
+Some Frame source files are *intended* to be reused between the hosted and bare-metal tracks: the Frame state machines are identical; the native action implementations differ. **As of B4 Step 4a this reuse has not happened yet** — `Shell` and `Parser` are compiled only into the hosted shell crate (`shell/build.rs`). The bare-metal reuse is a planned **B4 Step 4b** deliverable: building the *same* `.frs` into the ring-3 `user/` crate (a userspace program, **not** a kernel task). It needs an allocator in the user crate first (`parser.frs` uses `Vec`/`String`/`format!`).
 
 | System | Hosted milestone | Bare-metal milestone | Notes |
 |---|---|---|---|
-| `Shell` | H0–H3 | B2 | Same `.frs` source, different actions (`std::process::Command` in hosted; bare-metal task interface in kernel). |
-| `Parser` | H1 | B2 | Same `.frs` source; bare-metal version uses fewer Rust standard-library types. |
+| `Shell` | H0–H3 (done) | B4 Step 4b (planned) | Same `.frs` source, different actions (`std::process::Command` in hosted; raw syscalls in a ring-3 userspace program). The B4 Step 4a userspace shell is a *scripted, hand-written* raw-syscall program; reusing the `Shell` `.frs` in ring 3 is the pending 4b work. |
+| `Parser` | H1 (done) | B4 Step 4b (planned) | Same `.frs` source; the ring-3 version uses fewer Rust standard-library types. Not yet built outside the hosted shell. |
 
 ## Cross-cutting documentation
 

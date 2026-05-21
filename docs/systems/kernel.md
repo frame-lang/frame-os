@@ -128,7 +128,7 @@ B1 will add a domain field for the scheduler reference.
 
 **What would be lost by not using Frame here?** Specifically: the panic-forwarding pattern. Five hand-written init phases that each must remember to call a shared panic helper, with no compiler enforcement, is the kind of code that ships a bug eight months later when phase six is added and the helper call is forgotten. With Frame the `=> $^` is the only way to express the forwarding, so the omission would have to be deliberate.
 
-The Frame argument here is real but compact — the kernel HSM is small (5 init children + 2 peers) and won't grow much. The argument scales further at B1 (where `Scheduler`'s state machine is more complex) and especially at B3 (where the bytecode interpreter's fetch-decode-execute cycle is literally a state machine). The kernel HSM at B0 is mostly a vehicle for proving HSM forwarding works end-to-end before later systems depend on it.
+The Frame argument here is real but compact — the kernel HSM is small (5 init children + 2 peers) and won't grow much. The argument scales further at B1 (where `Scheduler`'s state machine is more complex) and especially at B5 (where the TCP connection state machine is literally the canonical state diagram). The kernel HSM at B0 is mostly a vehicle for proving HSM forwarding works end-to-end before later systems depend on it.
 
 ## Composition
 
@@ -152,7 +152,8 @@ crate, **`frame-os-kernel-tests`** (`kernel-tests/`), which compiles the
 *same* `frame/kernel.frs` for the host and supplies a *capturing* `serial`
 module (thread-local buffer) instead of COM1 port I/O. This is the same
 "shared `.frs`, different action implementations per target" pattern the
-roadmap calls for at B2 — proven early here.
+roadmap calls for at B4 Step 4b (the `Shell`/`Parser` userspace reuse) —
+proven early here.
 
 **State graph snapshot (Level 2):** present.
 - `kernel-tests/tests/state_graphs.rs::kernel_state_graph_snapshot` —

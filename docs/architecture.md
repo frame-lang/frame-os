@@ -20,9 +20,9 @@ Frame OS produces two distinct artifacts from a shared source tree:
 
 **Hosted-mode shell** is a single Rust executable that runs as a normal process on Linux, macOS, or Windows. It presents a command prompt, parses input, runs built-in commands and external programs, and handles signals. It is, in shape, a small Unix shell. The interesting property is that every piece of its behavior is implemented as a Frame state machine.
 
-**Bare-metal kernel** is an OS image that boots in QEMU and on real hardware. It manages tasks, drives a serial console, dispatches syscalls (in later milestones), and loads programs. The Frame systems describe its control flow; native Rust handles the unsafe primitives.
+**Bare-metal kernel** is an OS image that boots in QEMU and on real hardware. It manages processes, drives a serial console, dispatches syscalls, loads ELF programs, and runs an on-disk filesystem over a block device. The Frame systems describe its control flow; native Rust handles the unsafe primitives.
 
-Some Frame systems appear in both tracks. `Shell` and `Parser` are reused, with track-specific action implementations. The kernel-specific systems (`Kernel`, `Scheduler`, `Task` / `Process`, `ProcessTable`, `SyscallDispatcher`, `ElfLoader`, `SerialDriver`, `KernelTimer`) only exist in the bare-metal track. The hosted-specific systems (`JobControl`, `Job`) only exist in the hosted track. This selective sharing is the point of organizing the code this way — the Frame layer is portable across deployment shapes for the pieces where portability makes sense, while track-specific systems live where they belong.
+Some Frame systems are *intended* to appear in both tracks: `Shell` and `Parser` are written once and reused with track-specific action implementations. **As of B4 Step 4a that reuse hasn't happened yet** — both are compiled only into the hosted shell; building them into the ring-3 `user/` crate is the planned B4 Step 4b deliverable (a userspace program, not a kernel task). The kernel-specific systems (`Kernel`, `Scheduler`, `Process`, `ProcessTable`, `SyscallDispatcher`, `ElfLoader`, `PageFaultHandler`, `SerialDriver`, and the B4 filesystem systems `BlockRequest`, `Mount`, `OpenFile`) only exist in the bare-metal track. (`Task` is the B1 predecessor of `Process` — host-validated only, not compiled into the kernel image. A `KernelTimer` system was considered but collapsed to plain Rust; the timer is the native PIT driver.) The hosted-specific systems (`JobControl`, `Job`) only exist in the hosted track. This selective sharing is the point of organizing the code this way — the Frame layer is portable across deployment shapes for the pieces where portability makes sense, while track-specific systems live where they belong.
 
 ## The Frame layer vs. the native layer
 
@@ -44,9 +44,9 @@ The hosted shell is the simpler of the two artifacts and a good entry point for 
 
 - `Shell` — the top-level lifecycle. States: `$Booting → $Prompting → $Parsing → $RunningBuiltin | $RunningExternal → $Prompting`, with `$Exiting` as a terminal sink. Signal handling differs by state, which is the textbook case for state-driven dispatch — Ctrl-C in `$Prompting` clears the line, in `$RunningExternal` kills the child, in `$RunningBuiltin` is ignored.
 
-- `Parser` — turns a typed line into a structured command. States represent parsing modes: `$ReadingWord → $InWord → $InQuotedString → $ReadingWord → $Done`. The state machine handles quoting, escaping, and whitespace coherently.
+- `Parser` — turns a typed line into a structured command. States represent parsing modes: `$ReadingWord → $InWord → $InQuotedString → $ReadingWord → $Done`. The state machine handles quoting and whitespace coherently. (No escape-character processing at H1 — quoted strings are literal; see [`systems/parser.md`](systems/parser.md).)
 
-- `JobControl` and `Job` (later milestone) — `JobControl` is the manager that tracks background jobs and `fg`/`bg` semantics. `Job` is the per-instance state machine — one instance per running job, with states for foreground/background/stopped/done. The pattern (one manager system + N instance systems) appears again in the bare-metal kernel with `ProcessTable` and `Process`.
+- `JobControl` and `Job` (H3) — `JobControl` is the manager that tracks background jobs and `fg`/`bg` semantics. `Job` is the per-instance state machine — one instance per running job, with states for foreground/background/stopped/done. The pattern (one manager system + N instance systems) appears again in the bare-metal kernel with `ProcessTable` and `Process`.
 
 **Native Rust around the Frame systems:**
 
@@ -77,19 +77,19 @@ From boot to user programs, top to bottom. Items are tagged with the milestone (
 
 ```
 ┌─────────────────────────────────────────────────────────┐
-│  User programs (bytecode at B3; ELF at B4 stretch)      │
+│  User programs — static ELF, ring 3 (B3 / disk B4)      │
 ├─────────────────────────────────────────────────────────┤
-│  Shell, builtins (Frame systems, B2)                    │
+│  Userspace shell (ring-3, B4 4a/4b)                     │
 ├─────────────────────────────────────────────────────────┤
-│  Bytecode interpreter (Frame system, B3)                │
+│  Filesystem + VFS — Mount, OpenFile (B4)                │
 ├─────────────────────────────────────────────────────────┤
-│  Scheduler (B1), Task (B1) → Process / ProcessTable (B4)│
+│  Scheduler (B1), Process / ProcessTable (B3)            │
 ├─────────────────────────────────────────────────────────┤
-│  SyscallDispatcher (B4), ElfLoader (B4)                 │
+│  SyscallDispatcher (B3), ElfLoader (B3)                 │
 ├─────────────────────────────────────────────────────────┤
-│  PageFaultHandler (B4)                                  │
+│  PageFaultHandler (B2)                                  │
 ├─────────────────────────────────────────────────────────┤
-│  Drivers — SerialDriver (B0), KernelTimer (B1)          │
+│  Drivers — SerialDriver (B0), virtio-blk (B4)          │
 ├─────────────────────────────────────────────────────────┤
 │  Native: paging, GDT/IDT, context switch, heap, MMU     │
 ├─────────────────────────────────────────────────────────┤
@@ -101,7 +101,7 @@ The layers above the line are Frame-organized. The layers below are native Rust 
 
 ### Frame systems in the kernel
 
-Each of these is a `.frs` file. The list grows across milestones — B1 needs `Kernel`, `Scheduler`, `Task`, `SerialDriver`. B3 adds `Interpreter`. B4 adds `Process`, `ProcessTable`, `SyscallDispatcher`, `ElfLoader`, `PageFaultHandler`.
+Each of these is a `.frs` file. The list grows across milestones — B0 starts with `Kernel` + `SerialDriver`; B1 adds `Scheduler` + `Task`; B2 adds `PageFaultHandler`; B3 replaces `Task` with `Process` + `ProcessTable` and adds `SyscallDispatcher` + `ElfLoader`; B4 adds the filesystem systems `BlockRequest`, `Mount`, `OpenFile`.
 
 What follows is a *brief description* of each system: what it is, what its states are, why it earns being a state machine. The authoritative reference for each system (once implemented) lives in [`systems/`](systems/) — one file per system, with the state diagram, the full interface, the domain, and the detailed transition rules. The summaries below are the catalog; the per-system docs are the reference.
 
@@ -113,19 +113,23 @@ What follows is a *brief description* of each system: what it is, what its state
 
 **`ProcessTable`** (B3) — manager for the process array. The textbook framing is per-slot allocation states (`$Free → $Reserved → $Active → $ZombieAwaitingReap`), where `$Reserved` covers in-progress `fork()` that might fail partway. *As implemented (B3 Step 3), `ProcessTable` is a `JobControl`-style manager* holding `Vec<Process>` with `$HasCapacity ⇄ $Full` under a `$Managing` parent — the per-slot allocation lifecycle would largely duplicate the `Process` lifecycle, and `$Reserved`'s partial-fork case arrives with `fork`/`exec` at Step 5. The one invariant worth a state now is capacity (`spawn()` rejects when `$Full`). See [`systems/process_table.md`](systems/process_table.md).
 
-**`SyscallDispatcher`** (B4) — routes incoming syscalls to handlers, with HSM error handling. `$Active` is a parent state with `$Validating`, `$Executing`, `$Returning` as children. Error events (`bad_arg`, `permission_denied`, `out_of_memory`) are declared as handlers on `$Active`; each child declares a trailing `=> $^` so these error events forward to the parent's handlers when fired from deep inside a child state. This means error paths route correctly without explicit `Result<>` plumbing through every syscall implementation.
+**`SyscallDispatcher`** (B3) — routes incoming syscalls to handlers, with HSM error handling. `$Active` is a parent state with `$Validating` and `$Executing` as children. The error path is the single `reject(code)` handler declared on `$Active`; `$Validating` declares a trailing `=> $^` so an invalid syscall number forwards to `$Active.reject` (which records the error result and returns to `$Validating`) rather than reaching `$Executing`. This means the error path routes correctly without explicit `Result<>` plumbing through every syscall implementation. *As implemented (B3 Step 2), there is no `$Returning` child* — the result is written by `$Executing` and read back natively after dispatch. See [`systems/syscall_dispatcher.md`](systems/syscall_dispatcher.md).
 
 **`ElfLoader`** (B3) — loads a static ELF into a process address space. States are loading phases: `$ReadingHeader → $ValidatingHeader → $MappingSegments → $BuildingStack → $Done`, with `$Failed` as a sink that cleans up partial work. Every phase routes failure to the single `$Failed` state, whose enter handler does the rollback once — avoiding a `Result<>` ladder that would obscure the load sequence. *As implemented (B3 Step 4a), this is a flat phase FSM, not an HSM*: the funnel is "many phases → one sink" with shared cleanup in `$Failed`, not `=> $^` forwarding (there is no shared *handler* to centralize — failure detection differs per phase). The phases cascade from construction, like the `Kernel` boot chain. `crate::elf` owns the ELF64 parsing + PT_LOAD mapping; the loaded program is a freestanding-Rust static ELF baked into the kernel image. See [`systems/elf_loader.md`](systems/elf_loader.md).
 
 **`PageFaultHandler`** (B2; isolation B3 Step 4b) — classifies page faults and dispatches to the appropriate response. The parent state `$FaultActive` hosts the single "unrecoverable" handler; recovery children forward to it via `=> $^` so any give-up routes to one disposition decision without explicit error plumbing. *As implemented:* `$Classifying → $LazyFault` recovers (demand paging); on giving up, children self-send `unrecoverable()` (forwarded `=> $^` to `$FaultActive`), which routes on the error-code U/S bit to `$Killing` (ring-3 fault → kill the offending `Process`, kernel survives) or `$Fatal` (kernel fault → halt). This is where the `=> $^` forwarding finally became load-bearing. `$StackGrow`/`$CopyOnWrite` join the same funnel at B4. See [`systems/page_fault_handler.md`](systems/page_fault_handler.md).
 
-**`Interpreter`** (B3) — the bytecode VM. The machine block is literally the fetch-decode-execute cycle: `$Fetching → $Decoding → $Exec{Push, Add, Print, ...} → $Fetching → $Halted | $Faulted`. Each opcode is a state. This is arguably the project's most expressive Frame system — the interpreter's structure isn't approximated by a state machine, it *is* a state machine, top to bottom.
+**`BlockRequest`** (B4) — one block-I/O request's lifecycle: `$Queued → $InFlight → $Complete | $Error`. Driven by the virtio-blk completion interrupt via the **post/drain** deferred-event pattern (the ISR *posts* a completion flag; the kernel *drains* from normal context and advances the request — the Frame system is never dispatched from interrupt context). This is the project's first async-interrupt → Frame boundary. See [`systems/block_request.md`](systems/block_request.md).
 
-**`SerialDriver`** — manages the UART. States: `$Idle → $Transmitting → $Draining → $Idle`. The state machine handles "can I accept another byte right now?" without a `busy` flag scattered through the codebase. Different states respond differently to `write(byte)` — `$Idle` starts transmission, `$Transmitting` queues, `$Draining` blocks or returns busy depending on configuration.
+**`Mount`** (B4) — a filesystem's mount/unmount lifecycle: `$Unmounted → $Mounting → $Mounted → $Unmounting`. Gates FS reads on `is_mounted()` — the invariant *is* the state. See [`systems/mount.md`](systems/mount.md).
 
-**`KernelTimer`** — coordinates the periodic interrupt source. States: `$Stopped → $Calibrating → $Running`. This system is borderline — the calibration phase has genuinely different behavior than the running phase (calibration measures TSC frequency or similar, running just lets ticks arrive), but if calibration ends up being a single configuration call rather than a multi-step process, `KernelTimer` may collapse to plain Rust. Decision deferred until B1 implementation; included here so the architecture acknowledges the question.
+**`OpenFile`** (B4) — one open file descriptor's lifecycle, with the access mode as the state: `$Open → $Reading | $Writing → $Closed`. A wrong-mode op (a write on a read-fd, or any op on a closed fd) is gated out structurally rather than checked with a flag. The VFS holds one per fd. See [`systems/open_file.md`](systems/open_file.md).
 
-**`Shell`** (in bare-metal, over serial) — same Frame source as the hosted shell, but the *actions* are completely different: writes go to `SerialDriver` instead of `stdout`, and "external commands" map differently. In B2 there are no external commands — only builtins. In B3, the shell can `run <program>` to execute loaded bytecode through the `Interpreter` system, which is the bare-metal analogue of the hosted shell's "shell out to host". The state machines are portable across these very different action surfaces because Frame separates *which states exist and what events they handle* (portable) from *what each handler actually does* (not portable, native code).
+**`SerialDriver`** — manages the UART. *As implemented (B0)* it is a minimal init gate: `$Uninitialized → $Ready`, enforcing "program the UART before transmitting" (writes before init are dropped). QEMU's serial is synchronous, so the originally-specced `$Idle → $Transmitting → $Draining` transmit/drain states would have no behavior behind them; they become real only on an interrupt-driven hardware track. See [`systems/serial_driver.md`](systems/serial_driver.md).
+
+**`KernelTimer`** — *resolved to plain Rust, not a Frame system.* The periodic interrupt source was a candidate state machine (`$Stopped → $Calibrating → $Running`), but calibration turned out to be a single configuration call, so a state machine would add ceremony without clarity. The timer is the native PIT driver (`pit.rs`); this entry is kept only to record the decision.
+
+**`Shell`** (planned bare-metal reuse — B4 Step 4b) — the same Frame source as the hosted shell, run as a *ring-3 userspace program* rather than a kernel task. The *actions* differ: writes go through the `write_char` syscall instead of `stdout`, and "external commands" become `fork`/`exec` of programs loaded from disk. **Not yet built** — the B4 Step 4a userspace shell is a scripted, hand-written raw-syscall program; compiling the `Shell`/`Parser` `.frs` for ring 3 is the pending 4b work (it needs an allocator in the `user/` crate). The state machines are portable across these very different action surfaces because Frame separates *which states exist and what events they handle* (portable) from *what each handler actually does* (native, not portable).
 
 ### Native Rust modules in the kernel
 

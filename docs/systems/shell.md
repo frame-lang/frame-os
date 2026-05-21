@@ -4,12 +4,12 @@
 
 | Property | Value |
 |---|---|
-| Track | Hosted (will be reused in Bare-metal at B2 with different actions; the bare-metal version omits $RunningExternal because there's no host OS to shell out to) |
+| Track | Hosted (planned for reuse as a **ring-3 userspace program** at B4 Step 4b — not yet built; the userspace version omits $RunningExternal because there's no host OS to shell out to) |
 | Milestone introduced | H0 |
 | Source file | [`../../frame/shell.frs`](../../frame/shell.frs) |
 | State diagram | [`shell.svg`](shell.svg) |
 | Instances at runtime | Exactly one per process |
-| Status | In progress (H2 — external commands + state-dependent Ctrl-C) |
+| Status | Documented (H0–H3) |
 
 ## State diagram
 
@@ -206,7 +206,7 @@ The action bodies are inside the `actions:` block in [`../../frame/shell.frs`](.
 
 At H1, `print_unknown` moved out of `actions:` and into `execute()` in [`../../shell/src/builtin.rs`](../../shell/src/builtin.rs) — unknown commands are now a `Builtin::Unknown` variant that flows through the normal `$Parsing → $RunningBuiltin → execute()` path. Output format is unchanged (`unknown command: {cmd} (try 'exit')`), so the H0 E2E tests still pass.
 
-The actions are unsafe-free and `std`-only. They will need to be re-implemented for the bare-metal `Shell` at B2 (writing to `SerialDriver` instead of `stdout`); the Frame source itself is unchanged.
+The actions are unsafe-free and `std`-only. They will need to be re-implemented for the ring-3 userspace `Shell` at B4 Step 4b (writing via the `write_char` syscall instead of `stdout`); the Frame source itself is unchanged.
 
 ## Native dispatch layer (H1+)
 
