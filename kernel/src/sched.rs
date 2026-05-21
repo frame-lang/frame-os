@@ -314,6 +314,21 @@ pub unsafe fn spawn_user_from_frame(pml4: u64, frame: &crate::usermode::TrapFram
     with_sched(|s| s.task_ready());
 }
 
+/// Point the *current* process at a new address space (B3 Step 5c `exec`): the
+/// process keeps its pid + kernel stack, but its user space is replaced. Updates
+/// the TCB's PML4 and switches CR3 now (so the syscall return `iretq`s into the
+/// new program). The old address space is abandoned (teardown is Step 5d).
+///
+/// # Safety
+/// `new_pml4` must root a valid address space with the new program + stack
+/// mapped USER and the kernel higher-half mirrored.
+pub unsafe fn exec_into(new_pml4: u64) {
+    let cur = (&raw const CURRENT).read();
+    (*tcbs().add(cur)).pml4 = new_pml4;
+    paging::switch(new_pml4);
+    (&raw mut LAST_PML4).write(new_pml4);
+}
+
 /// Initialize the scheduler: create the Frame `Scheduler`, reserve the boot
 /// context, and capture the kernel address space. Call once before spawning.
 pub fn init() {

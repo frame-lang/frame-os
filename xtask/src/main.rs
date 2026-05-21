@@ -643,6 +643,22 @@ const SMOKE_TESTS: &[SmokeTest] = &[
         expect_absent: &["KERNEL EXCEPTION", "KERNEL PANIC", "triple fault"],
         timeout_secs: 20,
     },
+    SmokeTest {
+        // B3 Step 5c: fork + exec — the canonical shell-launch pattern. The
+        // `spawner` program (pid 5) forks; the child (pid 6) execs program 0
+        // (`hello`), *becoming* hello — its image is replaced and it runs
+        // hello's code, printing "hello from ELF". The parent prints 'S'. The
+        // "hello from ELF" matched here (after the exec marker) is the exec'd
+        // child's, not the original pid-1 hello (which ran far earlier).
+        name: "exec_b3",
+        expect_contains: &[
+            "[fork] pid 5 forked child pid 6",
+            "[exec] pid 6 exec'd program 0",
+            "hello from ELF",
+        ],
+        expect_absent: &["KERNEL EXCEPTION", "KERNEL PANIC", "triple fault"],
+        timeout_secs: 20,
+    },
 ];
 
 fn run_qemu_test() -> Result<()> {

@@ -116,6 +116,7 @@ fn build_user_program(workspace_root: &Path, out_dir: &Path) -> Result<()> {
         ("hello", "user_hello.elf"),
         ("faulter", "user_faulter.elf"),
         ("forker", "user_forker.elf"),
+        ("spawner", "user_spawner.elf"),
     ] {
         let elf = release.join(bin);
         if !elf.exists() {
@@ -136,6 +137,7 @@ fn build_user_program(workspace_root: &Path, out_dir: &Path) -> Result<()> {
         "src/main.rs",
         "src/faulter.rs",
         "src/forker.rs",
+        "src/spawner.rs",
         "linker.ld",
         "Cargo.toml",
         ".cargo/config.toml",

@@ -69,6 +69,8 @@ static USER_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/user_hello.el
 static USER_FAULTER_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/user_faulter.elf"));
 // `forker` (B3 Step 5b) forks into two concurrent processes.
 static USER_FORKER_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/user_forker.elf"));
+// `spawner` (B3 Step 5c) forks + execs `hello` in the child.
+static USER_SPAWNER_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/user_spawner.elf"));
 
 global_asm!(
     // syscall entry: rcx=user RIP, r11=user RFLAGS, rax=num, rdi/rsi=args.
@@ -231,9 +233,9 @@ fn proc_table() -> &'static mut ProcessTable {
 }
 
 /// Validation predicate, called by the dispatcher's `$Validating` state.
-/// 0 = write_char, 1 = exit, 2 = fork.
+/// 0 = write_char, 1 = exit, 2 = fork, 3 = exec(prog_id).
 pub fn is_known_syscall(num: u64) -> bool {
-    num == 0 || num == 1 || num == 2
+    num <= 3
 }
 
 /// Perform a (validated) syscall, called by the dispatcher's `$Executing`
@@ -255,8 +257,60 @@ pub fn perform_syscall(num: u64, a0: u64, _a1: u64) -> u64 {
             0
         }
         2 => do_fork(),
+        3 => do_exec(a0),
         _ => u64::MAX, // unreachable: validated by is_known_syscall
     }
+}
+
+/// Map an `exec` program id to its baked ELF. (No filesystem yet — programs are
+/// selected by id; B4 replaces this with loading from disk.)
+fn exec_elf(prog_id: u64) -> Option<&'static [u8]> {
+    match prog_id {
+        0 => Some(USER_ELF), // "hello"
+        _ => None,
+    }
+}
+
+/// `exec`: replace the calling process's image with a freshly loaded program.
+/// The process keeps its pid + kernel stack; its address space + trap frame are
+/// replaced so the syscall returns into the new program at its entry. On an
+/// unknown program id, returns u64::MAX and the caller keeps running.
+fn do_exec(prog_id: u64) -> u64 {
+    let Some(elf) = exec_elf(prog_id) else {
+        return u64::MAX;
+    };
+    // Load the new program into a fresh address space.
+    let new_pml4 = unsafe { paging::new_address_space() };
+    crate::elf::prepare(elf, new_pml4);
+    let mut loader = ElfLoader::__create();
+    if loader.is_failed() {
+        return u64::MAX;
+    }
+    let entry = loader.entry();
+    let user_rsp = loader.user_stack_top();
+
+    serial::write_str("[exec] pid ");
+    serial::write_u32_decimal(sched::current_pid());
+    serial::write_str(" exec'd program ");
+    serial::write_u32_decimal(prog_id as u32);
+    serial::writeln("");
+
+    // Swap the current process onto the new address space, then reset its trap
+    // frame to enter the new program fresh (zeroed GPRs, new RIP/RSP). The
+    // syscall stub's iretq returns into it. rax is set to 0 by syscall_dispatch.
+    unsafe {
+        sched::exec_into(new_pml4);
+        let f = &mut *(&raw const CURRENT_TRAP_FRAME).read();
+        *f = TrapFrame {
+            rip: entry,
+            rsp: user_rsp,
+            cs: 0x23,      // USER_CODE | 3
+            ss: 0x1b,      // USER_DATA | 3
+            rflags: 0x202, // IF=1
+            ..core::mem::zeroed()
+        };
+    }
+    0
 }
 
 /// Finish a voluntary `exit`: report it, move the Process to `$Zombie`, and
@@ -395,4 +449,5 @@ pub fn run() {
     run_one(USER_ELF, "hello");
     run_one(USER_FAULTER_ELF, "faulter");
     run_one(USER_FORKER_ELF, "forker");
+    run_one(USER_SPAWNER_ELF, "spawner");
 }

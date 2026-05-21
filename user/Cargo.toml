@@ -27,6 +27,11 @@ path = "src/faulter.rs"
 name = "forker"
 path = "src/forker.rs"
 
+# fork + exec: the child execs `hello` (B3 Step 5c).
+[[bin]]
+name = "spawner"
+path = "src/spawner.rs"
+
 [profile.dev]
 panic = "abort"
 opt-level = 1
