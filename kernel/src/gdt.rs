@@ -58,6 +58,16 @@ impl Tss {
 
 static mut TSS: Tss = Tss::new();
 
+/// Set TSS.RSP0 — the kernel stack the CPU loads when an interrupt or trap
+/// enters ring 0 from ring 3. The scheduler calls this on every switch *to* a
+/// user process, so each process traps onto its own kernel stack (B3 Step 5a).
+pub fn set_rsp0(top: u64) {
+    unsafe {
+        let tss_ptr = &raw mut TSS;
+        (*tss_ptr).rsp[0] = top;
+    }
+}
+
 // 7 u64 slots: null, kcode, kdata, udata, ucode, then the 16-byte TSS
 // descriptor (2 slots).
 static mut GDT: [u64; 7] = [0; 7];

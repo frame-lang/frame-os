@@ -580,20 +580,21 @@ const SMOKE_TESTS: &[SmokeTest] = &[
         timeout_secs: 20,
     },
     SmokeTest {
-        // B3 Step 1b + 3 + 4a: the user/kernel boundary running a real ELF as a
-        // Process. ElfLoader parses + maps the baked freestanding-Rust `hello`
-        // program; it's spawned ($Ready), runs in ring 3 printing "hello from
-        // ELF" via write_char syscalls, exits(42) (the exit syscall longjmps
-        // back to the kernel → $Zombie), and is reaped ($Reaped, slot freed).
+        // B3 Step 1b + 3 + 4a + 5a: a real ELF run as a preemptible, scheduled
+        // Process. ElfLoader parses + maps the baked `hello` program into its
+        // own address space; it's spawned ($Ready), scheduled (entered ring 3
+        // via the scheduler's iretq, preemptible), prints "hello from ELF" via
+        // write_char syscalls on its own kernel stack, exit(42)s (→ $Zombie +
+        // yields to the scheduler), then is reaped ($Reaped, slot freed).
         name: "ring3_syscall_b3",
         expect_contains: &[
             "[elf] loaded hello, entry 0x",
             "[proc] spawned pid 1 (Ready)",
-            "[user] entering ring 3",
+            "[sched] user process scheduled",
             "hello from ELF",
             "[user] exited with code 42",
             "[proc] pid 1 exited -> Zombie",
-            "[user] back in kernel",
+            "[sched] user process left the CPU",
             "[proc] reaped pid 1; exit 42; table count 0",
         ],
         expect_absent: &["KERNEL EXCEPTION", "KERNEL PANIC", "triple fault"],

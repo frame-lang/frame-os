@@ -25,8 +25,7 @@ use core::arch::asm;
 use core::sync::atomic::{AtomicBool, Ordering};
 
 use crate::frame_systems::Scheduler;
-use crate::interrupts;
-use crate::serial;
+use crate::{gdt, interrupts, paging, serial};
 
 const MAX_THREADS: usize = 8;
 const STACK_SIZE: usize = 16 * 1024;
@@ -43,18 +42,43 @@ enum RunState {
 struct Tcb {
     rsp: u64,
     state: RunState,
+    // User-process fields (B3 Step 5a). For kernel threads / the boot context
+    // these are 0 and the scheduler keeps the kernel address space.
+    pml4: u64,       // 0 ⇒ kernel address space; else this process's PML4 phys
+    kstack_top: u64, // ring-0 stack top for TSS.RSP0 + the syscall path
+    pid: u32,        // the owning Process's pid (0 if none)
 }
 
-static mut TCBS: [Tcb; MAX_THREADS] = [Tcb {
+const TCB_INIT: Tcb = Tcb {
     rsp: 0,
     state: RunState::Free,
-}; MAX_THREADS];
+    pml4: 0,
+    kstack_top: 0,
+    pid: 0,
+};
+
+static mut TCBS: [Tcb; MAX_THREADS] = [TCB_INIT; MAX_THREADS];
 static mut N: usize = 0; // total TCBs incl. boot (slot 0)
 static mut CURRENT: usize = 0;
 static ACTIVE: AtomicBool = AtomicBool::new(false);
 
+// Address-space + per-process-kernel-stack tracking (B3 Step 5a).
+static mut KERNEL_PML4: u64 = 0; // the boot/kernel address space
+static mut LAST_PML4: u64 = 0; // CR3 currently loaded (avoid redundant reloads)
+
+// Current user process's ring-0 stack top. #[no_mangle] so the syscall entry
+// stub (usermode.rs global_asm) can load it RIP-relative — each syscall runs
+// on its own process's kernel stack. Updated by `schedule()` on every switch.
+#[no_mangle]
+static mut CURRENT_KSTACK: u64 = 0;
+
 static mut STACK1: [u8; STACK_SIZE] = [0; STACK_SIZE];
 static mut STACK2: [u8; STACK_SIZE] = [0; STACK_SIZE];
+
+// Per-process ring-0 kernel stacks, indexed by TCB slot (B3 Step 5a). A user
+// process traps (timer/syscall) onto its own kernel stack so concurrent
+// processes never share ring-0 stack state.
+static mut KSTACKS: [[u8; STACK_SIZE]; MAX_THREADS] = [[0; STACK_SIZE]; MAX_THREADS];
 
 // The Frame Scheduler — guarded by interrupts-off critical sections (it is
 // non-reentrant and shared across preemptible threads).
@@ -112,7 +136,34 @@ extern "C" fn schedule(current_rsp: u64) -> u64 {
         }
 
         (&raw mut CURRENT).write(next);
+
+        // Address-space + kernel-stack switch (B3 Step 5a). A user process
+        // runs in its own PML4 and traps onto its own ring-0 stack; a kernel
+        // thread / the boot context runs in the kernel address space. The
+        // kernel higher-half is mirrored into every PML4, so the `mov cr3`
+        // here (executed on a kernel stack) keeps this code + stack mapped.
+        let np = (*t.add(next)).pml4;
+        let kernel_pml4 = (&raw const KERNEL_PML4).read();
+        let target = if np != 0 { np } else { kernel_pml4 };
+        if target != 0 && target != (&raw const LAST_PML4).read() {
+            paging::switch(target);
+            (&raw mut LAST_PML4).write(target);
+        }
+        if np != 0 {
+            let kstack = (*t.add(next)).kstack_top;
+            gdt::set_rsp0(kstack);
+            (&raw mut CURRENT_KSTACK).write(kstack);
+        }
+
         (*t.add(next)).rsp
+    }
+}
+
+/// The pid of the currently-running process (0 if none / a kernel thread).
+pub fn current_pid() -> u32 {
+    unsafe {
+        let cur = (&raw const CURRENT).read();
+        (*tcbs().add(cur)).pid
     }
 }
 
@@ -159,12 +210,21 @@ unsafe fn init_thread(stack_top: *mut u8, entry: extern "C" fn() -> !, cs: u16, 
     saved_rsp
 }
 
-/// Reserve TCB[0] for the boot context (the idle fallback).
+/// Reserve TCB[0] for the boot context (the idle fallback), and capture the
+/// kernel address space so the scheduler can restore it when switching away
+/// from a user process.
 fn init_boot() {
     unsafe {
+        // Reset the table (a fresh scheduler run reuses the global array).
+        for i in 0..MAX_THREADS {
+            (*tcbs().add(i)) = TCB_INIT;
+        }
         (&raw mut N).write(1);
         (&raw mut CURRENT).write(0);
         (*tcbs().add(0)).state = RunState::Runnable; // boot is always available
+        let kpml4 = paging::current_pml4();
+        (&raw mut KERNEL_PML4).write(kpml4);
+        (&raw mut LAST_PML4).write(kpml4);
     }
 }
 
@@ -181,10 +241,82 @@ unsafe fn spawn(stack_top: *mut u8, entry: extern "C" fn() -> !) {
     with_sched(|s| s.task_ready());
 }
 
+// ---------------------------------------------------------------------------
+// User-process scheduling (B3 Step 5a)
+// ---------------------------------------------------------------------------
+
+/// Craft a fresh *user* process's kernel stack as a synthetic preemption frame
+/// whose `iretq` drops to ring 3 at `entry` with interrupts enabled. Identical
+/// layout to `init_thread` but with ring-3 selectors and the user RSP:
+/// [15 zeroed GPRs][RIP=entry][CS=0x23][RFLAGS=0x202][RSP=user_rsp][SS=0x1b].
+///
+/// # Safety
+/// `kstack_top` must point one past a writable kernel stack ≥ 256 bytes.
+unsafe fn init_user_frame(kstack_top: u64, entry: u64, user_rsp: u64) -> u64 {
+    let top = kstack_top & !0xF;
+    let saved_rsp = top - 160;
+    let s = saved_rsp as *mut u64;
+    let mut i = 0;
+    while i < 15 {
+        s.add(i).write(0);
+        i += 1;
+    }
+    s.add(15).write(entry); // RIP
+    s.add(16).write((gdt::USER_CODE | 3) as u64); // CS (ring 3)
+    s.add(17).write(0x202); // RFLAGS: IF=1, reserved bit1=1
+    s.add(18).write(user_rsp); // user RSP
+    s.add(19).write((gdt::USER_DATA | 3) as u64); // SS (ring 3)
+    saved_rsp
+}
+
+/// Admit a user process to the scheduler: it runs in address space `pml4`,
+/// first enters ring 3 at `entry` with stack `user_rsp`, and is linked to
+/// `Process` `pid`. Fires the Frame Scheduler's `task_ready`.
+///
+/// # Safety
+/// `pml4` must be a valid address space with `entry`/`user_rsp` mapped USER.
+pub unsafe fn spawn_user(pml4: u64, entry: u64, user_rsp: u64, pid: u32) {
+    let n = (&raw const N).read();
+    // Top of this slot's kernel stack: base + (n+1)*STACK_SIZE, 16-aligned.
+    let base = (&raw mut KSTACKS) as *mut u8;
+    let kstack_top = (base.add((n + 1) * STACK_SIZE) as u64) & !0xF;
+    let rsp = init_user_frame(kstack_top, entry, user_rsp);
+    let t = tcbs();
+    (*t.add(n)).rsp = rsp;
+    (*t.add(n)).state = RunState::Runnable;
+    (*t.add(n)).pml4 = pml4;
+    (*t.add(n)).kstack_top = kstack_top;
+    (*t.add(n)).pid = pid;
+    (&raw mut N).write(n + 1);
+    with_sched(|s| s.task_ready());
+}
+
+/// Initialize the scheduler: create the Frame `Scheduler`, reserve the boot
+/// context, and capture the kernel address space. Call once before spawning.
+pub fn init() {
+    unsafe {
+        let p = &raw mut SCHED;
+        *p = Some(Scheduler::__create());
+    }
+    init_boot();
+}
+
+/// Enable preemption and idle the boot context until every spawned task has
+/// exited (the Frame Scheduler reports `$Idle`), then disable preemption.
+pub fn run_until_idle() {
+    ACTIVE.store(true, Ordering::Relaxed);
+    interrupts::enable();
+    while !with_sched(|s| s.is_idle()) {
+        interrupts::wait_for_interrupt();
+    }
+    interrupts::disable();
+    ACTIVE.store(false, Ordering::Relaxed);
+}
+
 /// Exit the calling worker: mark it dead (so the ISR stops scheduling it),
 /// fire the Frame Scheduler's `task_unready`, then park. Never returns — the
 /// next tick switches away and this thread is never resumed.
-fn exit_current() -> ! {
+pub fn exit_current() -> ! {
     // Mark Dead *and* fire `task_unready` in a single critical section. If
     // these were separate sections a timer tick could land in between:
     // `schedule()` would see this thread is Dead and switch away, and since
@@ -197,6 +329,11 @@ fn exit_current() -> ! {
         (*tcbs().add(cur)).state = RunState::Dead;
         with_sched(|s| s.task_unready());
     });
+    // A dead task MUST park with interrupts enabled so the next timer tick
+    // switches away. Kernel-thread callers already run with IF=1, but a user
+    // process exits via the syscall path (IF=0, cleared by FMASK), so enable
+    // explicitly — `wait_for_interrupt` is a bare `hlt` and would hang at IF=0.
+    interrupts::enable();
     loop {
         interrupts::wait_for_interrupt();
     }
