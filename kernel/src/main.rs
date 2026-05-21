@@ -31,6 +31,7 @@ mod allocator;
 mod context;
 mod frame_systems;
 mod frames;
+mod gdt;
 mod interrupts;
 mod io;
 mod paging;
@@ -98,6 +99,12 @@ unsafe extern "C" fn kmain() -> ! {
     // (When B1 adds a scheduler, kmain will hold the Kernel and pump
     // tick() events into it instead of halting here.)
     let _kernel = Kernel::__create();
+
+    // B3 Step 1a: install our own GDT + TSS (required for ring 3 +
+    // syscall/sysret). Reaching the next line proves the GDT load + segment
+    // reload + ltr didn't fault.
+    gdt::init();
+    serial::writeln("[gdt] loaded our GDT + TSS");
 
     // B2 Step 1: physical frame allocator. As of Step 5 the allocator is
     // initialized by the boot HSM's $InitMemory phase (during __create

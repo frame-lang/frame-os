@@ -534,6 +534,15 @@ const SMOKE_TESTS: &[SmokeTest] = &[
         expect_absent: &["KERNEL EXCEPTION", "KERNEL PANIC", "triple fault"],
         timeout_secs: 20,
     },
+    SmokeTest {
+        // B3 Step 1a: install our own GDT + TSS (syscall/sysret selector
+        // layout + a kernel stack for ring-3 interrupts). Reaching the line
+        // proves the lgdt + CS/segment reload + ltr didn't fault.
+        name: "gdt_loaded_b3",
+        expect_contains: &["[gdt] loaded our GDT + TSS"],
+        expect_absent: &["KERNEL EXCEPTION", "KERNEL PANIC", "triple fault"],
+        timeout_secs: 20,
+    },
 ];
 
 fn run_qemu_test() -> Result<()> {
