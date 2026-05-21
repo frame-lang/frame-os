@@ -404,7 +404,9 @@ H3 is the H-track's final committed milestone. Further H-track work (a configura
 - `ArpResolver`, `IpReassembly`, `UdpSocket`.
 - **`TcpConnection`** — the full RFC-793 state machine: `$Closed → $SynSent/$SynReceived → $Established → $FinWait1/$FinWait2/$Closing/$TimeWait/$CloseWait/$LastAck → $Closed`, with retransmit, delayed-ACK, and simultaneous-open/close edge cases. One instance per connection.
 
-**Native components:** virtio-net (or e1000) driver + DMA rings; checksum handling; socket buffers; the timer wheel feeding TCP's timers.
+**Native components:** virtio-net driver + DMA rings; checksum handling; socket buffers; the timer wheel feeding TCP's timers (TCP timers map to Frame enter/exit handlers + state variables, fired by the native wheel through the B4 `post`/`drain` boundary — Frame has no `after(ms)` primitive and doesn't need one; see [`plans/b5.md`](plans/b5.md)).
+
+**Test transport:** start with **QEMU user-mode networking (slirp)** — no root, CI-friendly. **TAP** is the production path (full L2 + true ICMP) and is the deferred upgrade: add it once the slirp-based smoke tests pass, since it needs host/CI privilege + setup. (Decided 2026-05-21.)
 
 **framec gates expected (the deepest in the whole roadmap):**
 - **Timed transitions / `after(ms)`** — TCP is full of timers (retransmit, `TIME_WAIT` 2·MSL, delayed-ACK, keepalive). If Frame has no native timed-transition primitive, this is where it is needed most.
