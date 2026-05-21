@@ -67,6 +67,11 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: x86_64-unknown-none
+      # The kernel's build.rs runs framec on the Frame sources, and building
+      # the kernel triggers the nested user-crate build (which also runs
+      # framec on parser.frs for the ring-3 Parser reuse). Both need framec.
+      - name: Install framec
+        run: cargo install framec
       - name: Cache cargo
         uses: actions/cache@v4
         with:
@@ -94,6 +99,10 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: x86_64-unknown-none
+      # qemu-test builds the kernel (and the nested user crate), both of which
+      # run framec in their build scripts.
+      - name: Install framec
+        run: cargo install framec
       - name: Install QEMU + OVMF + mtools
         # qemu-system-x86 ships qemu-system-x86_64; ovmf provides
         # /usr/share/OVMF/OVMF_CODE.fd + OVMF_VARS.fd which find_ovmf
