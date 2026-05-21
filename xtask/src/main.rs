@@ -520,6 +520,20 @@ const SMOKE_TESTS: &[SmokeTest] = &[
         expect_absent: &["KERNEL EXCEPTION", "triple fault"],
         timeout_secs: 20,
     },
+    SmokeTest {
+        // B2 Step 4: per-process address spaces. Build a fresh PML4 (kernel
+        // higher-half mirrored), map a page only in it, switch CR3 (the
+        // kernel survives the switch — proving the higher-half copy), read
+        // the page back, switch back, and confirm the mapping was isolated
+        // to the new space.
+        name: "address_space_switch_b2",
+        expect_contains: &[
+            "[vm] address-space switch sees its mapping: ok",
+            "[vm] mapping isolated to its address space: ok",
+        ],
+        expect_absent: &["KERNEL EXCEPTION", "KERNEL PANIC", "triple fault"],
+        timeout_secs: 20,
+    },
 ];
 
 fn run_qemu_test() -> Result<()> {

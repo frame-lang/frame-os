@@ -152,6 +152,37 @@ unsafe extern "C" fn kmain() -> ! {
         frames::free_frame(frame);
     }
 
+    // B2 Step 4: per-process address spaces (the primitive B3 needs). Build
+    // a fresh PML4 (kernel higher-half mirrored), map a page in it that is
+    // NOT mapped in the current space, switch to it, read the page back
+    // (proving the new space's mapping is live AND the kernel survived the
+    // CR3 load), switch back, and confirm the mapping was isolated to the
+    // new space.
+    {
+        const AS_VA: u64 = 0x0000_3000_0000_0000;
+        const AS_PATTERN: u64 = 0x0bad_c0de_1337_d00d;
+        let saved = paging::current_pml4();
+        let frame = frames::alloc_frame().expect("frame alloc");
+        unsafe {
+            // Seed the frame via the HHDM (address-space independent).
+            (frames::phys_to_virt(frame) as *mut u64).write_volatile(AS_PATTERN);
+            let new_as = paging::new_address_space();
+            paging::map_in(new_as, AS_VA, frame, paging::WRITABLE);
+            paging::switch(new_as);
+            let got = (AS_VA as *const u64).read_volatile();
+            paging::switch(saved); // back to the original space
+            if got == AS_PATTERN {
+                serial::writeln("[vm] address-space switch sees its mapping: ok");
+            }
+        }
+        // AS_VA was mapped only in the new space; the original has no such
+        // mapping → per-address-space isolation.
+        if paging::translate(AS_VA).is_none() {
+            serial::writeln("[vm] mapping isolated to its address space: ok");
+        }
+        frames::free_frame(frame);
+    }
+
     // B1 Step 3a: install the IDT and prove the interrupt path works by
     // firing a software breakpoint. The handler prints "[int3 ok]" and
     // `iretq`s; the "[idt] survived int3" line proves we returned.

@@ -82,19 +82,68 @@ fn indices(virt: u64) -> (u64, u64, u64, u64) {
     )
 }
 
-/// Map `virt` → `phys` with `flags` (PRESENT is added automatically).
+/// Physical address of the active PML4 (the current address space handle).
+pub fn current_pml4() -> u64 {
+    read_cr3() & ADDR_MASK
+}
+
+/// Map `virt` → `phys` with `flags` in the address space rooted at
+/// `pml4` (a PML4 physical address). PRESENT is added automatically.
 ///
 /// # Safety
-/// Changes the active address space. Caller must ensure `virt` isn't a
-/// mapping in use, and `phys` is a valid frame. 4 KiB pages only.
-pub unsafe fn map(virt: u64, phys: u64, flags: u64) {
+/// Mutates the given address space. `pml4` must be a valid PML4 frame and
+/// `phys` a valid frame. 4 KiB pages only.
+pub unsafe fn map_in(pml4: u64, virt: u64, phys: u64, flags: u64) {
     let (i4, i3, i2, i1) = indices(virt);
-    let pml4 = read_cr3() & ADDR_MASK;
     let pdpt = next_table(pml4, i4);
     let pd = next_table(pdpt, i3);
     let pt = next_table(pd, i2);
     *entry_ptr(pt, i1) = (phys & ADDR_MASK) | flags | PRESENT;
-    flush_tlb(virt);
+    // Only the active space has live TLB entries to flush.
+    if pml4 == current_pml4() {
+        flush_tlb(virt);
+    }
+}
+
+/// Map `virt` → `phys` with `flags` in the active address space.
+///
+/// # Safety
+/// As `map_in`, on the active space.
+pub unsafe fn map(virt: u64, phys: u64, flags: u64) {
+    map_in(current_pml4(), virt, phys, flags);
+}
+
+/// Build a fresh address space: a new PML4 whose lower half (user space) is
+/// empty and whose higher half (kernel + HHDM, indices 256..512) mirrors
+/// the current PML4 — so the kernel stays mapped after a `switch`. Returns
+/// the new PML4's physical address.
+///
+/// # Safety
+/// Allocates a frame; the result is only safe to `switch` to while the
+/// kernel higher-half it copied remains valid (always, at B2).
+pub unsafe fn new_address_space() -> u64 {
+    let frame = frames::alloc_frame().expect("out of frames for new address space");
+    let new_pml4 = frames::phys_to_virt(frame) as *mut u64;
+    let cur_pml4 = frames::phys_to_virt(current_pml4()) as *const u64;
+    let mut i = 0;
+    while i < 256 {
+        new_pml4.add(i).write(0); // lower half: empty user space
+        i += 1;
+    }
+    while i < 512 {
+        new_pml4.add(i).write(*cur_pml4.add(i)); // higher half: kernel + HHDM
+        i += 1;
+    }
+    frame
+}
+
+/// Switch the active address space (load CR3). Flushes the whole TLB.
+///
+/// # Safety
+/// `pml4_phys` must root an address space that maps the currently-executing
+/// code, the stack, and the HHDM — else the next instruction faults.
+pub unsafe fn switch(pml4_phys: u64) {
+    asm!("mov cr3, {}", in(reg) pml4_phys, options(nostack, preserves_flags));
 }
 
 /// Remove the mapping for `virt` (clears the leaf PTE). Intermediate tables
