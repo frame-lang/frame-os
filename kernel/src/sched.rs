@@ -291,6 +291,29 @@ pub unsafe fn spawn_user(pml4: u64, entry: u64, user_rsp: u64, pid: u32) {
     with_sched(|s| s.task_ready());
 }
 
+/// Admit a `fork`ed child: it runs in (copied) address space `pml4`, resuming
+/// from `frame` — the parent's full trap frame with `rax` already set to 0.
+/// The frame is copied to the top of the child's kernel stack so the next
+/// switch restores it + `iretq`s the child to the fork-return point in ring 3.
+///
+/// # Safety
+/// `pml4` must be a valid (forked) address space matching `frame`'s user RSP.
+pub unsafe fn spawn_user_from_frame(pml4: u64, frame: &crate::usermode::TrapFrame, pid: u32) {
+    let n = (&raw const N).read();
+    let base = (&raw mut KSTACKS) as *mut u8;
+    let kstack_top = (base.add((n + 1) * STACK_SIZE) as u64) & !0xF;
+    let saved_rsp = kstack_top - 160; // sizeof(TrapFrame)
+    (saved_rsp as *mut crate::usermode::TrapFrame).write(*frame);
+    let t = tcbs();
+    (*t.add(n)).rsp = saved_rsp;
+    (*t.add(n)).state = RunState::Runnable;
+    (*t.add(n)).pml4 = pml4;
+    (*t.add(n)).kstack_top = kstack_top;
+    (*t.add(n)).pid = pid;
+    (&raw mut N).write(n + 1);
+    with_sched(|s| s.task_ready());
+}
+
 /// Initialize the scheduler: create the Frame `Scheduler`, reserve the boot
 /// context, and capture the kernel address space. Call once before spawning.
 pub fn init() {

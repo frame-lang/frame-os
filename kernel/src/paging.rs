@@ -144,6 +144,58 @@ pub unsafe fn new_address_space() -> u64 {
     frame
 }
 
+/// Build a child address space that eager-copies `parent_pml4`'s *user* space:
+/// the kernel higher-half is mirrored (shared), and every present user page
+/// (PML4 indices 0..256) is duplicated into a fresh frame with the same
+/// contents + flags. Returns the child PML4 physical address. Used by `fork`.
+/// (Eager copy now; copy-on-write is a later optimization.)
+///
+/// # Safety
+/// `parent_pml4` must be the active address space (so `new_address_space`'s
+/// higher-half mirror is the parent's kernel mapping). Allocates frames.
+pub unsafe fn fork_address_space(parent_pml4: u64) -> u64 {
+    let child = new_address_space(); // higher-half mirrored from the parent
+    let parent = frames::phys_to_virt(parent_pml4) as *const u64;
+    for i4 in 0..256u64 {
+        let e4 = *parent.add(i4 as usize);
+        if e4 & PRESENT == 0 {
+            continue;
+        }
+        let pdpt = frames::phys_to_virt(e4 & ADDR_MASK) as *const u64;
+        for i3 in 0..512u64 {
+            let e3 = *pdpt.add(i3 as usize);
+            if e3 & PRESENT == 0 {
+                continue;
+            }
+            let pd = frames::phys_to_virt(e3 & ADDR_MASK) as *const u64;
+            for i2 in 0..512u64 {
+                let e2 = *pd.add(i2 as usize);
+                // Skip absent and 2 MiB large pages (we only map 4 KiB in user
+                // space, so large pages never appear here).
+                if e2 & PRESENT == 0 || e2 & (1 << 7) != 0 {
+                    continue;
+                }
+                let pt = frames::phys_to_virt(e2 & ADDR_MASK) as *const u64;
+                for i1 in 0..512u64 {
+                    let e1 = *pt.add(i1 as usize);
+                    if e1 & PRESENT == 0 {
+                        continue;
+                    }
+                    let va = (i4 << 39) | (i3 << 30) | (i2 << 21) | (i1 << 12);
+                    let dst_phys = frames::alloc_frame().expect("out of frames in fork");
+                    core::ptr::copy_nonoverlapping(
+                        frames::phys_to_virt(e1 & ADDR_MASK),
+                        frames::phys_to_virt(dst_phys),
+                        4096,
+                    );
+                    map_in(child, va, dst_phys, e1 & (WRITABLE | USER));
+                }
+            }
+        }
+    }
+    child
+}
+
 /// Switch the active address space (load CR3). Flushes the whole TLB.
 ///
 /// # Safety

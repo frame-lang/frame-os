@@ -622,6 +622,27 @@ const SMOKE_TESTS: &[SmokeTest] = &[
         expect_absent: &["KERNEL EXCEPTION", "KERNEL PANIC", "triple fault"],
         timeout_secs: 20,
     },
+    SmokeTest {
+        // B3 Step 5b: fork → two concurrent user processes. The `forker`
+        // program (pid 3) forks (eager address-space copy + trap-frame copy);
+        // the child (pid 4) returns 0, the parent returns the child pid. Both
+        // run concurrently in separate address spaces — interleaved on the
+        // serial console by the preemptive scheduler — and both exit. (The
+        // child lingers as a zombie until wait()/reap at Step 5d, so the
+        // parent's reap leaves table count 1.)
+        name: "fork_concurrency_b3",
+        expect_contains: &[
+            "[fork] pid 3 forked child pid 4",
+            // Order-stable proof that BOTH ran to exit: the parent's reap only
+            // happens once the scheduler is idle (both parent + child exited),
+            // and `table count 1` means the child (pid 4) exited and lingers as
+            // an unreaped zombie. (The two processes' own exit lines race, since
+            // they run concurrently — so we don't assert their relative order.)
+            "[proc] reaped pid 3; exit 0; table count 1",
+        ],
+        expect_absent: &["KERNEL EXCEPTION", "KERNEL PANIC", "triple fault"],
+        timeout_secs: 20,
+    },
 ];
 
 fn run_qemu_test() -> Result<()> {

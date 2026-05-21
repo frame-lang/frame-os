@@ -22,6 +22,11 @@ path = "src/main.rs"
 name = "faulter"
 path = "src/faulter.rs"
 
+# Forks into two concurrent processes (B3 Step 5b).
+[[bin]]
+name = "forker"
+path = "src/forker.rs"
+
 [profile.dev]
 panic = "abort"
 opt-level = 1

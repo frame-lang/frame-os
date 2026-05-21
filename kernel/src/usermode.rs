@@ -48,55 +48,116 @@ const IA32_FMASK: u32 = 0xC000_0084;
 #[no_mangle]
 static mut USER_RSP_SAVE: u64 = 0;
 
+// The trap frame of the syscall currently being serviced (set by
+// syscall_dispatch). `fork` reads it to copy the caller's full register state
+// into the child. Safe as a single global: syscalls run with IF=0 (no
+// preemption), so only one is ever in flight.
+static mut CURRENT_TRAP_FRAME: *mut TrapFrame = core::ptr::null_mut();
+
+// An `exit` syscall records its code here rather than diverging inside the
+// SyscallDispatcher handler — diverging there would leave the (shared, global)
+// dispatcher stuck in $Executing, corrupting it for the next process. `>= 0`
+// means an exit is pending; `syscall_dispatch` honors it AFTER the Frame
+// dispatch returns cleanly to $Validating. (IF=0 in syscalls, so single-flight.)
+static mut PENDING_EXIT: i64 = -1;
+
 // The freestanding user programs (B3 Step 4), built by kernel/build.rs from
 // the `user/` crate and baked into the kernel image. `hello` prints "hello
 // from ELF" and exit(42)s; `faulter` reads kernel memory to trigger the
 // isolation path (#PF U/S set → killed, kernel survives).
 static USER_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/user_hello.elf"));
 static USER_FAULTER_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/user_faulter.elf"));
+// `forker` (B3 Step 5b) forks into two concurrent processes.
+static USER_FORKER_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/user_forker.elf"));
 
 global_asm!(
     // syscall entry: rcx=user RIP, r11=user RFLAGS, rax=num, rdi/rsi=args.
-    // Switch to the *current process's* kernel stack (CURRENT_KSTACK, owned by
-    // the scheduler), marshal args to the SysV ABI, dispatch, restore, sysretq.
-    // IF is 0 here (FMASK clears it), so the single USER_RSP_SAVE is safe and
-    // the syscall can't be preempted mid-flight.
+    // Switch to the current process's kernel stack (CURRENT_KSTACK), then build
+    // a FULL trap frame identical in layout to the timer ISR's (15 GPRs + the
+    // iretq frame), pass its address to `syscall_dispatch`, restore, and return
+    // via `iretq` (not sysret). The uniform frame is what lets `fork` copy a
+    // process's complete user state for the child. IF is 0 here (FMASK), so the
+    // single USER_RSP_SAVE is safe and the syscall isn't preempted mid-flight.
     ".global syscall_entry",
     "syscall_entry:",
     "  mov [rip + USER_RSP_SAVE], rsp",
     "  mov rsp, [rip + CURRENT_KSTACK]",
-    // Preserve the user's registers across the kernel call. Per the syscall
-    // ABI only rax (return) and rcx/r11 (clobbered by `syscall` itself) may
-    // change; everything else must come back intact. `call syscall_dispatch`
-    // is a SysV C call that preserves rbx/rbp/r12-r15 but clobbers the
-    // caller-saved set, so we save rcx/r11 (also needed for sysretq) plus the
-    // caller-saved GPRs the user may have live across the syscall.
-    "  push rcx", // user RIP (sysret needs it in rcx)
-    "  push r11", // user RFLAGS (sysret needs it in r11)
-    "  push rdi",
-    "  push rsi",
+    // iretq frame (high→low): SS, RSP, RFLAGS, CS, RIP. `syscall` left the user
+    // RIP in rcx and RFLAGS in r11; the user RSP is in USER_RSP_SAVE.
+    "  push 0x1b",                            // SS  = USER_DATA | 3
+    "  push qword ptr [rip + USER_RSP_SAVE]", // user RSP
+    "  push r11",                             // RFLAGS
+    "  push 0x23",                            // CS  = USER_CODE | 3
+    "  push rcx",                             // RIP
+    // 15 GPRs, same order as isr_timer (rax first → r15 last). rcx/r11 here are
+    // the syscall-clobbered values (RIP/RFLAGS); harmless — the ABI says the
+    // user treats them as clobbered.
+    "  push rax",
+    "  push rbx",
+    "  push rcx",
     "  push rdx",
+    "  push rsi",
+    "  push rdi",
+    "  push rbp",
     "  push r8",
     "  push r9",
     "  push r10",
-    "  mov rdx, rsi",          // arg1  → SysV 3rd
-    "  mov rsi, rdi",          // arg0  → SysV 2nd
-    "  mov rdi, rax",          // number → SysV 1st
-    "  call syscall_dispatch", // result in rax
+    "  push r11",
+    "  push r12",
+    "  push r13",
+    "  push r14",
+    "  push r15",
+    "  mov rdi, rsp",          // arg0 = &TrapFrame (points at saved r15)
+    "  call syscall_dispatch", // reads num/args from the frame, writes frame.rax
+    "  pop r15",
+    "  pop r14",
+    "  pop r13",
+    "  pop r12",
+    "  pop r11",
     "  pop r10",
     "  pop r9",
     "  pop r8",
-    "  pop rdx",
-    "  pop rsi",
+    "  pop rbp",
     "  pop rdi",
-    "  pop r11",
+    "  pop rsi",
+    "  pop rdx",
     "  pop rcx",
-    "  mov rsp, [rip + USER_RSP_SAVE]",
-    "  sysretq",
+    "  pop rbx",
+    "  pop rax",
+    "  iretq",
 );
 
 extern "C" {
     fn syscall_entry();
+}
+
+/// The full user register state captured on every syscall/interrupt entry —
+/// 15 GPRs plus the `iretq` frame, laid out to match the push order in
+/// `syscall_entry` and `isr_timer`. `fork` copies one of these to give the
+/// child the parent's exact resumption state (with rax forced to 0).
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct TrapFrame {
+    pub r15: u64,
+    pub r14: u64,
+    pub r13: u64,
+    pub r12: u64,
+    pub r11: u64,
+    pub r10: u64,
+    pub r9: u64,
+    pub r8: u64,
+    pub rbp: u64,
+    pub rdi: u64,
+    pub rsi: u64,
+    pub rdx: u64,
+    pub rcx: u64,
+    pub rbx: u64,
+    pub rax: u64,
+    pub rip: u64,
+    pub cs: u64,
+    pub rflags: u64,
+    pub rsp: u64,
+    pub ss: u64,
 }
 
 fn wrmsr(msr: u32, val: u64) {
@@ -131,17 +192,34 @@ fn init() {
     }
 }
 
-/// Rust half of the syscall entry stub. Routes the syscall through the
-/// `SyscallDispatcher` HSM (validate → execute, or `=> $^` reject) and
-/// returns its result.
+/// Rust half of the syscall entry stub. Reads the syscall number + args from
+/// the trap frame, routes them through the `SyscallDispatcher` HSM (validate →
+/// execute, or `=> $^` reject), and writes the result back into `frame.rax`
+/// (the stub restores it on the way out). The frame pointer is stashed in
+/// `CURRENT_TRAP_FRAME` so `fork` can copy the caller's full state.
 #[no_mangle]
-extern "C" fn syscall_dispatch(num: u64, a0: u64, a1: u64) -> u64 {
+extern "C" fn syscall_dispatch(frame: *mut TrapFrame) {
+    unsafe {
+        (&raw mut CURRENT_TRAP_FRAME).write(frame);
+    }
+    let f = unsafe { &mut *frame };
+    let (num, a0, a1) = (f.rax, f.rdi, f.rsi);
     let d = unsafe {
         let p = &raw mut DISPATCHER;
         (*p).as_mut().expect("dispatcher initialized")
     };
     d.request(num, a0, a1);
-    d.result()
+    f.rax = d.result();
+
+    // Honor a pending exit AFTER the dispatcher has returned to $Validating —
+    // diverging inside the handler would leave it stuck in $Executing.
+    let pending = unsafe { (&raw const PENDING_EXIT).read() };
+    if pending >= 0 {
+        unsafe {
+            (&raw mut PENDING_EXIT).write(-1);
+        }
+        do_exit(pending as i32); // prints, $Zombie, yields — never returns
+    }
 }
 
 /// Borrow the global process table.
@@ -153,13 +231,14 @@ fn proc_table() -> &'static mut ProcessTable {
 }
 
 /// Validation predicate, called by the dispatcher's `$Validating` state.
+/// 0 = write_char, 1 = exit, 2 = fork.
 pub fn is_known_syscall(num: u64) -> bool {
-    num == 0 || num == 1
+    num == 0 || num == 1 || num == 2
 }
 
 /// Perform a (validated) syscall, called by the dispatcher's `$Executing`
 /// enter handler. `write_char` returns 1; `exit` marks the process `$Zombie`
-/// and yields to the scheduler (never returns).
+/// and yields to the scheduler (never returns); `fork` returns the child pid.
 pub fn perform_syscall(num: u64, a0: u64, _a1: u64) -> u64 {
     match num {
         0 => {
@@ -167,24 +246,61 @@ pub fn perform_syscall(num: u64, a0: u64, _a1: u64) -> u64 {
             1
         }
         1 => {
-            serial::write_str("\n[user] exited with code ");
-            serial::write_u32_decimal(a0 as u32);
-            serial::writeln("");
-            // Record the voluntary exit ($Ready → $Zombie), then yield: mark
-            // this process dead in the scheduler and park. The next timer tick
-            // switches away and this process never resumes. (ProcessTable is a
-            // different Frame instance than the SyscallDispatcher we're inside —
-            // no reentrancy hazard.)
-            let pid = sched::current_pid();
-            proc_table().exit_pid(pid, a0 as i32);
-            serial::write_str("[proc] pid ");
-            serial::write_u32_decimal(pid);
-            serial::write_str(" exited -> ");
-            serial::writeln(&proc_table().pid_state(pid));
-            sched::exit_current() // never returns
+            // Record the exit; the actual teardown + yield happens in
+            // syscall_dispatch once the dispatcher is back in $Validating
+            // (diverging here would corrupt the shared dispatcher).
+            unsafe {
+                (&raw mut PENDING_EXIT).write(a0 as i64);
+            }
+            0
         }
+        2 => do_fork(),
         _ => u64::MAX, // unreachable: validated by is_known_syscall
     }
+}
+
+/// Finish a voluntary `exit`: report it, move the Process to `$Zombie`, and
+/// yield to the scheduler (mark dead + park). Never returns — the next timer
+/// tick switches away and this process is never resumed. Called from
+/// `syscall_dispatch` after the SyscallDispatcher has returned to $Validating.
+fn do_exit(code: i32) -> ! {
+    serial::write_str("\n[user] exited with code ");
+    write_exit_code(code);
+    serial::writeln("");
+    let pid = sched::current_pid();
+    proc_table().exit_pid(pid, code);
+    serial::write_str("[proc] pid ");
+    serial::write_u32_decimal(pid);
+    serial::write_str(" exited -> ");
+    serial::writeln(&proc_table().pid_state(pid));
+    sched::exit_current()
+}
+
+/// `fork`: duplicate the calling process. Eager-copy its address space, copy
+/// its trap frame (with rax forced to 0 for the child), admit the child to the
+/// scheduler, and return the child's pid to the parent. The child resumes at
+/// the fork-return point in ring 3 with rax = 0 (the scheduler `iretq`s it from
+/// the copied frame); it never runs this code.
+fn do_fork() -> u64 {
+    // Copy the caller's trap frame (set by syscall_dispatch).
+    let parent_frame = unsafe {
+        let p = (&raw const CURRENT_TRAP_FRAME).read();
+        *p
+    };
+    let child_pml4 = unsafe { paging::fork_address_space(paging::current_pml4()) };
+    let child_pid = proc_table().spawn(); // child Process: $Created → $Ready
+    let mut child_frame = parent_frame;
+    child_frame.rax = 0; // fork() returns 0 in the child
+    unsafe {
+        sched::spawn_user_from_frame(child_pml4, &child_frame, child_pid);
+    }
+    let parent_pid = sched::current_pid();
+    serial::write_str("[fork] pid ");
+    serial::write_u32_decimal(parent_pid);
+    serial::write_str(" forked child pid ");
+    serial::write_u32_decimal(child_pid);
+    serial::writeln("");
+    child_pid as u64 // fork() returns the child pid in the parent
 }
 
 /// Kill the currently-running user process from inside the #PF handler (B3
@@ -278,4 +394,5 @@ pub fn run() {
 
     run_one(USER_ELF, "hello");
     run_one(USER_FAULTER_ELF, "faulter");
+    run_one(USER_FORKER_ELF, "forker");
 }
