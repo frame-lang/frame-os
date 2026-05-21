@@ -950,6 +950,33 @@ const SMOKE_TESTS: &[SmokeTest] = &[
         ],
         timeout_secs: 20,
     },
+    SmokeTest {
+        // B4 Step 4b: the Frame-driven shell. A ring-3 program tokenizes its
+        // command lines with the *same* `parser.frs` the hosted shell compiles
+        // — the "one source, two targets" demonstration. It cats a *quoted*
+        // path (`cat "/motd"`), which only resolves if the Parser's
+        // $InQuotedString state ran in ring 3 to strip the quotes, then execs
+        // `/bin/hello` by the parsed token. Asserting the motd contents (via
+        // the quoted cat) + hello's output + exit code proves the reused Frame
+        // tokenizer works end to end in userspace.
+        name: "userspace_frame_parser_reuse_b4",
+        expect_contains: &[
+            "[frameshell] tokenizing with parser.frs",
+            "[frameshell] $ cat \"/motd\"",
+            "Frame OS B4 filesystem online.",
+            "[frameshell] $ /bin/hello",
+            "hello from ELF",
+            "[user] exited with code 42",
+        ],
+        expect_absent: &[
+            "KERNEL EXCEPTION",
+            "KERNEL PANIC",
+            "triple fault",
+            "[frameshell] open failed",
+            "[frameshell] exec failed",
+        ],
+        timeout_secs: 20,
+    },
 ];
 
 fn run_qemu_test() -> Result<()> {

@@ -37,10 +37,23 @@ path = "src/spawner.rs"
 name = "waiter"
 path = "src/waiter.rs"
 
-# Scripted shell: cat /motd + exec /bin/hello from disk (B4 Step 4).
+# Scripted shell: cat /motd + exec /bin/hello from disk (B4 Step 4a).
 [[bin]]
 name = "shell"
 path = "src/shell.rs"
+
+# Frame-driven shell: tokenizes command lines with the *same* `parser.frs`
+# the hosted shell uses, in ring 3 (B4 Step 4b). The "one source, two targets"
+# demonstration. Needs the heap (the only bin that does), hence the dependency.
+[[bin]]
+name = "frameshell"
+path = "src/frameshell.rs"
+
+# Heap allocator for the Frame-generated code (Vec/String/Rc/BTreeMap).
+# Only `frameshell` pulls it in (via `mod mem`); the other bins stay
+# allocator-free. Same crate + version the kernel uses.
+[dependencies]
+linked_list_allocator = "0.10"
 
 [profile.dev]
 panic = "abort"

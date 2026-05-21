@@ -86,8 +86,11 @@ static USER_FORKER_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/user_f
 static USER_SPAWNER_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/user_spawner.elf"));
 // `waiter` (B3 Step 5d) forks a child and wait()s to reap it.
 static USER_WAITER_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/user_waiter.elf"));
-// `shell` (B4 Step 4) cats `/motd` then execs `/bin/hello` from disk by path.
+// `shell` (B4 Step 4a) cats `/motd` then execs `/bin/hello` from disk by path.
 static USER_SHELL_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/user_shell.elf"));
+// `frameshell` (B4 Step 4b) tokenizes command lines with the *same* parser.frs
+// the hosted shell uses — the "one source, two targets" demonstration.
+static USER_FRAMESHELL_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/user_frameshell.elf"));
 
 // Scratch buffer for `exec`-from-disk: the ELF is read off the filesystem into
 // this static, then handed to the loader as a `'static` slice. Single-flight
@@ -602,9 +605,15 @@ pub fn run() {
     run_one(USER_SPAWNER_ELF, "spawner");
     run_one(USER_WAITER_ELF, "waiter");
 
-    // B4 Step 4: a scripted shell that uses the file-I/O syscalls (open/read/
+    // B4 Step 4a: a scripted shell that uses the file-I/O syscalls (open/read/
     // close) to `cat /motd`, then `exec`s `/bin/hello` *from disk by path* —
     // the new image replaces the shell and runs to its own exit(42). Requires
     // the FS to be mounted (kmain runs fs::run_demo before usermode::run).
     run_one(USER_SHELL_ELF, "shell");
+
+    // B4 Step 4b: the Frame-driven shell. It tokenizes its command lines with
+    // the *same* `parser.frs` the hosted shell compiles — now running in ring 3
+    // (no_std + a bump heap). It cats a quoted path (`cat "/motd"`, exercising
+    // the Parser's $InQuotedString state in userspace) then execs `/bin/hello`.
+    run_one(USER_FRAMESHELL_ELF, "frameshell");
 }

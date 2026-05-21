@@ -4,12 +4,12 @@
 
 | Property | Value |
 |---|---|
-| Track | Hosted (planned for reuse in a **ring-3 userspace program** at B4 Step 4b — not yet built) |
-| Milestone introduced | H1 |
+| Track | Hosted **and** ring-3 userspace — the *same* `.frs` compiles for both (the userspace build landed at B4 Step 4b) |
+| Milestone introduced | H1 (hosted); reused in ring 3 at B4 Step 4b |
 | Source file | [`../../frame/parser.frs`](../../frame/parser.frs) |
 | State diagram | [`parser.svg`](parser.svg) |
 | Instances at runtime | One per Shell `$Parsing` activation — `Parser::__create()` per line |
-| Status | Documented (H1) |
+| Status | Documented (H1; reused in ring 3 at B4 Step 4b) |
 
 ## State diagram
 
@@ -141,7 +141,9 @@ This system is also a good test case for using Frame in places where per-event d
 
 **Calls into:** none. `Parser` is a pure tokenizer — no Frame system or native module is invoked from its handlers other than the `String`/`Vec` operations on its own domain fields.
 
-**Called from:** `Shell.$Parsing.$>()` at H1 — drives Parser to completion for each typed line. The Shell holds a `Parser` instance in its `domain:` block (decision documented in [shell.md](shell.md)). Planned ring-3 userspace usage (B4 Step 4b) will call `Parser` the same way from the userspace `Shell`'s `$Parsing` handler.
+**Called from:** `Shell.$Parsing.$>()` at H1 — drives Parser to completion for each typed line. The Shell holds a `Parser` instance in its `domain:` block (decision documented in [shell.md](shell.md)).
+
+**Userspace action implementations (B4 Step 4b):** `Parser` is pure — no native actions — so there's *nothing to re-implement* for ring 3; the only environmental difference is that the freestanding `user/` crate supplies a heap (a 64 KiB `linked_list_allocator` static, `user/src/mem.rs`) for the `String`/`Vec`/`Rc`/`BTreeMap` the generated code allocates. The generated `mod _parser_framec` is `no_std`-clean (only `alloc::` + the prelude names re-exported by `user/src/frame_systems.rs`), so the *same* `frame/parser.frs` compiles unchanged for `x86_64-unknown-none`. The ring-3 program `user/src/frameshell.rs` drives it exactly as the hosted shell does — `consume(c)` per char, then `finalize()` + `tokens()` — to tokenize baked command lines and dispatch on the first token (`cat <path>` / exec a program by path).
 
 **Native modules used by actions:** none. The Parser has no `actions:` block at H1 — all behavior is in the per-state handlers, which use only `String`/`Vec` operations on domain fields.
 
@@ -206,7 +208,7 @@ Test file: [`../../shell/tests/parser_behavior.rs`](../../shell/tests/parser_beh
 
 **E2E tests (Level 6):** N/A on its own — `Parser` isn't directly invoked by the binary. E2E tests for builtins exercise the Shell+Parser composition transitively.
 
-**QEMU smoke tests (Level 7):** N/A — `Parser` is currently hosted-only. Ring-3 userspace reuse at B4 Step 4b will add QEMU coverage.
+**QEMU smoke tests (Level 7):** `userspace_frame_parser_reuse_b4` — boots the kernel and runs a ring-3 program (`frameshell`) that tokenizes command lines with this *same* generated `Parser`. It cats a **quoted** path (`cat "/motd"`), which only resolves if the `$InQuotedString` state ran in userspace to strip the quotes, then execs `/bin/hello` by the parsed token — proving the reused tokenizer (including quote handling) works end to end in ring 3.
 
 **Hardware tests (Level 8):** N/A — same reason.
 

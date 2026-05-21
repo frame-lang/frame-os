@@ -4,7 +4,7 @@
 
 | Property | Value |
 |---|---|
-| Track | Hosted (planned for reuse as a **ring-3 userspace program** at B4 Step 4b — not yet built; the userspace version omits $RunningExternal because there's no host OS to shell out to) |
+| Track | Hosted. Ring-3 userspace reuse of the `Shell` `.frs` is **still pending** — at B4 Step 4b only `Parser` was reused in ring 3; the `Shell` machine itself awaits userspace action implementations + a real input device (the userspace shells so far are hand-written Rust). The userspace version would omit $RunningExternal (no host OS to shell out to). |
 | Milestone introduced | H0 |
 | Source file | [`../../frame/shell.frs`](../../frame/shell.frs) |
 | State diagram | [`shell.svg`](shell.svg) |
@@ -206,7 +206,7 @@ The action bodies are inside the `actions:` block in [`../../frame/shell.frs`](.
 
 At H1, `print_unknown` moved out of `actions:` and into `execute()` in [`../../shell/src/builtin.rs`](../../shell/src/builtin.rs) — unknown commands are now a `Builtin::Unknown` variant that flows through the normal `$Parsing → $RunningBuiltin → execute()` path. Output format is unchanged (`unknown command: {cmd} (try 'exit')`), so the H0 E2E tests still pass.
 
-The actions are unsafe-free and `std`-only. They will need to be re-implemented for the ring-3 userspace `Shell` at B4 Step 4b (writing via the `write_char` syscall instead of `stdout`); the Frame source itself is unchanged.
+The actions are unsafe-free and `std`-only. They will need to be re-implemented for a ring-3 userspace `Shell` (writing via the `write_char` syscall instead of `stdout`); the Frame source itself would be unchanged. **This is still pending as of B4 Step 4b** — that step reused the pure `Parser` `.frs` in ring 3 (no actions to port; see [parser.md](parser.md)) but not the `Shell` `.frs`, which needs the std-action rewrite *and* an input device for a meaningful interactive loop. The B4 userspace shells (`user/src/shell.rs`, `user/src/frameshell.rs`) are hand-written Rust; `frameshell` drives the reused `Parser` but not this `Shell` machine.
 
 ## Native dispatch layer (H1+)
 

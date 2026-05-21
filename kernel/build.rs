@@ -122,6 +122,7 @@ fn build_user_program(workspace_root: &Path, out_dir: &Path) -> Result<()> {
         ("spawner", "user_spawner.elf"),
         ("waiter", "user_waiter.elf"),
         ("shell", "user_shell.elf"),
+        ("frameshell", "user_frameshell.elf"),
     ] {
         let elf = release.join(bin);
         if !elf.exists() {
@@ -145,6 +146,10 @@ fn build_user_program(workspace_root: &Path, out_dir: &Path) -> Result<()> {
         "src/spawner.rs",
         "src/waiter.rs",
         "src/shell.rs",
+        "src/frameshell.rs",
+        "src/frame_systems.rs",
+        "src/mem.rs",
+        "build.rs",
         "linker.ld",
         "Cargo.toml",
         ".cargo/config.toml",
