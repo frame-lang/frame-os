@@ -1,0 +1,86 @@
+// frame/page_fault_handler.frs
+//
+// PageFaultHandler — classifies a page fault and dispatches to the response
+// (B2 Step 3). The Frame showcase of B2: a hierarchical state machine
+// running *inside a CPU exception handler*.
+//
+// The native #PF stub (interrupts.rs) reads CR2 + the error code and fires
+// `fault(addr, error_code)`. This is safe to drive synchronously: the #PF
+// gate clears IF, so there's no preemption and no concurrent fault (a fault
+// during fault handling is a double-fault, caught by the safety net) — the
+// non-reentrancy hazard that needs a queue for *async* interrupts does not
+// apply to a synchronous exception.
+//
+// State graph:
+//
+//   ┌──────────────────────────── $FaultActive (parent) ───────────────────┐
+//   │                                                                       │
+//   │   ┌──────────────┐  fault, addr in lazy region    ┌──────────────┐    │
+//   │   │ $Classifying │ ──────────────────────────────►│  $LazyFault  │    │
+//   │   │  (initial)   │                                 │  $>: map it  │    │
+//   │   └──────┬───────┘ ◄──── map ok (recovered) ───────└──────┬───────┘    │
+//   │          │  fault, not a lazy region                      │ map OOM    │
+//   │          └───────────────────────┐          ┌─────────────┘            │
+//   │                                   ▼          ▼                         │
+//   │                              ┌──────────────────┐                      │
+//   │                              │     $Fatal       │                      │
+//   │                              └──────────────────┘                      │
+//   └───────────────────────────────────────────────────────────────────────┘
+//
+// The HSM parent `$FaultActive` exists for B4: there it hosts the shared
+// "unrecoverable → kill the process" handler that the deep children
+// ($StackGrow / $CopyOnWrite / $LazyFault) forward to via `=> $^`. At B2
+// the two children fully handle their cases, so the forwarding edge is
+// declared (matching the committed design) but not yet traversed — the same
+// "declared now, load-bearing later" pattern as `Task.$Blocked` at B1.
+
+@@[target("rust")]
+
+@@system PageFaultHandler {
+    interface:
+        fault(addr: u64, error_code: u64)
+        is_fatal(): bool = false
+        fault_addr(): u64 = self.fault_addr
+
+    machine:
+        $Classifying => $FaultActive {
+            fault(addr: u64, error_code: u64) {
+                self.fault_addr = addr;
+                if crate::vm::is_lazy_region(addr) {
+                    -> $LazyFault
+                } else {
+                    -> $Fatal
+                }
+            }
+            => $^
+        }
+
+        $LazyFault => $FaultActive {
+            $>() {
+                if crate::vm::lazy_map(self.fault_addr) {
+                    -> $Classifying
+                } else {
+                    -> $Fatal
+                }
+            }
+            => $^
+        }
+
+        // Parent. At B4 this hosts the shared unrecoverable handler the deep
+        // children forward to via `=> $^`.
+        $FaultActive {
+        }
+
+        $Fatal {
+            $>() {
+                serial::write_str("\n[#PF] FATAL unhandled fault at 0x");
+                serial::write_hex_u64(self.fault_addr);
+                serial::writeln("");
+            }
+
+            is_fatal(): bool { @@:(true) }
+        }
+
+    domain:
+        fault_addr: u64 = 0
+}

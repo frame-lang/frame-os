@@ -104,6 +104,18 @@ pub fn writeln(s: &str) {
     write_byte(b'\n');
 }
 
+/// Write a u64 as 16 hex digits (no `0x` prefix). Alloc-free; used by the
+/// page-fault handler to report a faulting address.
+pub fn write_hex_u64(n: u64) {
+    let digits = b"0123456789abcdef";
+    let mut shift = 60i32;
+    while shift >= 0 {
+        let nibble = ((n >> shift) & 0xF) as usize;
+        write_byte(digits[nibble]);
+        shift -= 4;
+    }
+}
+
 /// Write a u32 in decimal. Used by the panic handler, which can't rely on
 /// `format!`/`alloc` being usable in every panic context.
 pub fn write_u32_decimal(mut n: u32) {

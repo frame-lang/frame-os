@@ -55,6 +55,11 @@ pub mod serial {
         CAPTURED.with(|c| c.borrow_mut().push_str(&n.to_string()));
     }
 
+    /// Append a u64 as 16 hex digits (matches the kernel's serial).
+    pub fn write_hex_u64(n: u64) {
+        CAPTURED.with(|c| c.borrow_mut().push_str(&format!("{n:016x}")));
+    }
+
     /// Return a copy of everything captured on this thread so far.
     pub fn captured() -> String {
         CAPTURED.with(|c| c.borrow().clone())
@@ -63,6 +68,39 @@ pub mod serial {
     /// Reset the capture buffer for this thread.
     pub fn clear() {
         CAPTURED.with(|c| c.borrow_mut().clear());
+    }
+}
+
+/// Host test-double for the kernel's `vm` module. The generated
+/// `PageFaultHandler` actions call `crate::vm::{is_lazy_region, lazy_map}`;
+/// in the kernel those touch real page tables, here they're controllable
+/// thread-locals so behavioral tests can drive each classification path.
+/// Thread-local (libtest runs each test on its own thread) so concurrent
+/// tests don't clobber each other's settings.
+pub mod vm {
+    use core::cell::Cell;
+
+    thread_local! {
+        static LAZY: Cell<bool> = const { Cell::new(false) };
+        static MAP_OK: Cell<bool> = const { Cell::new(true) };
+    }
+
+    /// Set whether the next `is_lazy_region` reports the address as lazy.
+    pub fn set_lazy(b: bool) {
+        LAZY.with(|c| c.set(b));
+    }
+
+    /// Set whether the next `lazy_map` succeeds (false simulates OOM).
+    pub fn set_map_ok(b: bool) {
+        MAP_OK.with(|c| c.set(b));
+    }
+
+    pub fn is_lazy_region(_addr: u64) -> bool {
+        LAZY.with(|c| c.get())
+    }
+
+    pub fn lazy_map(_addr: u64) -> bool {
+        MAP_OK.with(|c| c.get())
     }
 }
 
@@ -75,3 +113,4 @@ include!(concat!(env!("OUT_DIR"), "/serial_driver.rs"));
 include!(concat!(env!("OUT_DIR"), "/kernel.rs"));
 include!(concat!(env!("OUT_DIR"), "/task.rs"));
 include!(concat!(env!("OUT_DIR"), "/scheduler.rs"));
+include!(concat!(env!("OUT_DIR"), "/page_fault_handler.rs"));

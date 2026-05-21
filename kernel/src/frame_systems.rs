@@ -36,3 +36,7 @@ include!(concat!(env!("OUT_DIR"), "/kernel.rs"));
 // actions are pure counter arithmetic — no native deps beyond the heap
 // types already re-exported above.
 include!(concat!(env!("OUT_DIR"), "/scheduler.rs"));
+// PageFaultHandler: the #PF classifier HSM. Its actions call
+// `crate::vm::{is_lazy_region,lazy_map}` (full paths, resolved per crate)
+// and `serial::*` (imported above).
+include!(concat!(env!("OUT_DIR"), "/page_fault_handler.rs"));

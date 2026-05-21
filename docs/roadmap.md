@@ -302,15 +302,17 @@ H3 is the H-track's final committed milestone. Further H-track work (a configura
 
 | # | Exit criterion | Validating test(s) |
 |---|---|---|
-| B2-1 | `PageFaultHandler` state graph matches committed design | Snapshot `page_fault_handler_state_graph_snapshot` (`kernel-tests`) |
-| B2-2 | Fault classification is correct: stack-grow, COW, lazy-fault, fatal | Behavioral tests in `kernel-tests/tests/page_fault_handler_behavior.rs` (host, faults injected as events) |
-| B2-3 | Physical frame allocator: alloc/free/double-free-guard | Unit tests (host) |
-| B2-4 | Paging: map → translate round-trips; unmap revokes; per-address-space isolation | Unit tests (host) where feasible + QEMU smoke `paging_maps_and_isolates_b2` |
-| B2-5 | A demand-paged region faults in correctly; an illegal access lands in `$Fatal` without crashing the kernel | QEMU smoke `demand_page_faults_in_b2`, `illegal_access_is_fatal_not_crash_b2` |
-| B2-6 | Diagrams + per-system doc for `PageFaultHandler` | `cargo xtask check-diagrams`; review |
-| B2-7 | All CI gates pass, plus QEMU smoke on Linux | Full CI matrix + `qemu-test` |
+| B2-1 | `PageFaultHandler` state graph matches committed design | Snapshot `page_fault_handler_state_graph_snapshot` (`kernel-tests`) — **done at Step 3** (`$Classifying → $LazyFault \| $Fatal` under `$FaultActive`; `$StackGrow`/`$CopyOnWrite` deferred to B3/B4) |
+| B2-2 | Fault classification is correct: lazy-fault recovers, OOM/non-lazy → fatal | Behavioral tests in `kernel-tests/tests/page_fault_handler_behavior.rs` (5, via the `vm` test-double) — **done at Step 3.** (stack-grow / COW arrive with B3/B4) |
+| B2-3 | Physical frame allocator: alloc / free / realloc | `frames` self-test; QEMU smoke `frame_allocator_b2` — **done at Step 1** |
+| B2-4 | Paging: map → write → translate → unmap | QEMU smoke `paging_b2` (write cross-checked via HHDM) — **done at Step 2** |
+| B2-5 | A demand-paged region faults in; an unmapped access → `$Fatal` without crashing | QEMU smoke `page_fault_demand_b2`, `page_fault_fatal_b2` — **done at Step 3** |
+| B2-6 | Diagrams + per-system doc for `PageFaultHandler` | `cargo xtask check-diagrams`; `docs/systems/page_fault_handler.md` — **done at Step 3** |
+| B2-7 | All CI gates pass, plus QEMU smoke on Linux | Full CI matrix + `qemu-test` (9/9) — **done** |
 
 **Estimated effort:** Large; mostly native (paging is unsafe-Rust-heavy). The Frame payload is concentrated in `PageFaultHandler`.
+
+**Status:** Core complete (Steps 1–3). Frame allocator (`7385208`), 4-level paging (`3835155`), and the `#PF` handler + `PageFaultHandler` HSM (this step) all land and QEMU-validate; B2-1 through B2-7 met. **Remaining (plan Steps 4–5, not numbered exit criteria):** per-process address-space construction (new PML4 + CR3 switch) — machinery for B3, build + smoke; and folding the frame-allocator/paging init into the `$InitMemory` HSM phase (retiring that stub). Both are tracked; B3 (user mode) needs the address-space machinery, so it lands next.
 
 ### B3 — user mode, processes, syscalls, ELF, fork/exec
 

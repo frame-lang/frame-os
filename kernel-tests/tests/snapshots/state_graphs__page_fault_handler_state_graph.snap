@@ -1,0 +1,57 @@
+---
+source: kernel-tests/tests/state_graphs.rs
+expression: dot
+---
+digraph PageFaultHandler {
+    compound=true
+    node [color="deepskyblue4" style="rounded, filled" fillcolor="azure"]
+    edge[color="red"]
+
+    Entry[width=0.2 shape="circle" style="filled" fillcolor="black" label=""]
+    Entry -> Classifying
+
+    subgraph cluster_FaultActive {
+        label = <
+            <table cellborder="0" border="0">
+                <tr><td>FaultActive</td></tr>
+                <hr/>
+                <tr><td></td></tr>
+            </table>
+        >
+        style = rounded
+        FaultActive [shape="point" width="0"]
+
+        Classifying [label = <
+            <table CELLBORDER="0" CELLPADDING="5" style="rounded">
+                <tr><td><b>Classifying</b></td></tr>
+                <hr/>
+                <tr><td align="left"><font point-size="10">
+fault(addr: u64, error_code: u64)<br ALIGN="LEFT"/>
+                </font></td></tr>
+            </table>
+        > margin=0 shape=none]
+        LazyFault [label = <
+            <table CELLBORDER="0" CELLPADDING="5" style="rounded">
+                <tr><td><b>LazyFault</b></td></tr>
+                <hr/>
+                <tr><td align="left"><font point-size="10">
+$&gt;()<br ALIGN="LEFT"/>
+                </font></td></tr>
+            </table>
+        > margin=0 shape=none]
+    }
+    Fatal [label = <
+        <table CELLBORDER="0" CELLPADDING="5" style="rounded">
+            <tr><td><b>Fatal</b></td></tr>
+            <hr/>
+            <tr><td align="left"><font point-size="10">
+$&gt;()<br ALIGN="LEFT"/>is_fatal()<br ALIGN="LEFT"/>
+            </font></td></tr>
+        </table>
+    > margin=0 shape=none]
+
+    Classifying -> LazyFault [label=" fault "]
+    Classifying -> Fatal [label=" fault "]
+    LazyFault -> Classifying [label=" $> "]
+    LazyFault -> Fatal [label=" $> "]
+}

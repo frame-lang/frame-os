@@ -119,6 +119,42 @@ global_asm!(
     "  pop rcx",
     "  pop rax",
     "  iretq",
+    // Page fault (#PF, vector 14). Unlike most exceptions, #PF pushes an
+    // error code (below the iretq frame), and the faulting address is in
+    // CR2. Pass both to the Rust handler; it returns (recovered → retry) or
+    // halts (fatal). Before iretq we discard the error code so rsp points at
+    // the iretq frame. rbx (callee-saved, preserved across the call) holds
+    // rsp across the alignment.
+    ".global isr_page_fault",
+    "isr_page_fault:",
+    "  push rax",
+    "  push rcx",
+    "  push rdx",
+    "  push rsi",
+    "  push rdi",
+    "  push r8",
+    "  push r9",
+    "  push r10",
+    "  push r11",
+    "  push rbx",
+    "  mov rdi, cr2",      // arg0 = faulting address
+    "  mov rsi, [rsp+80]", // arg1 = error code (10 pushes = 80 bytes above)
+    "  mov rbx, rsp",      // save rsp across alignment
+    "  and rsp, -16",      // align for the SysV call
+    "  call page_fault_handler",
+    "  mov rsp, rbx", // restore rsp
+    "  pop rbx",
+    "  pop r11",
+    "  pop r10",
+    "  pop r9",
+    "  pop r8",
+    "  pop rdi",
+    "  pop rsi",
+    "  pop rdx",
+    "  pop rcx",
+    "  pop rax",
+    "  add rsp, 8", // discard the error code
+    "  iretq",
     // Timer IRQ0 (vector 32), full-frame preemptive switch (3c). Save ALL
     // 15 GPRs on top of the CPU's iretq frame, pass rsp to `schedule`,
     // switch rsp to whatever `schedule` returns (the next thread, or the
@@ -171,6 +207,7 @@ extern "C" {
     fn isr_exception();
     fn isr_breakpoint();
     fn isr_timer();
+    fn isr_page_fault();
 }
 
 #[no_mangle]
@@ -210,6 +247,7 @@ pub fn init() {
     let exc = isr_exception as *const () as usize as u64;
     let bp = isr_breakpoint as *const () as usize as u64;
     let timer = isr_timer as *const () as usize as u64;
+    let pf = isr_page_fault as *const () as usize as u64;
 
     unsafe {
         let idt = &raw mut IDT;
@@ -218,6 +256,8 @@ pub fn init() {
             (*idt)[v].set(exc, cs);
         }
         (*idt)[3].set(bp, cs);
+        // Page fault (#PF) → demand-paging / fatal classifier.
+        (*idt)[14].set(pf, cs);
         // IRQ0 timer.
         (*idt)[TIMER_VECTOR].set(timer, cs);
 

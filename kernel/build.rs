@@ -22,6 +22,7 @@ use anyhow::{anyhow, Context, Result};
 const FRAME_SYSTEMS: &[(&str, &str)] = &[
     ("serial_driver", "serial_driver.frs"),
     ("scheduler", "scheduler.frs"),
+    ("page_fault_handler", "page_fault_handler.frs"),
     ("kernel", "kernel.frs"),
 ];
 

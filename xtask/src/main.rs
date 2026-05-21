@@ -156,6 +156,7 @@ const DIAGRAMS: &[(&str, &str)] = &[
     ("serial_driver.frs", "serial_driver.svg"),
     ("task.frs", "task.svg"),
     ("scheduler.frs", "scheduler.svg"),
+    ("page_fault_handler.frs", "page_fault_handler.svg"),
 ];
 
 fn diagrams(mode: DiagramMode) -> Result<()> {
@@ -493,6 +494,30 @@ const SMOKE_TESTS: &[SmokeTest] = &[
             "[paging] unmap clears mapping: ok",
         ],
         expect_absent: &["KERNEL EXCEPTION", "KERNEL PANIC", "triple fault"],
+        timeout_secs: 20,
+    },
+    SmokeTest {
+        // B2 Step 3 (demand paging): touching a registered lazy region
+        // faults (#PF), the PageFaultHandler HSM classifies it $LazyFault,
+        // maps a frame, and the access retries successfully — all from
+        // inside the exception handler. The #PF goes to isr_page_fault, so
+        // the isr_exception safety net (KERNEL EXCEPTION) must NOT fire.
+        name: "page_fault_demand_b2",
+        expect_contains: &["[#PF] demand fault recovered: ok"],
+        expect_absent: &["KERNEL EXCEPTION", "KERNEL PANIC", "triple fault"],
+        timeout_secs: 20,
+    },
+    SmokeTest {
+        // B2 Step 3 (fatal): an unmapped, non-lazy access is classified
+        // $Fatal — reported and halted cleanly, NOT a silent triple-fault
+        // and NOT the generic exception safety net.
+        name: "page_fault_fatal_b2",
+        expect_contains: &[
+            "[#PF] triggering a deliberate fatal fault",
+            "[#PF] FATAL unhandled fault at 0x0000600000000000",
+            "[#PF] halting.",
+        ],
+        expect_absent: &["KERNEL EXCEPTION", "triple fault"],
         timeout_secs: 20,
     },
 ];

@@ -82,3 +82,11 @@ fn scheduler_state_graph_snapshot() {
     };
     insta::assert_snapshot!("scheduler_state_graph", dot);
 }
+
+#[test]
+fn page_fault_handler_state_graph_snapshot() {
+    let Some(dot) = frame_to_dot("page_fault_handler.frs") else {
+        return; // framec unavailable; test skipped
+    };
+    insta::assert_snapshot!("page_fault_handler_state_graph", dot);
+}

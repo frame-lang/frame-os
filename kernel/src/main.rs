@@ -39,6 +39,7 @@ mod pit;
 mod sched;
 mod sched_demo;
 mod serial;
+mod vm;
 
 use frame_systems::Kernel;
 
@@ -159,6 +160,24 @@ unsafe extern "C" fn kmain() -> ! {
     interrupts::test_breakpoint();
     serial::writeln("\n[idt] survived int3");
 
+    // B2 Step 3: demand paging via the PageFaultHandler HSM. Register a
+    // lazy region, then touch it: the access faults (#PF), the HSM
+    // classifies it $LazyFault, maps a fresh frame, and the instruction
+    // retries successfully — all driven from inside the exception handler.
+    vm::init();
+    {
+        const LAZY_VA: u64 = 0x0000_5000_0000_0000;
+        const PATTERN: u64 = 0x1234_5678_9abc_def0;
+        vm::register_lazy_region(LAZY_VA, 4096);
+        unsafe {
+            let p = LAZY_VA as *mut u64;
+            p.write_volatile(PATTERN); // first touch → #PF → demand-mapped → retry
+            if p.read_volatile() == PATTERN {
+                serial::writeln("[#PF] demand fault recovered: ok");
+            }
+        }
+    }
+
     // B1 Step 3b: remap the PIC, start the PIT at 100 Hz, enable
     // interrupts, and wait for ~20 timer ticks. Reaching the "elapsed"
     // line proves IRQ0 is firing (otherwise the hlt loop blocks forever
@@ -184,6 +203,16 @@ unsafe extern "C" fn kmain() -> ! {
     // ever yielding; the timer ISR preempts them round-robin. Both digits
     // appearing proves preemption works.
     sched::run();
+
+    // B2 Step 3 (fatal path): deliberately fault on an unmapped, non-lazy
+    // address. The PageFaultHandler classifies it $Fatal, reports it, and
+    // halts — a clean fatal, not a silent triple-fault. This is the last
+    // thing kmain does.
+    serial::writeln("[#PF] triggering a deliberate fatal fault...");
+    unsafe {
+        let bad = 0x0000_6000_0000_0000 as *const u64;
+        let _ = bad.read_volatile(); // → #PF → $Fatal → halt (never returns)
+    }
 
     halt_forever();
 }
