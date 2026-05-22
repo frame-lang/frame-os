@@ -43,6 +43,7 @@ mod lapic;
 mod net;
 mod paging;
 mod pci;
+mod pcsched;
 mod percpu;
 mod pic;
 mod pit;
@@ -154,6 +155,12 @@ unsafe extern "C" fn ap_entry(cpu: &limine::mp::Cpu) -> ! {
     // posts the BSP staged for it (admit/retire tasks). The instance is pinned
     // to this core; only Send event data crossed from the BSP.
     ksched::ap_run(index);
+
+    // R1b: per-core context-switched execution. This core builds a run queue of
+    // kernel threads and time-slices them under its own LAPIC timer, driving its
+    // own Scheduler Frame instance through $Active→$Idle as they spawn and exit.
+    // Real preemptive multitasking per core; the BSP reads back the results.
+    pcsched::ap_run(index);
 
     // B7 Step 5: stay *interrupt-enabled* and idle, so this core can service the
     // BSP's TLB-shootdown IPI (and its own timer). `hlt` with IF=1 wakes on each
@@ -365,6 +372,53 @@ unsafe extern "C" fn kmain() -> ! {
                 }
                 if all_ok {
                     serial::writeln("[smp] per-core Frame schedulers driven cross-core: ok");
+                }
+            }
+
+            // R1b: per-core context-switched execution. Each AP is now running a
+            // real run queue of kernel threads, time-slicing them under its own
+            // LAPIC timer and driving its own Scheduler Frame instance. Snapshot
+            // the heap-alloc counter, wait for every core to drain its queue
+            // ($Idle), then read back per-core results — and the alloc delta,
+            // which is the per-event allocation cost paid by N cores scheduling
+            // concurrently against the one shared, spin-locked heap (the load
+            // case R1a could not exercise; ties back to R2a finding #3).
+            if ap_count > 0 {
+                // Snapshot the heap-alloc counter, then release the APs — so the
+                // delta below covers every per-core dispatch in the phase.
+                let allocs_before = allocator::alloc_count();
+                pcsched::release();
+                let mut spins = 0u64;
+                while pcsched::done_count() < ap_count && spins < 4_000_000_000 {
+                    spins += 1;
+                    core::hint::spin_loop();
+                }
+                let alloc_delta = allocator::alloc_count().saturating_sub(allocs_before);
+                let want = pcsched::workers_per_core();
+                let mut all_ok = pcsched::done_count() == ap_count;
+                for cpu in 1..=ap_count {
+                    let sw = pcsched::switches(cpu);
+                    let ran = pcsched::threads_run(cpu);
+                    let idle = pcsched::ended_idle(cpu);
+                    serial::write_str("[r1b] core ");
+                    serial::write_u32_decimal(cpu as u32);
+                    serial::write_str(": sliced ");
+                    serial::write_u32_decimal(ran);
+                    serial::write_str(" threads, ");
+                    serial::write_u32_decimal(sw);
+                    serial::write_str(" switches, ended idle=");
+                    serial::writeln(if idle { "true" } else { "false" });
+                    if ran != want || !idle || sw < want {
+                        all_ok = false;
+                    }
+                }
+                serial::write_str("[r1b] heap allocs during per-core scheduling: ");
+                serial::write_u32_decimal(alloc_delta as u32);
+                serial::write_str(" (");
+                serial::write_u32_decimal(ap_count as u32);
+                serial::writeln(" cores dispatching concurrently)");
+                if all_ok {
+                    serial::writeln("[r1b] per-core context-switched execution: ok");
                 }
             }
         } else {

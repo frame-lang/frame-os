@@ -180,31 +180,48 @@ global_asm!(
     "  pop rcx",
     "  pop rax",
     "  iretq",
-    // LAPIC timer (B7 Step 4, vector 0x40) — the application processors' own
-    // periodic timer. Same minimal shape as the virtio post stubs (save the 9
-    // caller-saved GPRs, call the Rust half, restore, iretq). The handler bumps
-    // this core's per-CPU tick and EOIs the LAPIC — no scheduling, no Frame
-    // dispatch. (9 pushes keep rsp 16-aligned for the SysV call.)
+    // LAPIC timer (B7 Step 4 / R1b, vector 0x40) — the application processors'
+    // own periodic timer, now a full-frame preemptive switch like `isr_timer`.
+    // Save ALL 15 GPRs on top of the CPU's iretq frame, pass rsp to
+    // `lapic_schedule`, switch rsp to whatever it returns (the next per-core
+    // thread, or the same context when per-core scheduling is inactive), restore
+    // the 15 GPRs, iretq. `lapic_schedule` does the per-CPU tick + LAPIC EOI and,
+    // when this core's run queue is active (R1b), the round-robin pick.
     ".global isr_lapic_timer",
     "isr_lapic_timer:",
     "  push rax",
+    "  push rbx",
     "  push rcx",
     "  push rdx",
     "  push rsi",
     "  push rdi",
+    "  push rbp",
     "  push r8",
     "  push r9",
     "  push r10",
     "  push r11",
-    "  call lapic_timer_irq",
+    "  push r12",
+    "  push r13",
+    "  push r14",
+    "  push r15",
+    "  mov rdi, rsp", // arg0 = current rsp (points at saved r15)
+    "  and rsp, -16", // align for the call
+    "  call lapic_schedule",
+    "  mov rsp, rax", // switch to the chosen thread's stack
+    "  pop r15",
+    "  pop r14",
+    "  pop r13",
+    "  pop r12",
     "  pop r11",
     "  pop r10",
     "  pop r9",
     "  pop r8",
+    "  pop rbp",
     "  pop rdi",
     "  pop rsi",
     "  pop rdx",
     "  pop rcx",
+    "  pop rbx",
     "  pop rax",
     "  iretq",
     // Spurious interrupt (vector 0xFF) — the LAPIC delivers this if an interrupt
@@ -334,12 +351,24 @@ extern "C" {
     fn isr_tlb_shootdown();
 }
 
-/// Rust half of the LAPIC-timer ISR (B7 Step 4). Records a per-CPU tick (proof
-/// this core was preempted) and EOIs the *LAPIC* (not the PIC). Runs on each AP.
+/// Rust half of the LAPIC-timer ISR (B7 Step 4 / R1b). Records a per-CPU tick
+/// (proof this core was preempted), and — when this core's per-core run queue is
+/// active (R1b) — round-robins to the next runnable thread, returning its stack
+/// pointer for the asm stub to switch to. EOIs the *LAPIC* (not the PIC) before
+/// returning. When per-core scheduling is inactive (B7 Step 4 busy loop, R1a),
+/// it returns `current_rsp` unchanged, so the interrupted context just resumes.
+/// Pure native: never dispatches a Frame system from interrupt context.
 #[no_mangle]
-extern "C" fn lapic_timer_irq() {
+extern "C" fn lapic_schedule(current_rsp: u64) -> u64 {
     crate::percpu::record_tick();
+    let cpu = crate::percpu::this_cpu_index() as usize;
+    let next_rsp = if crate::pcsched::active(cpu) {
+        crate::pcsched::schedule(cpu, current_rsp)
+    } else {
+        current_rsp
+    };
     crate::lapic::eoi();
+    next_rsp
 }
 
 // B7 Step 5: TLB shootdown state. The initiator stores the VA to flush, resets

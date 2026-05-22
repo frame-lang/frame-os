@@ -548,13 +548,26 @@ load-balancing arrive as `post`s into the target core's queue.
   cross-core-post finding holds under N real `Scheduler` instances** — the
   prediction held: no framec change. This is the scheduling *coordination /
   run-mode* layer per core.
-- **R1b (per-core context-switched execution) — remaining.** Wire each core's
-  LAPIC timer (B7 Step 4) to a per-core context switch that picks runnable threads
-  from this Scheduler's ready set — so each core actually *time-slices several
-  threads*, not just tracks the count. Needs: per-CPU TSS (for ring-3 → ring-0
-  traps so APs can run user processes), per-CPU `CURRENT`/run-queue, an IPI
-  "reschedule" vector. **Validates:** whether per-event allocation behind the heap
-  spinlock holds up with N cores scheduling under load.
+- **R1b (per-core context-switched execution) — done.** Each AP now runs a real
+  per-core run queue (`kernel/src/pcsched.rs`): it spawns kernel-thread workers and
+  *time-slices* them under its own LAPIC timer, which became a full-frame
+  context-switching ISR (`isr_lapic_timer` → `lapic_schedule` → per-core
+  `pcsched::schedule`, pure native). Spawning/exiting each worker drives that
+  core's own `Scheduler` Frame instance ($Idle→$Active→$Idle), every dispatch in a
+  per-core interrupts-off critical section — the same native/Frame discipline as
+  the BSP's `sched.rs`, replicated per core. Result: each of the 3 APs runs all 3
+  workers to completion with **~42 context switches** and ends `$Idle`, and the BSP
+  measures **~57 heap allocs** for the whole phase (3 cores × 6 dispatches ≈ **3.2
+  allocs/dispatch** for the parameterless `Scheduler` events — lower than R2a's ~6
+  for param-carrying TCP events, exactly as expected). Serial: `[r1b] core N:
+  sliced 3 threads, 42 switches, ended idle=true` → `[r1b] per-core
+  context-switched execution: ok`. Validated by `smp_pcsched_r1b` (**41/41** QEMU).
+  **Answers the validation question:** per-event allocation behind the shared heap
+  spinlock holds up with N cores scheduling concurrently — no corruption, no
+  deadlock, all instances correct. **Scope:** kernel threads (ring 0) only;
+  per-core *user processes* (ring-3-on-APs + per-CPU TSS.RSP0) are a separate
+  native lift deferred to R5 — not needed for the Frame-relevant question.
+  Recorded in `frame_assessment.md`.
 
 ### R2 — networking at scale: a TCP connection table (Frame-relevant)
 

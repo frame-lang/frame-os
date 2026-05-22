@@ -1552,6 +1552,23 @@ const SMOKE_TESTS: &[SmokeTest] = &[
         expect_absent: &["KERNEL EXCEPTION", "KERNEL PANIC", "triple fault"],
         timeout_secs: 30,
     },
+    SmokeTest {
+        // R1b: per-core context-switched execution. Each AP builds a run queue of
+        // kernel threads and time-slices them under its own LAPIC timer, driving
+        // its own Scheduler Frame instance through $Active -> $Idle as the workers
+        // spawn and exit. Real preemptive multitasking per core: each of the 3 APs
+        // runs all 3 workers to completion with multiple context switches and ends
+        // $Idle. Confirms per-event allocation holds with N cores dispatching their
+        // own Scheduler concurrently against the one shared, spin-locked heap.
+        name: "smp_pcsched_r1b",
+        expect_contains: &[
+            "[r1b] core 1: sliced 3 threads",
+            "[r1b] core 3: sliced 3 threads",
+            "[r1b] per-core context-switched execution: ok",
+        ],
+        expect_absent: &["KERNEL EXCEPTION", "KERNEL PANIC", "triple fault"],
+        timeout_secs: 30,
+    },
 ];
 
 fn run_qemu_test() -> Result<()> {
