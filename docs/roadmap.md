@@ -514,7 +514,80 @@ H3 is the H-track's final committed milestone. Further H-track work (a configura
 - **Step 4 (per-CPU LAPIC timer preemption; B7-1 met) — done.** Native, no Frame system. The legacy PIT only interrupts the BSP, so each AP runs its own **LAPIC timer** to be preempted. `kernel/src/lapic.rs`: map the LAPIC MMIO page (uncached; per-core — every core hits its own LAPIC at the same address), software-enable it, program a periodic timer on vector `0x40`. New IDT gate + naked ISR (`isr_lapic_timer` → per-CPU tick + LAPIC EOI) and a present spurious-vector (`0xFF`) gate; `gdt::load_on_ap` + `interrupts::load_idt_on_ap` so an AP loads our GDT/IDT (GDT *before* per-CPU init, since reloading `gs` zeros the GS base). Each AP then `sti`s and runs a busy loop preempted by its timer until it has been ticked `TARGET_TICKS` times — proving the core runs a real, *time-sliced* thread. Serial: `[smp] core 1: 5 timer ticks, 47216 work units` (… cores 2/3 similar, varying because they run independently) → `per-core preemption: ok (each AP timer-sliced)`. Validated by `smp_preempt_b7` (**36/36** QEMU; B0–B6 unaffected). **B7-1 met** (each core runs + is preempted; per-CPU run-*queues* / many threads per core is a further refinement).
 - **Step 5 (TLB shootdown via IPI) — done.** B7's last named native component. When one core unmaps a page the others may still cache the translation, so the initiator must IPI them to `invlpg` it — and wait for every core to ack before reusing the page (the **shootdown barrier**). `lapic::send_ipi_all_but_self` (ICR, all-excluding-self shorthand) + a new IPI vector `0x41` / naked ISR (`invlpg` the shootdown VA + ack + LAPIC EOI) + `interrupts::shootdown(va)` (set VA, reset acks, send IPI). The APs idle *interrupt-enabled* (`sti; hlt`) after the preempt phase so they service the IPI. Demo: the BSP maps a test page, unmaps it (flushing its own TLB), IPIs the 3 APs, and waits for all 3 acks. Serial: `[smp] TLB shootdown: 3 of 3 cores flushed` → `TLB shootdown ack barrier: ok (safe to reuse page)`. Validated by `smp_tlb_shootdown_b7` (**37/37** QEMU).
 
-**B7 status: substantially complete.** B7-1 (cores run + are preempted), B7-2 (cross-core `post` driving a Frame system), and the native components (AP startup, per-CPU data, the IRQ-safe `SpinLock` + documented lock ordering, the LAPIC timer, IPIs, TLB shootdown) are all done and validated; the smoke suite runs under `-smp 4` (B7-5). The headline Frame finding — **the post/drain architecture gives cross-core safety with no framec `Send`/`Sync` change** (B7-4's write-up) — is in [`frame_assessment.md`](frame_assessment.md). **Remaining (refinements, not blockers):** a real per-CPU run-queue scheduler (drive the existing `Scheduler`/`Process` Frame systems per core — expected to reuse the cross-core-post pattern), and a deeper deadlock/ordering stress (B7-3) as nested locks appear. **All seven B-track milestones (B0–B7) are now functionally demonstrated.**
+**B7 status: substantially complete.** B7-1 (cores run + are preempted), B7-2 (cross-core `post` driving a Frame system), and the native components (AP startup, per-CPU data, the IRQ-safe `SpinLock` + documented lock ordering, the LAPIC timer, IPIs, TLB shootdown) are all done and validated; the smoke suite runs under `-smp 4` (B7-5). The headline Frame finding — **the post/drain architecture gives cross-core safety with no framec `Send`/`Sync` change** (B7-4's write-up) — is in [`frame_assessment.md`](frame_assessment.md). **Remaining (refinements, not blockers):** a real per-CPU run-queue scheduler (drive the existing `Scheduler`/`Process` Frame systems per core — expected to reuse the cross-core-post pattern), and a deeper deadlock/ordering stress (B7-3) as nested locks appear. **All seven B-track milestones (B0–B7) are now functionally demonstrated.** A retrospective synthesis is in [`capstone.md`](capstone.md).
+
+## Post-B7 refinement track
+
+The committed B0–B7 milestones are functionally complete. Forward work is
+*refinement* — deepening what exists rather than adding new milestones. These are
+**not strictly sequential**; they're ordered roughly by value to the project's
+core purpose (stress-testing Frame on systems problems). Each lands green (gates +
+QEMU smoke) like a milestone step, and each gets its assessment note.
+
+The guiding question for prioritization: *does this teach us something new about
+Frame, or is it native completeness?* The Frame-relevant ones come first.
+
+### R1 — per-CPU run-queue scheduler (Frame-relevant)
+
+Today the APs run a single timer-preempted loop (B7-1). The refinement: a real
+**per-CPU run queue** so each core schedules multiple kernel threads/processes,
+driving the *existing* `Scheduler`/`Process` Frame systems **per core**. The
+prediction (from the B7 cross-core-post finding) is that this needs **no framec
+change**: each core owns its scheduler/process instances; cross-core wakeups and
+load-balancing arrive as `post`s into the target core's queue. This is the
+highest-value refinement — it puts the marquee finding under real load and
+exercises *many* Frame instances across cores. Needs: per-CPU TSS (so APs can take
+ring-3 → ring-0 traps and run user processes), per-CPU `CURRENT`/run-queue, an IPI
+"reschedule" vector. **Validates:** the cross-core-post model at scale; whether
+per-event allocation behind the heap spinlock holds up with N cores scheduling.
+
+### R2 — networking at scale: a TCP connection table (Frame-relevant)
+
+B5 proved one `TcpConnection`. The open question from `frame_assessment.md`: does
+**per-event allocation + per-instance dispatch** hold up with *many* concurrent
+connections? Build a connection table (N live `TcpConnection` instances keyed by
+4-tuple), accept several simultaneous connections, and measure. **Validates** (or
+refutes, quantitatively) the hot-path-allocation concern — the single most
+important open question about Frame's runtime model for systems use.
+
+### R3 — multi-port USB / orthogonal regions (Frame-relevant)
+
+B6 was single-port/single-device. The roadmap flagged **orthogonal regions
+(multiple ports concurrently)** as a framec gate that B6 didn't exercise. Add hub
+support / multiple `HubPort` + `UsbEnumeration` instances running concurrently
+(e.g. `usb-kbd` + `usb-mouse` + `usb-storage`), and a mass-storage (bulk/SCSI)
+transfer. **Validates:** many concurrent lifecycle FSMs of the same type; the
+"orthogonal regions" question.
+
+### R4 — the no-alloc / preallocated event path (framec-relevant)
+
+`frame_assessment.md` flags this as *the single highest-value framec change for
+systems use*: a dispatch path that doesn't allocate per event. This is primarily a
+framec investigation (can the generated `FrameEvent`/context use a preallocated
+pool or stack storage?), filed to the transpiler team. If it lands, it removes the
+root cause behind post/drain and the hot-path verdict — re-run R1/R2 against it.
+
+### R5 — deeper SMP correctness (native)
+
+Nested locks with a documented acquire order, sleep-locks (block rather than spin
+for long holds), a deadlock stress test, and proper per-CPU TSS/IST. Completes
+B7-3 beyond the leaf-lock stage. Mostly native; the payoff is robustness, not a
+Frame finding.
+
+### R6 — the crates.io CI gate (tooling)
+
+B5-7/B6/B7's crates.io CI is red because the kernel uses typed-context framec
+(struct enter params) that isn't published yet. Unblock by publishing the
+typed-context framec (the transpiler team's call), then green the GitHub CI matrix
+to match the locally-green dev container.
+
+### Out of scope unless expanded
+
+- **"B8" — AArch64 / Raspberry Pi port.** A plausible later track (the README lists
+  Pi Pico / Pi 4/5 as intended runtime targets), not committed. Would be its own
+  milestone with a port-contract + portability story.
+- A device/power state-machine showcase (ACPI sleep states) — a *possible* future
+  Frame demonstration, not committed.
 
 ## Dependency graph between milestones
 
