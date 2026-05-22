@@ -278,8 +278,11 @@ unsafe extern "C" fn kmain() -> ! {
     if xhci::init() {
         // B6 Step 2: drive the connected port through the HubPort Frame system —
         // connect → reset (a timed transition) → enabled, readying the device
-        // for enumeration (Step 3).
+        // for enumeration.
         xhci::run_port_lifecycle();
+        // B6 Step 3: enumerate the device through the UsbEnumeration Frame system
+        // — Enable Slot → Address Device (descriptors + configuration in 3c).
+        xhci::run_enumeration();
     }
 
     // B2 Step 3 (fatal path): deliberately fault on an unmapped, non-lazy

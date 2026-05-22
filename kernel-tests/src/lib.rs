@@ -451,6 +451,10 @@ pub mod xhci {
         static RESET_PORT: Cell<u8> = const { Cell::new(0) };
         static RESETS: Cell<u32> = const { Cell::new(0) };
         static ENABLED_PORT: Cell<u8> = const { Cell::new(0) };
+        // Enumeration actions (UsbEnumeration).
+        static ENABLE_SLOTS: Cell<u32> = const { Cell::new(0) };
+        static ADDR_SLOT: Cell<u8> = const { Cell::new(0) };
+        static ADDRESSED_SLOT: Cell<u8> = const { Cell::new(0) };
     }
 
     pub fn begin_port_reset(port: u8) {
@@ -459,6 +463,15 @@ pub mod xhci {
     }
     pub fn on_port_enabled(port: u8) {
         ENABLED_PORT.with(|c| c.set(port));
+    }
+    pub fn cmd_enable_slot() {
+        ENABLE_SLOTS.with(|c| c.set(c.get() + 1));
+    }
+    pub fn address_device(slot: u8) {
+        ADDR_SLOT.with(|c| c.set(slot));
+    }
+    pub fn on_address_assigned(slot: u8) {
+        ADDRESSED_SLOT.with(|c| c.set(slot));
     }
 
     /// Test inspectors.
@@ -471,10 +484,22 @@ pub mod xhci {
     pub fn enabled_port() -> u8 {
         ENABLED_PORT.with(|c| c.get())
     }
+    pub fn enable_slots() -> u32 {
+        ENABLE_SLOTS.with(|c| c.get())
+    }
+    pub fn addr_slot() -> u8 {
+        ADDR_SLOT.with(|c| c.get())
+    }
+    pub fn addressed_slot() -> u8 {
+        ADDRESSED_SLOT.with(|c| c.get())
+    }
     pub fn reset() {
         RESET_PORT.with(|c| c.set(0));
         RESETS.with(|c| c.set(0));
         ENABLED_PORT.with(|c| c.set(0));
+        ENABLE_SLOTS.with(|c| c.set(0));
+        ADDR_SLOT.with(|c| c.set(0));
+        ADDRESSED_SLOT.with(|c| c.set(0));
     }
 }
 
@@ -521,3 +546,7 @@ include!(concat!(env!("OUT_DIR"), "/ip_reassembly.rs"));
 // call crate::xhci::{begin_port_reset,on_port_enabled} (the host double above
 // records them); disconnect funnels to $Disconnected via the $Attached parent.
 include!(concat!(env!("OUT_DIR"), "/hub_port.rs"));
+// UsbEnumeration (B6 Step 3): the device enumeration lifecycle. Actions call
+// crate::xhci::{cmd_enable_slot,address_device,on_address_assigned} (the host
+// double above records them); slot threads via the FSM domain.
+include!(concat!(env!("OUT_DIR"), "/usb_enumeration.rs"));

@@ -1,0 +1,84 @@
+// frame/usb_enumeration.frs
+//
+// UsbEnumeration — a USB device's enumeration lifecycle (B6 Step 3). After the
+// port is enabled (HubPort.$Enabled), the device must be brought from its
+// Default state to Configured: assign it a slot, give it an address, then read
+// its descriptors and select a configuration. Each step is one xHCI command (or
+// control transfer) whose *completion* is an asynchronous event — so this system
+// tracks the enumeration *stage*, and its enter handlers issue the next command
+// (non-blocking); the native driver loop dequeues completion events and
+// dispatches the matching milestone event back here.
+//
+// State graph (Step 3a/3b — through addressing; $Configured lands in Step 3c):
+//
+//   $Powered ─ slot_enabled(slot) ─► $SlotEnabled ─ addressed ─► $AddressAssigned
+//      │                                  │                            │
+//      └──────────────── fail (any stage, via $Enumerating parent) ──► $Failed
+//
+//   $Powered.$>        issues Enable Slot
+//   $SlotEnabled.$>    issues Address Device (using the slot from the domain)
+//   $AddressAssigned.$> logs the milestone (configuration follows in Step 3c)
+//
+// `fail()` from any active stage funnels to `$Failed` through the `$Enumerating`
+// parent (`=> $^` — the TcpConnection.$Open / HubPort.$Attached pattern).
+
+@@[target("rust")]
+
+@@system UsbEnumeration {
+    interface:
+        slot_enabled(slot: u8)
+        addressed()
+        fail()
+        state(): String = "Powered".to_string()
+        is_addressed(): bool = false
+        is_failed(): bool = false
+
+    machine:
+        $Powered => $Enumerating {
+            $>() {
+                crate::xhci::cmd_enable_slot();
+            }
+            slot_enabled(slot: u8) {
+                self.slot = slot;
+                -> $SlotEnabled
+            }
+            state(): String { @@:("Powered".to_string()) }
+            => $^
+        }
+
+        $SlotEnabled => $Enumerating {
+            $>() {
+                crate::xhci::address_device(self.slot);
+            }
+            addressed() {
+                -> $AddressAssigned
+            }
+            state(): String { @@:("SlotEnabled".to_string()) }
+            => $^
+        }
+
+        $AddressAssigned => $Enumerating {
+            $>() {
+                crate::xhci::on_address_assigned(self.slot);
+            }
+            is_addressed(): bool { @@:(true) }
+            state(): String { @@:("AddressAssigned".to_string()) }
+            => $^
+        }
+
+        $Failed {
+            is_failed(): bool { @@:(true) }
+            state(): String { @@:("Failed".to_string()) }
+        }
+
+        // Parent: a failed command at any stage tears enumeration down to
+        // $Failed. The active children forward `fail()` here via `=> $^`.
+        $Enumerating {
+            fail() {
+                -> $Failed
+            }
+        }
+
+    domain:
+        slot: u8 = 0
+}

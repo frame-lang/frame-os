@@ -19,7 +19,7 @@
 // physical address space — so the BAR's physical base is directly addressable.
 // All register access is volatile.
 
-use crate::frame_systems::HubPort;
+use crate::frame_systems::{HubPort, UsbEnumeration};
 use crate::{frames, interrupts, paging, pci, serial};
 use core::ptr::{read_volatile, write_volatile};
 
@@ -91,10 +91,17 @@ pub struct Xhci {
     ctx_64: bool, // CSZ: contexts are 64 bytes (else 32)
     #[allow(dead_code)]
     dcbaa_phys: u64,
-    #[allow(dead_code)]
     cmd_ring_phys: u64,
-    #[allow(dead_code)]
     event_ring_phys: u64,
+    // Ring cursors (B6 Step 3). The command ring is a producer ring (we enqueue,
+    // the controller consumes): `cmd_enqueue` is our next slot, `cmd_pcs` the
+    // Producer Cycle State we stamp. The event ring is a consumer ring (the
+    // controller produces, we dequeue): `event_dequeue` is our next slot,
+    // `event_ccs` the Consumer Cycle State a valid event must match.
+    cmd_enqueue: usize,
+    cmd_pcs: u32,
+    event_dequeue: usize,
+    event_ccs: u32,
 }
 
 static mut XHCI: Option<Xhci> = None;
@@ -272,6 +279,12 @@ pub fn init() -> bool {
         dcbaa_phys,
         cmd_ring_phys,
         event_ring_phys,
+        // Both rings start at slot 0; producer/consumer cycle states start at 1
+        // (matching the RCS we set in CRCR and the controller's initial ERDP).
+        cmd_enqueue: 0,
+        cmd_pcs: 1,
+        event_dequeue: 0,
+        event_ccs: 1,
     };
 
     // 7. Report connected ports (the usb-kbd attaches to one of them).
@@ -369,6 +382,72 @@ impl Xhci {
         self.write_portsc(port, v);
     }
 
+    /// Enqueue a command TRB on the command ring (the low 3 dwords + a control
+    /// dword `ctrl` whose cycle bit we stamp), then return the physical address
+    /// of the slot it landed in (for matching its Command Completion Event).
+    /// Follows the Link TRB at the end of the ring (toggling our cycle state).
+    fn enqueue_cmd(&mut self, d0: u32, d1: u32, d2: u32, ctrl: u32) -> u64 {
+        let ring = frames::phys_to_virt(self.cmd_ring_phys);
+        // If we're at the Link TRB slot, point it at our current cycle so the
+        // controller follows it, then wrap to slot 0 and toggle our cycle.
+        if self.cmd_enqueue >= RING_TRBS - 1 {
+            let link = unsafe { ring.add((RING_TRBS - 1) * TRB_SIZE) };
+            unsafe {
+                write_volatile(link.add(12) as *mut u32, (6 << 10) | (1 << 1) | self.cmd_pcs)
+            };
+            self.cmd_enqueue = 0;
+            self.cmd_pcs ^= 1;
+        }
+        let slot = unsafe { ring.add(self.cmd_enqueue * TRB_SIZE) };
+        let trb_phys = self.cmd_ring_phys + (self.cmd_enqueue * TRB_SIZE) as u64;
+        unsafe {
+            write_volatile(slot as *mut u32, d0);
+            write_volatile(slot.add(4) as *mut u32, d1);
+            write_volatile(slot.add(8) as *mut u32, d2);
+            write_volatile(slot.add(12) as *mut u32, ctrl | self.cmd_pcs);
+        }
+        self.cmd_enqueue += 1;
+        trb_phys
+    }
+
+    /// Ring the command doorbell (DB[0] = 0) so the controller processes the
+    /// command ring up to our enqueue pointer.
+    fn ring_command_doorbell(&self) {
+        unsafe { write_volatile(self.doorbells, 0) };
+    }
+
+    /// Ring an endpoint doorbell: DB[slot] = endpoint DCI (e.g. 1 for EP0).
+    /// (Used by the control-transfer path in Step 3c.)
+    #[allow(dead_code)]
+    fn ring_doorbell(&self, slot: u8, dci: u32) {
+        unsafe { write_volatile(self.doorbells.add(slot as usize), dci) };
+    }
+
+    /// Dequeue the next event-ring TRB if one has been produced (its cycle bit
+    /// matches our Consumer Cycle State). Advances the dequeue pointer + ERDP.
+    fn poll_event(&mut self) -> Option<[u32; 4]> {
+        let ring = frames::phys_to_virt(self.event_ring_phys);
+        let slot = unsafe { ring.add(self.event_dequeue * TRB_SIZE) };
+        let d3 = unsafe { read_volatile(slot.add(12) as *const u32) };
+        if (d3 & 1) != self.event_ccs {
+            return None; // controller hasn't produced this slot yet
+        }
+        let d0 = unsafe { read_volatile(slot as *const u32) };
+        let d1 = unsafe { read_volatile(slot.add(4) as *const u32) };
+        let d2 = unsafe { read_volatile(slot.add(8) as *const u32) };
+
+        self.event_dequeue += 1;
+        if self.event_dequeue >= RING_TRBS {
+            self.event_dequeue = 0;
+            self.event_ccs ^= 1;
+        }
+        // Update ERDP to the new dequeue position + clear the Event Handler Busy
+        // bit (bit 3, write-1-to-clear).
+        let erdp = self.event_ring_phys + (self.event_dequeue * TRB_SIZE) as u64;
+        unsafe { wr64(self.runtime, RT_IR0 + IR_ERDP, erdp | (1 << 3)) };
+        Some([d0, d1, d2, d3])
+    }
+
     /// Whether a device is currently connected on 1-based `port` (PORTSC.CCS).
     pub fn port_connected(&self, port: u8) -> bool {
         self.portsc(port) & PORTSC_CCS != 0
@@ -452,6 +531,156 @@ pub fn run_port_lifecycle() {
         if interrupts::ticks() >= unsafe { (&raw const RESET_DEADLINE).read() } {
             hp.timeout(); // -> $Connected
             serial::writeln("[usb] port reset timed out");
+            break;
+        }
+        interrupts::wait_for_interrupt();
+    }
+    interrupts::disable();
+}
+
+// --- USB enumeration (B6 Step 3) -------------------------------------------
+//
+// The native actions the `UsbEnumeration` Frame system calls (each issues one
+// xHCI command, non-blocking — never waits inside a Frame handler), plus the
+// driver loop that dequeues completion events and dispatches the matching FSM
+// event. Frame owns the enumeration *stage*; this owns the TRBs + contexts.
+
+const TRB_ADDRESS_DEVICE: u32 = 11;
+const TRB_ENABLE_SLOT: u32 = 9;
+const TRB_CMD_COMPLETION: u32 = 33;
+const COMPLETION_SUCCESS: u32 = 1;
+
+// Enumeration state (single-flight).
+static mut ENUM_SLOT: u8 = 0;
+static mut DEVICE_CTX_PHYS: u64 = 0;
+static mut INPUT_CTX_PHYS: u64 = 0;
+static mut EP0_RING_PHYS: u64 = 0;
+
+fn trb_type(d3: u32) -> u32 {
+    (d3 >> 10) & 0x3F
+}
+fn completion_code(d2: u32) -> u32 {
+    (d2 >> 24) & 0xFF
+}
+fn event_slot(d3: u32) -> u8 {
+    ((d3 >> 24) & 0xFF) as u8
+}
+
+/// EP0 max packet size by USB speed (PORTSC speed field): LS/FS=8, HS=64, SS=512.
+fn ep0_mps(speed: u32) -> u32 {
+    match speed {
+        3 => 64,  // High-Speed
+        4 => 512, // SuperSpeed
+        _ => 8,   // Full/Low-Speed (and unknown)
+    }
+}
+
+/// `UsbEnumeration.$Powered.$>`: issue an Enable Slot command (non-blocking).
+pub fn cmd_enable_slot() {
+    if let Some(x) = controller() {
+        x.enqueue_cmd(0, 0, 0, TRB_ENABLE_SLOT << 10);
+        x.ring_command_doorbell();
+    }
+    serial::writeln("[usb] enable slot issued");
+}
+
+/// `UsbEnumeration.$SlotEnabled.$>`: build the input context (slot + EP0) for
+/// `slot`, register the output device context in the DCBAA, allocate the EP0
+/// transfer ring, and issue an Address Device command (non-blocking).
+pub fn address_device(slot: u8) {
+    serial::write_str("[usb] slot ");
+    serial::write_u32_decimal(slot as u32);
+    serial::writeln(" enabled");
+
+    let port = unsafe { (&raw const CONNECTED_PORT).read() };
+    let Some(x) = controller() else { return };
+    let speed = (x.portsc(port) >> 10) & 0xF;
+    let mps = ep0_mps(speed);
+    let cs = if x.ctx_64 { 64usize } else { 32 };
+
+    // Output device context → DCBAA[slot].
+    let Some(devctx) = alloc_zeroed_page() else { return };
+    let dcbaa = frames::phys_to_virt(x.dcbaa_phys) as *mut u64;
+    unsafe { write_volatile(dcbaa.add(slot as usize), devctx) };
+
+    // EP0 transfer ring (with a Link TRB back to its start).
+    let Some(ep0) = alloc_zeroed_page() else { return };
+    write_link_trb(ep0, ep0);
+
+    // Input context: Input Control Context + Slot Context + EP0 Context.
+    let Some(ictx) = alloc_zeroed_page() else { return };
+    let v = frames::phys_to_virt(ictx);
+    unsafe {
+        // Input Control Context: Add Context flags A0 (slot) | A1 (EP0).
+        write_volatile(v.add(4) as *mut u32, 0b11);
+        // Slot Context: Context Entries = 1 (bits 31:27), Speed (bits 23:20).
+        write_volatile(v.add(cs) as *mut u32, (1 << 27) | (speed << 20));
+        // Root Hub Port Number (bits 23:16).
+        write_volatile(v.add(cs + 4) as *mut u32, (port as u32) << 16);
+        // EP0 Context: EP Type = 4 (Control, bits 5:3), CErr = 3 (bits 2:1),
+        // Max Packet Size (bits 31:16).
+        let ep = cs * 2;
+        write_volatile(v.add(ep + 4) as *mut u32, (4 << 3) | (3 << 1) | (mps << 16));
+        // TR Dequeue Pointer = EP0 ring | DCS(1).
+        write_volatile(v.add(ep + 8) as *mut u32, (ep0 as u32) | 1);
+        write_volatile(v.add(ep + 12) as *mut u32, (ep0 >> 32) as u32);
+        // Average TRB Length (control = 8).
+        write_volatile(v.add(ep + 16) as *mut u32, 8);
+    }
+
+    unsafe {
+        (&raw mut ENUM_SLOT).write(slot);
+        (&raw mut DEVICE_CTX_PHYS).write(devctx);
+        (&raw mut INPUT_CTX_PHYS).write(ictx);
+        (&raw mut EP0_RING_PHYS).write(ep0);
+    }
+
+    // Address Device command: input context pointer + slot id.
+    x.enqueue_cmd(
+        ictx as u32,
+        (ictx >> 32) as u32,
+        0,
+        (TRB_ADDRESS_DEVICE << 10) | ((slot as u32) << 24),
+    );
+    x.ring_command_doorbell();
+}
+
+/// `UsbEnumeration.$AddressAssigned.$>`: the device has a USB address.
+pub fn on_address_assigned(slot: u8) {
+    serial::write_str("[usb] device addressed (slot ");
+    serial::write_u32_decimal(slot as u32);
+    serial::writeln(")");
+}
+
+/// Drive the connected, enabled device through enumeration. Creates the
+/// `UsbEnumeration` FSM (which kicks Enable Slot in `$Powered`'s enter handler),
+/// then dequeues command-completion events and dispatches the matching FSM event
+/// until the device is addressed (or a command fails / the deadline passes).
+pub fn run_enumeration() {
+    if unsafe { (&raw const CONNECTED_PORT).read() } == 0 {
+        return;
+    }
+    interrupts::enable();
+    let mut e = UsbEnumeration::__create(); // $Powered.$> → Enable Slot
+    let deadline = interrupts::ticks() + 200;
+
+    while interrupts::ticks() < deadline {
+        if let Some(ev) = controller().and_then(|x| x.poll_event()) {
+            if trb_type(ev[3]) == TRB_CMD_COMPLETION {
+                if completion_code(ev[2]) != COMPLETION_SUCCESS {
+                    serial::writeln("[usb] command failed during enumeration");
+                    e.fail();
+                    break;
+                }
+                let slot = event_slot(ev[3]);
+                match e.state().as_str() {
+                    "Powered" => e.slot_enabled(slot), // → $SlotEnabled (issues Address Device)
+                    "SlotEnabled" => e.addressed(),    // → $AddressAssigned
+                    _ => {}
+                }
+            }
+        }
+        if e.is_addressed() || e.is_failed() {
             break;
         }
         interrupts::wait_for_interrupt();

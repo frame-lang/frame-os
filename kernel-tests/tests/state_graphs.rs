@@ -194,3 +194,11 @@ fn hub_port_state_graph_snapshot() {
     };
     insta::assert_snapshot!("hub_port_state_graph", dot);
 }
+
+#[test]
+fn usb_enumeration_state_graph_snapshot() {
+    let Some(dot) = frame_to_dot("usb_enumeration.frs") else {
+        return; // framec unavailable; test skipped
+    };
+    insta::assert_snapshot!("usb_enumeration_state_graph", dot);
+}

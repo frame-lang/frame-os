@@ -177,6 +177,7 @@ const DIAGRAMS: &[(&str, &str)] = &[
     ("tcp_connection.frs", "tcp_connection.svg"),
     ("ip_reassembly.frs", "ip_reassembly.svg"),
     ("hub_port.frs", "hub_port.svg"),
+    ("usb_enumeration.frs", "usb_enumeration.svg"),
 ];
 
 fn diagrams(mode: DiagramMode) -> Result<()> {
@@ -1368,6 +1369,25 @@ const SMOKE_TESTS: &[SmokeTest] = &[
             "[usb] port 5 enabled",
         ],
         expect_absent: &["KERNEL EXCEPTION", "KERNEL PANIC", "triple fault"],
+        timeout_secs: 30,
+    },
+    SmokeTest {
+        // B6 Step 3 (3a/3b): the UsbEnumeration Frame system enumerates the
+        // device through addressing — Enable Slot (→ slot id from a Command
+        // Completion Event) then Address Device (input/slot/EP0 contexts). Each
+        // command's completion drives an FSM milestone event. (Descriptors +
+        // SET_CONFIGURATION → $Configured land in Step 3c.)
+        name: "usb_enumerates_b6",
+        expect_contains: &[
+            "[usb] slot 1 enabled",
+            "[usb] device addressed (slot 1)",
+        ],
+        expect_absent: &[
+            "KERNEL EXCEPTION",
+            "KERNEL PANIC",
+            "triple fault",
+            "[usb] command failed during enumeration",
+        ],
         timeout_secs: 30,
     },
 ];

@@ -86,3 +86,8 @@ include!(concat!(env!("OUT_DIR"), "/ip_reassembly.rs"));
 // Actions call crate::xhci::{begin_port_reset,on_port_enabled}; the reset is a
 // timed transition (settle timer armed in $Resetting's enter handler).
 include!(concat!(env!("OUT_DIR"), "/hub_port.rs"));
+// UsbEnumeration (B6 Step 3): a device's enumeration lifecycle ($Powered →
+// $SlotEnabled → $AddressAssigned → …). Enter handlers issue the next xHCI
+// command (crate::xhci::{cmd_enable_slot,address_device,...}); the native driver
+// dispatches the milestone events on command completions. slot threads via domain.
+include!(concat!(env!("OUT_DIR"), "/usb_enumeration.rs"));

@@ -36,6 +36,7 @@ const FRAME_SYSTEMS: &[(&str, &str)] = &[
     ("tcp_connection", "tcp_connection.frs"),
     ("ip_reassembly", "ip_reassembly.frs"),
     ("hub_port", "hub_port.frs"),
+    ("usb_enumeration", "usb_enumeration.frs"),
     ("kernel", "kernel.frs"),
 ];
 
