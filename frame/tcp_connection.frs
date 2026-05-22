@@ -112,8 +112,9 @@
                     crate::tcp::send_ack();
                     -> $CloseWait
                 } else if seg.payload_len > 0 {
+                    // The demo's echo "application": send the received bytes back
+                    // (the data segment piggybacks the ACK, so no separate ack).
                     crate::tcp::deliver_data();
-                    crate::tcp::send_ack();
                 }
                 // a pure ACK (no data, no FIN) advances send state only — no reply
             }

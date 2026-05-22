@@ -56,6 +56,13 @@ static mut RETRANSMIT_AT: u64 = 0; // 0 = disarmed
 static mut TIMEWAIT_AT: u64 = 0;
 static mut SAW_TCP: bool = false; // any inbound TCP segment seen (serve loop)
 
+// The most recent received payload, stashed by on_segment so the echo "app"
+// (deliver_data) can send it back. Single-flight, like the rest.
+const MAX_PAYLOAD: usize = 512;
+static mut LAST_PAYLOAD: [u8; MAX_PAYLOAD] = [0; MAX_PAYLOAD];
+static mut LAST_PAYLOAD_LEN: usize = 0;
+static mut ECHOES: u32 = 0; // total payloads echoed (lets the serve loop know it got the live conn)
+
 fn conn() -> &'static mut TcpConnection {
     let p = &raw mut CONN;
     unsafe { (*p).get_or_insert_with(TcpConnection::__create) }
@@ -161,7 +168,7 @@ fn send(flags: u8, payload: &[u8]) {
     let rcv = rd(&raw const RCV_NXT);
 
     let tcp_len = 20 + payload.len();
-    let mut f = [0u8; 14 + 20 + 20 + 64];
+    let mut f = [0u8; 14 + 20 + 20 + MAX_PAYLOAD];
     let total = 14 + 20 + tcp_len;
 
     // Ethernet.
@@ -227,8 +234,43 @@ pub fn send_fin() {
     send(F_FIN | F_ACK, &[]);
 }
 
-/// Hand received payload up. (At 4a there's no app; the echo lands at 4c.)
-pub fn deliver_data() {}
+/// The demo's echo "application": send the most recently received payload
+/// (stashed by `on_segment`) back to the peer. The data segment piggybacks the
+/// ACK (its `ack_num` = `RCV_NXT`, already advanced past the received bytes).
+pub fn deliver_data() {
+    let n = rd(&raw const LAST_PAYLOAD_LEN);
+    if n == 0 {
+        return;
+    }
+    let buf = {
+        let p = &raw const LAST_PAYLOAD;
+        let full: &[u8] = unsafe { &*p };
+        &full[..n]
+    };
+    send(F_ACK, buf);
+    wr(&raw mut ECHOES, rd(&raw const ECHOES) + 1);
+    serial::write_str("[tcp] echoed ");
+    serial::write_u32_decimal(n as u32);
+    serial::writeln(" bytes");
+}
+
+/// Total payloads echoed so far (cumulative across connections).
+pub fn echoes() -> u32 {
+    rd(&raw const ECHOES)
+}
+
+/// Recycle the connection: force it to `$Closed` (via the RST funnel — no
+/// packet sent, just `on_reset` + the transition), reset the sequence state,
+/// and passive-open again. Used by the serve loop to drop an idle/dead
+/// connection (slirp accepts host connections locally before the guest
+/// handshakes, so abandoned retries can leave us stuck `$Established`) and
+/// accept the live one.
+pub fn relisten() {
+    conn().rst(); // any active state -> $Closed via the $Open funnel
+    on_reset();
+    wr(&raw mut SND_NXT, INITIAL_SND);
+    conn().open_passive(); // $Closed -> $Listen
+}
 
 /// On reset, clear the timers + sequence state for the next connection.
 pub fn on_reset() {
@@ -263,6 +305,19 @@ pub fn on_segment(frame: &[u8]) {
         return; // not for our listening port
     }
     wr(&raw mut SAW_TCP, true);
+
+    // Stash any payload so the echo app (deliver_data) can send it back. Only
+    // in-order data (seq == RCV_NXT before parse advanced it) is echoed.
+    let n = seg.payload_len.min(MAX_PAYLOAD);
+    if n > 0 && seg.payload_off + n <= frame.len() {
+        let p = &raw mut LAST_PAYLOAD;
+        let dst: &mut [u8] = unsafe { &mut *p };
+        dst[..n].copy_from_slice(&frame[seg.payload_off..seg.payload_off + n]);
+        wr(&raw mut LAST_PAYLOAD_LEN, n);
+    } else {
+        wr(&raw mut LAST_PAYLOAD_LEN, 0);
+    }
+
     if seg.rst {
         conn().rst();
     } else {

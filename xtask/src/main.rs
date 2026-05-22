@@ -1080,6 +1080,17 @@ const SMOKE_TESTS: &[SmokeTest] = &[
         // The serve loop waits a few seconds for the client; give it headroom.
         timeout_secs: 30,
     },
+    SmokeTest {
+        // B5 Step 4c: data echo. After the handshake, the harness sends a
+        // request; the kernel's $Established echoes it back (the data segment
+        // piggybacks the ACK). The harness reads the reply and verifies it
+        // matches (gated in run_qemu_once — a bad outbound seq/checksum would
+        // make the host TCP drop it), and the kernel logs "[tcp] echoed N bytes".
+        name: "tcp_echo_b5",
+        expect_contains: &["[tcp] established", "[tcp] echoed 18 bytes"],
+        expect_absent: &["KERNEL EXCEPTION", "KERNEL PANIC", "triple fault"],
+        timeout_secs: 30,
+    },
 ];
 
 fn run_qemu_test() -> Result<()> {
@@ -1140,8 +1151,21 @@ fn run_qemu_test() -> Result<()> {
 /// `serial_path`. Returns when QEMU exits (clean isa-debug-exit) or the
 /// timeout forces a kill. `-display none` is set in `qemu_base_command`.
 /// Host port slirp forwards to the guest's TCP listener (:7), for the B5 Step
-/// 4b handshake probe.
+/// 4b/4c TCP probes.
 const TCP_PROBE_PORT: u16 = 15580;
+/// The request the echo probe sends; the kernel echoes it back verbatim.
+const TCP_ECHO_REQUEST: &[u8] = b"frame-os tcp echo\n";
+
+/// What (if anything) the harness drives over the forwarded TCP port.
+#[derive(Clone, Copy, PartialEq)]
+enum TcpProbe {
+    None,
+    /// 4b: connect (drive the 3-way handshake); the serial oracle confirms it.
+    Handshake,
+    /// 4c: connect, send a request, and verify the echoed reply (validates the
+    /// outbound data path's seq + checksum — the host TCP would drop a bad one).
+    Echo,
+}
 
 fn run_qemu_once(
     artifacts: &QemuArtifacts,
@@ -1149,7 +1173,7 @@ fn run_qemu_once(
     blk_disk: &Path,
     serial_path: &Path,
     timeout_secs: u64,
-    tcp_probe: bool,
+    tcp_probe: TcpProbe,
 ) -> Result<()> {
     let mut cmd = qemu_base_command(artifacts, ovmf_vars, blk_disk);
     cmd.args(["-serial"])
@@ -1160,12 +1184,13 @@ fn run_qemu_once(
 
     let mut child = cmd.spawn().context("failed to invoke qemu-system-x86_64")?;
 
-    // B5 Step 4b: if this test drives a TCP handshake, connect to the forwarded
-    // port (retrying while the kernel boots to its serve loop). A successful
-    // connect means slirp completed a forwarded connection, i.e. the guest's
-    // TcpConnection reached $Established — the kernel logs "[tcp] established",
-    // which is the serial-side oracle the test asserts on.
+    // B5 Step 4b/4c: drive the forwarded TCP port (retrying while the kernel
+    // boots to its serve loop). Handshake: a successful connect means the guest
+    // reached $Established (serial oracle "[tcp] established"). Echo: also send
+    // a request and verify the echoed reply (a bad outbound seq/checksum would
+    // make the host TCP drop it, so reading it back validates the data path).
     let mut probed = false;
+    let mut echo_ok = false;
 
     // Poll for QEMU's natural exit, otherwise force-kill at timeout.
     // The kernel's `halt_forever()` writes `isa-debug-exit` (port 0xf4)
@@ -1181,12 +1206,39 @@ fn run_qemu_once(
         match child.try_wait().context("failed to poll qemu process")? {
             Some(_status) => break,
             None => {
-                if tcp_probe && !probed {
+                // Connect only once the kernel is actually serving (it logs
+                // "[tcp] listening" when it enters the serve loop). Connecting
+                // earlier piles up dead slirp connections that the guest would
+                // handshake instead of the live one. Waiting → exactly one
+                // connection, during the serve window.
+                let serving = std::fs::read_to_string(serial_path)
+                    .map(|s| s.contains("[tcp] listening on :7"))
+                    .unwrap_or(false);
+                if tcp_probe != TcpProbe::None && !probed && serving {
                     let addr = std::net::SocketAddr::from(([127, 0, 0, 1], TCP_PROBE_PORT));
-                    if std::net::TcpStream::connect_timeout(&addr, Duration::from_millis(150))
-                        .is_ok()
+                    if let Ok(mut stream) =
+                        std::net::TcpStream::connect_timeout(&addr, Duration::from_millis(500))
                     {
-                        probed = true; // handshake completed through slirp
+                        match tcp_probe {
+                            TcpProbe::Handshake => probed = true, // handshake done via slirp
+                            TcpProbe::Echo => {
+                                use std::io::{Read, Write};
+                                stream
+                                    .set_read_timeout(Some(Duration::from_millis(2500)))
+                                    .ok();
+                                let mut buf = vec![0u8; TCP_ECHO_REQUEST.len()];
+                                if stream.write_all(TCP_ECHO_REQUEST).is_ok()
+                                    && stream.read_exact(&mut buf).is_ok()
+                                    && buf == TCP_ECHO_REQUEST
+                                {
+                                    echo_ok = true;
+                                    probed = true;
+                                } else {
+                                    eprintln!("    (echo attempt: read {buf:?})");
+                                }
+                            }
+                            TcpProbe::None => {}
+                        }
                     }
                 }
                 if Instant::now() >= deadline {
@@ -1197,6 +1249,12 @@ fn run_qemu_once(
                 std::thread::sleep(Duration::from_millis(50));
             }
         }
+    }
+
+    // The echo probe gates the test: the harness must have read its request
+    // back (proving the kernel's outbound data segment was well-formed).
+    if tcp_probe == TcpProbe::Echo && !echo_ok {
+        bail!("TCP echo not verified: the harness never read the echoed request back");
     }
     Ok(())
 }
@@ -1211,13 +1269,24 @@ fn run_smoke_test(
     // disk (so the first boot's writes persist into the second) with fresh
     // NVRAM each boot; the second boot's capture is the one we check.
     let blk_disk = fresh_blk_disk(artifacts, test.name)?;
-    // Only the TCP handshake test drives an external connection.
-    let tcp_probe = test.name == "tcp_handshake_b5";
+    // The TCP tests drive an external connection through the forwarded port.
+    let tcp_probe = match test.name {
+        "tcp_handshake_b5" => TcpProbe::Handshake,
+        "tcp_echo_b5" => TcpProbe::Echo,
+        _ => TcpProbe::None,
+    };
     if reboot {
         let ovmf1 = fresh_ovmf_vars(artifacts, &format!("{}-boot1", test.name))?;
         let boot1_log = serial_path.with_extension("boot1.log");
         let _ = std::fs::remove_file(&boot1_log);
-        run_qemu_once(artifacts, &ovmf1, &blk_disk, &boot1_log, test.timeout_secs, false)?;
+        run_qemu_once(
+            artifacts,
+            &ovmf1,
+            &blk_disk,
+            &boot1_log,
+            test.timeout_secs,
+            TcpProbe::None,
+        )?;
     }
     let ovmf_vars = fresh_ovmf_vars(artifacts, test.name)?;
     run_qemu_once(

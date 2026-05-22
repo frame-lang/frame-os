@@ -109,12 +109,14 @@ fn simultaneous_open_goes_syn_received() {
 // --- data ------------------------------------------------------------------
 
 #[test]
-fn data_in_established_is_delivered_and_acked() {
+fn data_in_established_is_echoed() {
     let mut c = established();
     c.segment(data(10));
     assert_eq!(c.state(), "Established");
+    // The echo "app" sends the data back (the data segment piggybacks the ACK,
+    // so no separate send_ack fires).
     assert!(tcp::fired("deliver_data"));
-    assert!(tcp::fired("send_ack"));
+    assert!(!tcp::fired("send_ack"), "the echo data carries the ACK");
 }
 
 #[test]

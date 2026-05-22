@@ -374,34 +374,52 @@ pub fn run_demo() {
     tcp_serve();
 }
 
-/// Listen on :7 and pump received frames through the RxPipeline (→ the $Tcp
-/// leaf → the TcpConnection FSM) until the handshake completes, then linger
-/// briefly so the external client finishes. On a boot with no client (every
-/// non-TCP smoke test), bail ~1s after seeing no TCP at all.
+/// Listen on :7 and serve: pump received frames through the RxPipeline (→ the
+/// $Tcp leaf → the TcpConnection FSM), completing the handshake and echoing the
+/// client's data. slirp accepts host connections locally before the guest
+/// handshakes, so a client's abandoned retries can leave us `$Established` on a
+/// dead connection — if a connection establishes but echoes nothing within
+/// ~0.5s, we recycle it (rst → re-listen) to accept the live one. We bail ~1s
+/// after the echo, or ~1s after seeing no TCP at all (every non-TCP boot).
 fn tcp_serve() {
     crate::tcp::listen(7);
     interrupts::enable();
     let start = interrupts::ticks();
-    let mut announce_at: u64 = 0;
+    let mut announced = false;
+    let mut conn_at: u64 = 0; // when the current connection established (0 = none)
+    let mut done_at: u64 = 0; // when our echo went out (0 = not yet)
     loop {
         if !pump() {
             interrupts::wait_for_interrupt();
         }
         let now = interrupts::ticks();
-        if announce_at == 0 && crate::tcp::is_established() {
-            serial::writeln("[tcp] established");
-            announce_at = now;
+
+        if crate::tcp::is_established() {
+            if conn_at == 0 {
+                conn_at = now;
+                if !announced {
+                    serial::writeln("[tcp] established");
+                    announced = true;
+                }
+            }
+            if done_at == 0 && crate::tcp::echoes() > 0 {
+                done_at = now; // got the echo on the live connection
+            } else if done_at == 0 && now - conn_at > 50 {
+                crate::tcp::relisten(); // idle/dead connection → accept the next
+                conn_at = 0;
+            }
         }
-        if announce_at != 0 {
-            if now - announce_at > 100 {
-                break; // linger ~1s past the handshake, then move on
+
+        if done_at != 0 {
+            if now - done_at > 100 {
+                break; // linger ~1s past the echo
             }
         } else if !crate::tcp::saw_tcp() {
             if now - start > 100 {
                 break; // no client knocked within ~1s → not a TCP test
             }
-        } else if now - start > 500 {
-            break; // overall cap (~5s)
+        } else if now - start > 400 {
+            break; // overall cap (~4s): handshake-only client, or recycling window
         }
     }
     interrupts::disable();
