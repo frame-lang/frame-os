@@ -545,6 +545,10 @@ fn qemu_base_command(
 ) -> Command {
     let mut cmd = Command::new("qemu-system-x86_64");
     cmd.args(["-machine", "q35", "-cpu", "qemu64", "-m", "256M"])
+        // B7: 4 cores. Limine starts the APs; the kernel brings them up + parks
+        // them (B7 Step 1), then schedules across them (later steps). Harmless
+        // for B0–B6 (the APs stay parked).
+        .args(["-smp", "4"])
         // UEFI firmware (split into read-only code + writable NVRAM).
         .args(["-drive"])
         .arg(format!(
@@ -1414,6 +1418,22 @@ const SMOKE_TESTS: &[SmokeTest] = &[
             "triple fault",
             "[usb] configure endpoint failed",
             "[usb] key report not received (no transfer)",
+        ],
+        timeout_secs: 30,
+    },
+    SmokeTest {
+        // B7 Step 1: SMP application-processor bringup. Limine starts the APs;
+        // the kernel launches each at ap_entry (Limine MP request), where it sets
+        // up its per-CPU GS-base block and reports online; the BSP waits and logs
+        // the count. With `-smp 4`, all 4 cores must come online. (Per-CPU
+        // scheduling across cores lands in later B7 steps; here the APs park.)
+        name: "smp_cores_online_b7",
+        expect_contains: &["[smp] cores online: 4 of 4"],
+        expect_absent: &[
+            "KERNEL EXCEPTION",
+            "KERNEL PANIC",
+            "triple fault",
+            "[smp] no MP response (single core)",
         ],
         timeout_secs: 30,
     },

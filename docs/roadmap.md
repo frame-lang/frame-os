@@ -504,6 +504,12 @@ H3 is the H-track's final committed milestone. Further H-track work (a configura
 
 **Estimated effort:** Very large; the final boss. SMP correctness (locking, TLB shootdown, memory ordering) is where real kernels spend their hardest debugging.
 
+**Concurrency model (decided 2026-05-22):** fine-grained per-CPU from the start — per-CPU run state + per-structure locks with a documented lock ordering, not a Big-Kernel-Lock staging.
+
+#### Steps
+
+- **Step 1 (AP startup + per-CPU data) — done.** Native foundation, no Frame system. QEMU now boots with `-smp 4`. The kernel declares a Limine **MP request** and, after the boot HSM, launches each application processor at `ap_entry` (writing the CPU's `goto_address`, stashing its index in `extra`); each AP sets up its **per-CPU block + GS base** (`kernel/src/percpu.rs` — `IA32_GS_BASE` MSR → a `PerCpu` whose first field `cpu_index` is read via `gs:[0]`, the standard x86_64 per-CPU mechanism), reports online (an atomic), and parks (`cli; hlt` — the timer/PIC route to the BSP, so APs idle until they run the scheduler in Step 2). The BSP sets its own per-CPU block (index 0) and waits for the APs. Serial: `[smp] cores online: 4 of 4 (BSP lapic 0, this cpu 0)` — the `this cpu 0` proving the GS-base read works. Validated by `smp_cores_online_b7` (**33/33** QEMU; B0–B6 unaffected under `-smp 4`). **Remaining:** per-CPU scheduling (Step 2), locking (the fine-grained design), the cross-core `post` + framec `Send`/`Sync` gate (Step 4), TLB shootdown.
+
 ## Dependency graph between milestones
 
 The H-track (H0 → H1 → H2 → H3) is **complete**. The B-track is strictly

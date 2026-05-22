@@ -40,6 +40,7 @@ mod ip_reasm;
 mod net;
 mod paging;
 mod pci;
+mod percpu;
 mod pic;
 mod pit;
 mod sched;
@@ -77,6 +78,33 @@ static REQUESTS_START_MARKER: limine::request::RequestsStartMarker =
 #[link_section = ".requests_end_marker"]
 static REQUESTS_END_MARKER: limine::request::RequestsEndMarker =
     limine::request::RequestsEndMarker::new();
+
+// B7 Step 1 (SMP): ask Limine to start the application processors. Without this
+// request the non-bootstrap cores are left parked by the bootloader. Each AP is
+// launched at `ap_entry` (below) once we write its `goto_address`.
+#[used]
+#[link_section = ".requests"]
+static MP_REQUEST: limine::request::MpRequest = limine::request::MpRequest::new();
+
+/// Count of application processors that have reached `ap_entry` and set up their
+/// per-CPU state. The BSP waits on this during SMP bringup.
+static AP_ONLINE: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+/// Application-processor entry point. Limine jumps here (in our address space,
+/// on a Limine-provided stack) once the BSP writes the CPU's `goto_address`. The
+/// CPU's index was stashed in `extra` by the BSP. B7 Step 1: set up per-CPU state
+/// (GS base), report online, and park — later steps will run the scheduler here.
+unsafe extern "C" fn ap_entry(cpu: &limine::mp::Cpu) -> ! {
+    use core::sync::atomic::Ordering;
+    let index = cpu.extra.load(Ordering::SeqCst) as usize;
+    percpu::init_this_cpu(index, cpu.lapic_id);
+    AP_ONLINE.fetch_add(1, Ordering::SeqCst);
+    // Park: interrupts off (the timer/PIC route to the BSP; APs run the
+    // scheduler from B7 Step 2 onward), low-power halt.
+    loop {
+        unsafe { core::arch::asm!("cli; hlt", options(nomem, nostack)) };
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Entry point
@@ -116,6 +144,47 @@ unsafe extern "C" fn kmain() -> ! {
     // → $InitConsole (SerialDriver) → $LaunchInit → $Running. The returned
     // instance is unused here; its purpose was running the chain.
     let _kernel = Kernel::__create();
+
+    // B7 Step 1 (SMP): bring up the application processors. Set up the BSP's own
+    // per-CPU block, then launch each AP (stashing its index in `extra`) and wait
+    // for it to report online. The APs park; the rest of kmain's demos run on the
+    // BSP. (Per-CPU scheduling across cores lands in B7 Step 2.)
+    {
+        use core::sync::atomic::Ordering;
+        if let Some(mp) = MP_REQUEST.get_response() {
+            let bsp = mp.bsp_lapic_id();
+            percpu::init_this_cpu(0, bsp); // BSP is per-CPU index 0
+            let mut next_index = 1usize;
+            let mut ap_count = 0usize;
+            for cpu in mp.cpus() {
+                if cpu.lapic_id == bsp || next_index >= percpu::MAX_CPUS {
+                    continue;
+                }
+                cpu.extra.store(next_index as u64, Ordering::SeqCst);
+                cpu.goto_address.write(ap_entry); // launches the AP at ap_entry
+                next_index += 1;
+                ap_count += 1;
+            }
+            // Bounded wait for the APs to report in.
+            let mut spins = 0u64;
+            while AP_ONLINE.load(Ordering::SeqCst) < ap_count && spins < 200_000_000 {
+                spins += 1;
+                core::hint::spin_loop();
+            }
+            let online = AP_ONLINE.load(Ordering::SeqCst) + 1; // + BSP
+            serial::write_str("[smp] cores online: ");
+            serial::write_u32_decimal(online as u32);
+            serial::write_str(" of ");
+            serial::write_u32_decimal((ap_count + 1) as u32);
+            serial::write_str(" (BSP lapic ");
+            serial::write_u32_decimal(bsp);
+            serial::write_str(", this cpu ");
+            serial::write_u32_decimal(percpu::this_cpu_index());
+            serial::writeln(")");
+        } else {
+            serial::writeln("[smp] no MP response (single core)");
+        }
+    }
 
     // B2 Step 1: physical frame allocator. As of Step 5 the allocator is
     // initialized by the boot HSM's $InitMemory phase (during __create
