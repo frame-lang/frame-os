@@ -368,11 +368,43 @@ pub fn run_demo() {
     // lifecycle + the RxPipeline's $Udp leaf on a real inbound datagram.
     dhcp_exchange();
 
-    // B5 Step 4a: passive-open a TcpConnection on :7. No client connects yet
-    // (the live handshake is Step 4b, which adds slirp hostfwd + the harness
-    // TCP probe); the connection rests in $Listen, and any inbound TCP segment
-    // would flow through the RxPipeline's $Tcp leaf into the FSM.
+    // B5 Step 4b: passive-open a TcpConnection on :7 and serve — pump inbound
+    // segments through the RxPipeline's $Tcp leaf into the FSM until the 3-way
+    // handshake reaches $Established (the harness connects via slirp hostfwd).
+    tcp_serve();
+}
+
+/// Listen on :7 and pump received frames through the RxPipeline (→ the $Tcp
+/// leaf → the TcpConnection FSM) until the handshake completes, then linger
+/// briefly so the external client finishes. On a boot with no client (every
+/// non-TCP smoke test), bail ~1s after seeing no TCP at all.
+fn tcp_serve() {
     crate::tcp::listen(7);
+    interrupts::enable();
+    let start = interrupts::ticks();
+    let mut announce_at: u64 = 0;
+    loop {
+        if !pump() {
+            interrupts::wait_for_interrupt();
+        }
+        let now = interrupts::ticks();
+        if announce_at == 0 && crate::tcp::is_established() {
+            serial::writeln("[tcp] established");
+            announce_at = now;
+        }
+        if announce_at != 0 {
+            if now - announce_at > 100 {
+                break; // linger ~1s past the handshake, then move on
+            }
+        } else if !crate::tcp::saw_tcp() {
+            if now - start > 100 {
+                break; // no client knocked within ~1s → not a TCP test
+            }
+        } else if now - start > 500 {
+            break; // overall cap (~5s)
+        }
+    }
+    interrupts::disable();
 }
 
 /// B5 Step 2b: send an ICMP echo request to the gateway and wait for the reply

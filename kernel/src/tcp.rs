@@ -54,6 +54,7 @@ static mut SND_NXT: u32 = INITIAL_SND; // our next sequence number
 static mut RCV_NXT: u32 = 0; // next sequence we expect from the peer (what we ACK)
 static mut RETRANSMIT_AT: u64 = 0; // 0 = disarmed
 static mut TIMEWAIT_AT: u64 = 0;
+static mut SAW_TCP: bool = false; // any inbound TCP segment seen (serve loop)
 
 fn conn() -> &'static mut TcpConnection {
     let p = &raw mut CONN;
@@ -261,11 +262,23 @@ pub fn on_segment(frame: &[u8]) {
     if rd(&raw const LOCAL_PORT) != 0 && seg.dst_port != rd(&raw const LOCAL_PORT) {
         return; // not for our listening port
     }
+    wr(&raw mut SAW_TCP, true);
     if seg.rst {
         conn().rst();
     } else {
         conn().segment(seg);
     }
+}
+
+/// Whether any inbound TCP segment has been seen (lets the serve loop bail
+/// fast on a boot where no client connects).
+pub fn saw_tcp() -> bool {
+    rd(&raw const SAW_TCP)
+}
+
+/// Whether the connection is in `$Established`.
+pub fn is_established() -> bool {
+    conn().state() == "Established"
 }
 
 /// Passive-open the connection on `port` ($Closed → $Listen).

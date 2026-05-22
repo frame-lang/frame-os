@@ -9,7 +9,7 @@
 | Source file | [`../../frame/tcp_connection.frs`](../../frame/tcp_connection.frs) |
 | State diagram | [`tcp_connection.svg`](tcp_connection.svg) |
 | Instances at runtime | One per connection (single connection at 4a; a table later) |
-| Status | FSM complete + host-validated (RFC-793); wired live in `$Listen` (4a). Handshake/data/close land at 4b–4d. |
+| Status | FSM complete + host-validated (RFC-793). Live **passive handshake to `$Established`** against a real client (4b). Data/close land at 4c–4d. |
 
 ## State diagram
 
@@ -64,11 +64,12 @@ The states are RFC-793's verbatim: `$Closed` (initial/terminal), `$Listen`, `$Sy
 
 **Behavioral (Level 3):** `kernel-tests/tests/tcp_connection_behavior.rs` — **15 tests** covering both opens, the passive + active handshakes, data delivery vs. a silent pure-ACK, both closes (`$CloseWait`→`$LastAck`→`$Closed` and `$FinWait1`→`$FinWait2`→`$TimeWait`→`$Closed`), the simultaneous-open and simultaneous-close edges, the RST funnel from two states, and a SYN retransmit (B5-2). The `tcp` native actions are doubled to record what fired.
 
-**QEMU (Level 7):** `tcp_listen_b5` — the FSM is instantiated + passive-opened (`$Listen`) on real hardware. The live handshake/echo/close smoke tests land at 4b–4d.
+**QEMU (Level 7):** `tcp_handshake_b5` — the kernel passive-opens on :7 and serves; the smoke harness connects through slirp `hostfwd` (driving the 3-way handshake), and the FSM reaches `$Established` against the **host's real TCP stack** (a correct RFC-793 oracle) — exercising `send_syn_ack`/`send_ack` + seq arithmetic + checksums live. Data echo + close land at 4c–4d.
 
 ## Related documents
 - [Roadmap](../roadmap.md) — B5 Step 4 · [B5 TCP plan](../plans/b5_tcp.md)
 - [`RxPipeline`](rx_pipeline.md) — the `$Tcp` leaf feeds it · [`ArpResolver`](arp_resolver.md) — the same timer-via-enter-handler pattern
 
 ## Change log
-- **2026-05-21** — initial doc; B5 Step 4a. Full RFC-793 FSM (11 states + `$Open` RST funnel), host-validated (15 behavioral + snapshot); wired live in `$Listen`. Handshake/data/close + the timer wheel land at 4b–4d.
+- **2026-05-21** — initial doc; B5 Step 4a. Full RFC-793 FSM (11 states + `$Open` RST funnel), host-validated (15 behavioral + snapshot); wired live in `$Listen`.
+- **2026-05-21** — B5 Step 4b. Live passive handshake: the kernel serves on :7 and reaches `$Established` against the host's TCP stack via slirp `hostfwd` + a harness TCP probe (`tcp_handshake_b5`). Data/close + the timer wheel land at 4c–4d.

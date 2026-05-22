@@ -542,7 +542,10 @@ fn qemu_base_command(artifacts: &QemuArtifacts, ovmf_vars: &Path, blk_disk: &Pat
         // CI-friendly. `disable-modern=on` forces the legacy I/O-BAR interface
         // our driver speaks. slirp answers ARP for the gateway (10.0.2.2), which
         // the B5 Step 1 demo relies on. TAP is the deferred production path.
-        .args(["-netdev", "user,id=net0"])
+        // hostfwd forwards host 127.0.0.1:TCP_PROBE_PORT → guest :7 for the B5
+        // Step 4b handshake test (the harness connects to the kernel's listener).
+        .args(["-netdev"])
+        .arg(format!("user,id=net0,hostfwd=tcp::{TCP_PROBE_PORT}-:7"))
         .args([
             "-device",
             "virtio-net-pci,netdev=net0,disable-modern=on,disable-legacy=off",
@@ -1062,14 +1065,20 @@ const SMOKE_TESTS: &[SmokeTest] = &[
         timeout_secs: 20,
     },
     SmokeTest {
-        // B5 Step 4a: the TcpConnection FSM is wired live in $Listen. No client
-        // connects yet (the handshake is Step 4b); this just proves the
-        // RFC-793 machine is instantiated and passive-opened on real hardware
-        // (the FSM's transitions are validated by host behavioral tests).
-        name: "tcp_listen_b5",
-        expect_contains: &["[tcp] listening on :7", "Listen"],
-        expect_absent: &["KERNEL EXCEPTION", "KERNEL PANIC", "triple fault"],
-        timeout_secs: 20,
+        // B5 Step 4b: the live passive TCP handshake. The kernel passive-opens
+        // a TcpConnection on :7 and serves; the harness connects through slirp
+        // hostfwd (driving the 3-way handshake), so the FSM reaches
+        // $Established against the host's real TCP stack. "[tcp] established" is
+        // the oracle — it's logged only when the guest completes the handshake.
+        name: "tcp_handshake_b5",
+        expect_contains: &["[tcp] listening on :7", "[tcp] established"],
+        expect_absent: &[
+            "KERNEL EXCEPTION",
+            "KERNEL PANIC",
+            "triple fault",
+        ],
+        // The serve loop waits a few seconds for the client; give it headroom.
+        timeout_secs: 30,
     },
 ];
 
@@ -1081,10 +1090,18 @@ fn run_qemu_test() -> Result<()> {
     std::fs::create_dir_all(&serial_dir)
         .with_context(|| format!("failed to create {}", serial_dir.display()))?;
 
-    let mut failures: Vec<String> = Vec::new();
-    let total = SMOKE_TESTS.len();
+    // Optional substring filter for iterating on one test:
+    // `FRAMEOS_SMOKE_FILTER=tcp_handshake cargo xtask qemu-test`.
+    let filter = std::env::var("FRAMEOS_SMOKE_FILTER").unwrap_or_default();
+    let tests: Vec<&SmokeTest> = SMOKE_TESTS
+        .iter()
+        .filter(|t| filter.is_empty() || t.name.contains(&filter))
+        .collect();
 
-    for test in SMOKE_TESTS {
+    let mut failures: Vec<String> = Vec::new();
+    let total = tests.len();
+
+    for test in tests {
         eprintln!("smoke: {} ...", test.name);
         let serial_path = serial_dir.join(format!("{}.log", test.name));
         // Truncate any previous run's log; QEMU appends with `-serial
@@ -1122,12 +1139,17 @@ fn run_qemu_test() -> Result<()> {
 /// Boot the kernel once in QEMU on a given disk + NVRAM, routing serial to
 /// `serial_path`. Returns when QEMU exits (clean isa-debug-exit) or the
 /// timeout forces a kill. `-display none` is set in `qemu_base_command`.
+/// Host port slirp forwards to the guest's TCP listener (:7), for the B5 Step
+/// 4b handshake probe.
+const TCP_PROBE_PORT: u16 = 15580;
+
 fn run_qemu_once(
     artifacts: &QemuArtifacts,
     ovmf_vars: &Path,
     blk_disk: &Path,
     serial_path: &Path,
     timeout_secs: u64,
+    tcp_probe: bool,
 ) -> Result<()> {
     let mut cmd = qemu_base_command(artifacts, ovmf_vars, blk_disk);
     cmd.args(["-serial"])
@@ -1137,6 +1159,13 @@ fn run_qemu_once(
         .stdin(Stdio::null());
 
     let mut child = cmd.spawn().context("failed to invoke qemu-system-x86_64")?;
+
+    // B5 Step 4b: if this test drives a TCP handshake, connect to the forwarded
+    // port (retrying while the kernel boots to its serve loop). A successful
+    // connect means slirp completed a forwarded connection, i.e. the guest's
+    // TcpConnection reached $Established — the kernel logs "[tcp] established",
+    // which is the serial-side oracle the test asserts on.
+    let mut probed = false;
 
     // Poll for QEMU's natural exit, otherwise force-kill at timeout.
     // The kernel's `halt_forever()` writes `isa-debug-exit` (port 0xf4)
@@ -1152,6 +1181,14 @@ fn run_qemu_once(
         match child.try_wait().context("failed to poll qemu process")? {
             Some(_status) => break,
             None => {
+                if tcp_probe && !probed {
+                    let addr = std::net::SocketAddr::from(([127, 0, 0, 1], TCP_PROBE_PORT));
+                    if std::net::TcpStream::connect_timeout(&addr, Duration::from_millis(150))
+                        .is_ok()
+                    {
+                        probed = true; // handshake completed through slirp
+                    }
+                }
                 if Instant::now() >= deadline {
                     let _ = child.kill();
                     let _ = child.wait();
@@ -1174,11 +1211,13 @@ fn run_smoke_test(
     // disk (so the first boot's writes persist into the second) with fresh
     // NVRAM each boot; the second boot's capture is the one we check.
     let blk_disk = fresh_blk_disk(artifacts, test.name)?;
+    // Only the TCP handshake test drives an external connection.
+    let tcp_probe = test.name == "tcp_handshake_b5";
     if reboot {
         let ovmf1 = fresh_ovmf_vars(artifacts, &format!("{}-boot1", test.name))?;
         let boot1_log = serial_path.with_extension("boot1.log");
         let _ = std::fs::remove_file(&boot1_log);
-        run_qemu_once(artifacts, &ovmf1, &blk_disk, &boot1_log, test.timeout_secs)?;
+        run_qemu_once(artifacts, &ovmf1, &blk_disk, &boot1_log, test.timeout_secs, false)?;
     }
     let ovmf_vars = fresh_ovmf_vars(artifacts, test.name)?;
     run_qemu_once(
@@ -1187,6 +1226,7 @@ fn run_smoke_test(
         &blk_disk,
         serial_path,
         test.timeout_secs,
+        tcp_probe,
     )?;
 
     // Read the captured serial output.
