@@ -609,6 +609,51 @@ support / multiple `HubPort` + `UsbEnumeration` instances running concurrently
 transfer. **Validates:** many concurrent lifecycle FSMs of the same type; the
 "orthogonal regions" question.
 
+### R7 — message-passing internals: scheduler-as-actor + a per-core reactor (Frame-relevant, near-term)
+
+The multithreading-safety analysis (`frame_assessment.md`, 2026-05-22) established the
+governing rule for this OS: **post across contexts, call within a context.** We already
+honor it at the hard boundaries (ISR→mainline post/drain, core→core MPSC posts,
+hardware→software via the event/used rings). This milestone pushes message-passing
+*deeper* where it's a genuine win — ranked by signal:
+
+- **R7a — scheduler-as-actor (the standout).** Today R1a (`ksched.rs`) drives the
+  `Scheduler` through a *mailbox* (drained posts) but R1b (`pcsched.rs`) drives the
+  *same FSM* synchronously inside `with_sched` + `without_interrupts` critical sections —
+  a split personality. The lock exists only because two contexts touch the instance (a
+  worker in `exit_current`, and the boot/idle loop). Make a worker **post** "slot N
+  exiting" to a per-core mailbox and let the idle loop be the *only* drainer/dispatcher:
+  exactly one context touches the `Scheduler`, the lock and the `without_interrupts`
+  dance disappear, and it becomes a true single-owner actor. Same `.frs`, coupling
+  becomes a queue. Unifies R1a and R1b on one model. Small, high-signal.
+- **R7b — one per-core reactor loop.** Converge the several ad-hoc drains (RxPipeline
+  pump, xHCI driver loop, crosscore drain, scheduler critical sections) onto a single
+  per-core loop that owns that core's FSM instances and drains *one* mailbox. The payoff
+  beyond tidiness: the "an ISR must never dispatch a Frame system" rule (finding #3's
+  heap-deadlock hazard) stops being a remembered discipline and becomes **structural** —
+  ISRs can only `post`, the loop is the only `dispatch`er; you can't write the bug.
+- **R7c — align block + USB completion onto the net shape.** Net already does
+  hardware→post→drain via `RxPipeline`; route B4 block and B6/R3 USB completions through
+  the same per-core mailbox so all three subsystems are uniform.
+
+**Explicitly *not* in scope** (ceremony, not value): query paths (`is_idle()`/`state()`
+are reads, not events), the synchronous syscall fast path (microkernel-only payoff),
+register/stack mechanics, and intra-context RTC chains where the caller needs the result
+now. A full microkernel-ization (each subsystem an isolated message-only server) is a
+*research* fork — philosophically pure Frame, but it taxes every cross-subsystem call
+with a queue hop; not a committed milestone.
+
+**The framec lesson underneath R7** (feeds R4): the post/drain pattern is currently
+entirely *hand-rolled native* (a `SpinLock` ring + a `match` at each drain site). Frame
+has `$>`/`<$`, transitions, and typed event payloads (RFC-0025), but the *queue* is
+native boilerplate re-implemented each time. The missing actor-model primitive is a
+**deferred send** — "enqueue event E to instance I, dispatched by the runtime loop, not
+now." With it, R7a–R7c become a Frame idiom instead of native plumbing; it wants pooled,
+no-alloc event storage (→ R4 / RFC-0036) and rides on typed events (RFC-0025). The
+standing observation: *the runtime spec describes synchronous run-to-completion dispatch,
+but every real systems use we've hit needs a queued, deferred dispatch mode, and there is
+no Frame-level construct for it.* Worth a framec RFC.
+
 ### R4 — the no-alloc / preallocated event path (framec-relevant)
 
 `frame_assessment.md` flags this as *the single highest-value framec change for
