@@ -1081,13 +1081,17 @@ const SMOKE_TESTS: &[SmokeTest] = &[
         timeout_secs: 30,
     },
     SmokeTest {
-        // B5 Step 4c: data echo. After the handshake, the harness sends a
-        // request; the kernel's $Established echoes it back (the data segment
-        // piggybacks the ACK). The harness reads the reply and verifies it
-        // matches (gated in run_qemu_once — a bad outbound seq/checksum would
-        // make the host TCP drop it), and the kernel logs "[tcp] echoed N bytes".
+        // B5 Step 4c/4d (B5-4): the full TCP exchange against a real client —
+        // handshake, request/response, clean close. After the handshake the
+        // harness sends a request; $Established echoes it back (verified by the
+        // harness reading it, gated in run_qemu_once); then the kernel actively
+        // closes, driving $FinWait1 → $TimeWait → (2·MSL timer) → $Closed.
         name: "tcp_echo_b5",
-        expect_contains: &["[tcp] established", "[tcp] echoed 18 bytes"],
+        expect_contains: &[
+            "[tcp] established",
+            "[tcp] echoed 18 bytes",
+            "[tcp] closed",
+        ],
         expect_absent: &["KERNEL EXCEPTION", "KERNEL PANIC", "triple fault"],
         timeout_secs: 30,
     },

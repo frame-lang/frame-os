@@ -9,7 +9,7 @@
 | Source file | [`../../frame/tcp_connection.frs`](../../frame/tcp_connection.frs) |
 | State diagram | [`tcp_connection.svg`](tcp_connection.svg) |
 | Instances at runtime | One per connection (single connection at 4a; a table later) |
-| Status | FSM complete + host-validated (RFC-793). Live **handshake + data echo** against a real client (4b/4c). Close + TIME_WAIT land at 4d. |
+| Status | FSM complete + host-validated (RFC-793). Live **handshake + data echo + clean close** against a real client (4b–4d, **B5-4 met**). Active open + retransmit at 4e. |
 
 ## State diagram
 
@@ -64,7 +64,7 @@ The states are RFC-793's verbatim: `$Closed` (initial/terminal), `$Listen`, `$Sy
 
 **Behavioral (Level 3):** `kernel-tests/tests/tcp_connection_behavior.rs` — **15 tests** covering both opens, the passive + active handshakes, data delivery vs. a silent pure-ACK, both closes (`$CloseWait`→`$LastAck`→`$Closed` and `$FinWait1`→`$FinWait2`→`$TimeWait`→`$Closed`), the simultaneous-open and simultaneous-close edges, the RST funnel from two states, and a SYN retransmit (B5-2). The `tcp` native actions are doubled to record what fired.
 
-**QEMU (Level 7):** `tcp_handshake_b5` — the kernel passive-opens on :7 and serves; the harness connects through slirp `hostfwd` (3-way handshake) and the FSM reaches `$Established` against the **host's real TCP stack** (a correct RFC-793 oracle). `tcp_echo_b5` — the harness then sends a request; `$Established` echoes it back (the data segment piggybacks the ACK), and **the harness reads its request back**, validating the outbound data path's seq + pseudo-header checksum (a bad one would be dropped by the host). Close + TIME_WAIT land at 4d. (The harness waits for the kernel's `[tcp] listening` log before connecting, so it makes exactly one connection during the serve window.)
+**QEMU (Level 7):** `tcp_handshake_b5` — the kernel passive-opens on :7 and serves; the harness connects through slirp `hostfwd` (3-way handshake) and the FSM reaches `$Established` against the **host's real TCP stack** (a correct RFC-793 oracle). `tcp_echo_b5` — the harness then sends a request; `$Established` echoes it back (the data segment piggybacks the ACK), and **the harness reads its request back**, validating the outbound data path's seq + pseudo-header checksum (a bad one would be dropped by the host). After the echo the kernel **actively closes**, driving `$FinWait1` → `$TimeWait` → (the 2·MSL timer, fired by the native wheel `tcp::drain_timers` from the serve loop) → `$Closed` — so `tcp_echo_b5` covers the full **handshake + request/response + clean close** (B5-4), asserting `[tcp] established` / `[tcp] echoed 18 bytes` / `[tcp] closed`. (The harness waits for the kernel's `[tcp] listening` log before connecting, so it makes exactly one connection during the serve window.)
 
 ## Related documents
 - [Roadmap](../roadmap.md) — B5 Step 4 · [B5 TCP plan](../plans/b5_tcp.md)
@@ -73,4 +73,5 @@ The states are RFC-793's verbatim: `$Closed` (initial/terminal), `$Listen`, `$Sy
 ## Change log
 - **2026-05-21** — initial doc; B5 Step 4a. Full RFC-793 FSM (11 states + `$Open` RST funnel), host-validated (15 behavioral + snapshot); wired live in `$Listen`.
 - **2026-05-21** — B5 Step 4b. Live passive handshake: the kernel serves on :7 and reaches `$Established` against the host's TCP stack via slirp `hostfwd` + a harness TCP probe (`tcp_handshake_b5`).
-- **2026-05-21** — B5 Step 4c. Data echo: `$Established` echoes the client's bytes back (the demo's echo "app"); the harness verifies the reply (`tcp_echo_b5`), validating the outbound data path. Added connection recycling so the server drops dead/idle connections and accepts the live one. Close + the timer wheel land at 4d.
+- **2026-05-21** — B5 Step 4c. Data echo: `$Established` echoes the client's bytes back (the demo's echo "app"); the harness verifies the reply (`tcp_echo_b5`), validating the outbound data path. Added connection recycling so the server drops dead/idle connections and accepts the live one.
+- **2026-05-21** — B5 Step 4d (**B5-4**). Clean close: after the echo the kernel actively closes (`$FinWait1` → `$TimeWait` → 2·MSL timer via the native wheel → `$Closed`); `tcp_echo_b5` now asserts the full handshake + echo + close. Active open + retransmit land at 4e.

@@ -388,10 +388,13 @@ fn tcp_serve() {
     let mut announced = false;
     let mut conn_at: u64 = 0; // when the current connection established (0 = none)
     let mut done_at: u64 = 0; // when our echo went out (0 = not yet)
+    let mut closing = false; // we've actively closed after the echo
+    let mut closed_logged = false;
     loop {
         if !pump() {
             interrupts::wait_for_interrupt();
         }
+        crate::tcp::drain_timers(); // fire retransmit / TIME_WAIT timeouts
         let now = interrupts::ticks();
 
         if crate::tcp::is_established() {
@@ -403,16 +406,27 @@ fn tcp_serve() {
                 }
             }
             if done_at == 0 && crate::tcp::echoes() > 0 {
-                done_at = now; // got the echo on the live connection
+                done_at = now;
+                // Actively close after the echo — drives $FinWait1 → … →
+                // $TimeWait → (2·MSL timer) → $Closed, exercising the timer wheel.
+                crate::tcp::close();
+                closing = true;
             } else if done_at == 0 && now - conn_at > 50 {
                 crate::tcp::relisten(); // idle/dead connection → accept the next
                 conn_at = 0;
             }
         }
 
-        if done_at != 0 {
-            if now - done_at > 100 {
-                break; // linger ~1s past the echo
+        if closing && !closed_logged && crate::tcp::is_closed() {
+            serial::writeln("[tcp] closed");
+            closed_logged = true;
+        }
+
+        if closed_logged {
+            break; // clean close complete (handshake + echo + close)
+        } else if done_at != 0 {
+            if now - done_at > 200 {
+                break; // safety: close didn't settle within ~2s
             }
         } else if !crate::tcp::saw_tcp() {
             if now - start > 100 {

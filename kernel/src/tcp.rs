@@ -291,9 +291,34 @@ pub fn arm_timewait() {
     wr(&raw mut TIMEWAIT_AT, interrupts::ticks() + TIMEWAIT_TICKS);
 }
 
-// (The timer-wheel drain that reads RETRANSMIT_AT/TIMEWAIT_AT and fires
-// `timeout()` is wired into the net loop at Step 4d, where a live connection
-// actually runs its timers.)
+/// Check the connection's timers and fire `timeout()` if one expired — the
+/// native "wheel," driven from the serve loop (post/drain), never an ISR. In
+/// `$TimeWait` this advances the 2·MSL timer to `$Closed`; in `$SynSent`/
+/// `$SynReceived`/`$FinWait*` it drives a retransmit.
+pub fn drain_timers() {
+    let now = interrupts::ticks();
+    let rt = rd(&raw const RETRANSMIT_AT);
+    if rt != 0 && now >= rt {
+        wr(&raw mut RETRANSMIT_AT, now + RETRANSMIT_TICKS); // re-arm; the FSM resends
+        conn().timeout();
+    }
+    let tw = rd(&raw const TIMEWAIT_AT);
+    if tw != 0 && now >= tw {
+        wr(&raw mut TIMEWAIT_AT, 0);
+        conn().timeout(); // $TimeWait -> $Closed
+    }
+}
+
+/// Actively close the connection (the local "app" closes): `$Established` →
+/// `$FinWait1` (send FIN) or `$CloseWait` → `$LastAck`.
+pub fn close() {
+    conn().close();
+}
+
+/// Whether the connection is back in `$Closed` (the close handshake finished).
+pub fn is_closed() -> bool {
+    conn().state() == "Closed"
+}
 
 // --- delivery (called by the RxPipeline $Tcp leaf via net::on_tcp) ----------
 
