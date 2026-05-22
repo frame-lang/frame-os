@@ -368,10 +368,50 @@ pub fn run_demo() {
     // lifecycle + the RxPipeline's $Udp leaf on a real inbound datagram.
     dhcp_exchange();
 
-    // B5 Step 4b: passive-open a TcpConnection on :7 and serve — pump inbound
-    // segments through the RxPipeline's $Tcp leaf into the FSM until the 3-way
-    // handshake reaches $Established (the harness connects via slirp hostfwd).
+    // B5 Step 4b–4d: passive-open a TcpConnection on :7 and serve — handshake,
+    // echo, and clean close against a client connecting via slirp hostfwd.
     tcp_serve();
+
+    // B5 Step 4e: active open. Connect *out* to 10.0.2.2:9 (the gateway, whose
+    // MAC we already resolved), which slirp guestfwd forwards to a host
+    // listener — exercising the $SynSent path. Reaches $Established if the
+    // harness is listening; a fast RST (no listener) just falls through.
+    tcp_connect();
+}
+
+/// Active-open a connection to the gateway:9 (slirp guestfwd → host listener)
+/// and pump until it reaches $Established ($SynSent → … ), or $Closed (no
+/// listener → RST), or a timeout. Exercises the client side of the FSM.
+fn tcp_connect() {
+    // slirp uses one MAC for all its virtual addresses, so we reach the
+    // guestfwd address (10.0.2.100) via the gateway MAC we already resolved.
+    let gw = gateway_mac();
+    serial::writeln("[tcp] connecting to 10.0.2.100:9 (active open)");
+    crate::tcp::connect(gw, [10, 0, 2, 100], 9, 50000); // $Closed → $SynSent (SYN sent)
+    interrupts::enable();
+    let start = interrupts::ticks();
+    let mut announced = false;
+    loop {
+        if !pump() {
+            interrupts::wait_for_interrupt();
+        }
+        crate::tcp::drain_timers(); // retransmit the SYN if it's lost
+        let now = interrupts::ticks();
+        if crate::tcp::is_established() && !announced {
+            serial::writeln("[tcp] connected (active open)");
+            announced = true;
+        }
+        if announced {
+            if now - start > 100 {
+                break; // linger ~1s after connecting
+            }
+        } else if crate::tcp::is_closed() {
+            break; // RST'd (no listener / no guestfwd) — nothing to wait for
+        } else if now - start > 150 {
+            break; // cap (~1.5s): no guestfwd on this boot (every non-active test)
+        }
+    }
+    interrupts::disable();
 }
 
 /// Listen on :7 and serve: pump received frames through the RxPipeline (→ the

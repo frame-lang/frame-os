@@ -211,3 +211,14 @@ fn syn_sent_timeout_retransmits_the_syn() {
     assert_eq!(c.state(), "SynSent", "stays in SynSent on a retransmit");
     assert!(tcp::fired("send_syn"));
 }
+
+#[test]
+fn syn_received_timeout_retransmits_the_syn_ack() {
+    let mut c = TcpConnection::__create();
+    c.open_passive();
+    c.segment(syn()); // -> SynReceived (send_syn_ack)
+    tcp::reset();
+    c.timeout(); // retransmit timer fired before the peer's ACK
+    assert_eq!(c.state(), "SynReceived", "stays in SynReceived on a retransmit");
+    assert!(tcp::fired("send_syn_ack"));
+}

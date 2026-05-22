@@ -361,6 +361,21 @@ pub fn is_established() -> bool {
     conn().state() == "Established"
 }
 
+/// Active-open a connection to `peer_ip:peer_port` (reachable at `peer_mac`),
+/// from local port `local_port`: force the connection to `$Closed`, set the
+/// peer, then `open_active()` → `$SynSent` (sends the SYN). Used by the B5 Step
+/// 4e demo to connect out through slirp `guestfwd`.
+pub fn connect(peer_mac: [u8; 6], peer_ip: [u8; 4], peer_port: u16, local_port: u16) {
+    conn().rst(); // force $Closed from wherever we are (Listen/Established/…)
+    on_reset();
+    wr(&raw mut PEER_MAC, peer_mac);
+    wr(&raw mut PEER_IP, peer_ip);
+    wr(&raw mut PEER_PORT, peer_port);
+    wr(&raw mut LOCAL_PORT, local_port);
+    wr(&raw mut SND_NXT, INITIAL_SND);
+    conn().open_active(); // $Closed → $SynSent, sends SYN
+}
+
 /// Passive-open the connection on `port` ($Closed → $Listen).
 pub fn listen(port: u16) {
     wr(&raw mut LOCAL_PORT, port);

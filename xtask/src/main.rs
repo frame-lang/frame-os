@@ -513,7 +513,12 @@ fn fresh_ovmf_vars(artifacts: &QemuArtifacts, tag: &str) -> Result<PathBuf> {
 /// arguments. Callers add the serial routing they want
 /// (`-serial stdio` for interactive, `-serial file:<path>` for smoke
 /// tests) and then either spawn or run.
-fn qemu_base_command(artifacts: &QemuArtifacts, ovmf_vars: &Path, blk_disk: &Path) -> Command {
+fn qemu_base_command(
+    artifacts: &QemuArtifacts,
+    ovmf_vars: &Path,
+    blk_disk: &Path,
+    guestfwd: bool,
+) -> Command {
     let mut cmd = Command::new("qemu-system-x86_64");
     cmd.args(["-machine", "q35", "-cpu", "qemu64", "-m", "256M"])
         // UEFI firmware (split into read-only code + writable NVRAM).
@@ -542,10 +547,19 @@ fn qemu_base_command(artifacts: &QemuArtifacts, ovmf_vars: &Path, blk_disk: &Pat
         // CI-friendly. `disable-modern=on` forces the legacy I/O-BAR interface
         // our driver speaks. slirp answers ARP for the gateway (10.0.2.2), which
         // the B5 Step 1 demo relies on. TAP is the deferred production path.
-        // hostfwd forwards host 127.0.0.1:TCP_PROBE_PORT → guest :7 for the B5
-        // Step 4b handshake test (the harness connects to the kernel's listener).
+        // hostfwd forwards host 127.0.0.1:TCP_PROBE_PORT → guest :7 (the B5 4b/4c
+        // passive tests connect in). guestfwd (only for the 4e active-open test —
+        // QEMU connects to the target at startup, so a listener must be up and we
+        // mustn't add it otherwise) forwards the guest's connection to 10.0.2.2:9
+        // → host 127.0.0.1:TCP_ACTIVE_PORT, where the kernel connects out.
         .args(["-netdev"])
-        .arg(format!("user,id=net0,hostfwd=tcp::{TCP_PROBE_PORT}-:7"))
+        .arg(if guestfwd {
+            format!(
+                "user,id=net0,hostfwd=tcp::{TCP_PROBE_PORT}-:7,guestfwd=tcp:10.0.2.100:9-tcp:127.0.0.1:{TCP_ACTIVE_PORT}"
+            )
+        } else {
+            format!("user,id=net0,hostfwd=tcp::{TCP_PROBE_PORT}-:7")
+        })
         .args([
             "-device",
             "virtio-net-pci,netdev=net0,disable-modern=on,disable-legacy=off",
@@ -575,7 +589,7 @@ fn run_qemu() -> Result<()> {
     eprintln!("booting kernel in QEMU (Ctrl-C or Ctrl-A x to quit)...");
     let ovmf_vars = fresh_ovmf_vars(&artifacts, "run")?;
     let blk_disk = fresh_blk_disk(&artifacts, "run")?;
-    let mut cmd = qemu_base_command(&artifacts, &ovmf_vars, &blk_disk);
+    let mut cmd = qemu_base_command(&artifacts, &ovmf_vars, &blk_disk, false);
     cmd.args(["-serial", "stdio"]);
     let status = cmd
         .status()
@@ -1095,6 +1109,20 @@ const SMOKE_TESTS: &[SmokeTest] = &[
         expect_absent: &["KERNEL EXCEPTION", "KERNEL PANIC", "triple fault"],
         timeout_secs: 30,
     },
+    SmokeTest {
+        // B5 Step 4e: active open (the kernel as TCP client). The kernel
+        // connects out to 10.0.2.100:9, which slirp guestfwd forwards to the
+        // harness's host listener; the FSM goes $SynSent → $Established. The
+        // harness just listens (accepting completes the connection); the serial
+        // oracle confirms the active open.
+        name: "tcp_active_open_b5",
+        expect_contains: &[
+            "[tcp] connecting to 10.0.2.100:9 (active open)",
+            "[tcp] connected (active open)",
+        ],
+        expect_absent: &["KERNEL EXCEPTION", "KERNEL PANIC", "triple fault"],
+        timeout_secs: 30,
+    },
 ];
 
 fn run_qemu_test() -> Result<()> {
@@ -1157,6 +1185,9 @@ fn run_qemu_test() -> Result<()> {
 /// Host port slirp forwards to the guest's TCP listener (:7), for the B5 Step
 /// 4b/4c TCP probes.
 const TCP_PROBE_PORT: u16 = 15580;
+/// Host port the guestfwd target maps to — the harness listens here for the
+/// kernel's active-open connection (B5 Step 4e).
+const TCP_ACTIVE_PORT: u16 = 15581;
 /// The request the echo probe sends; the kernel echoes it back verbatim.
 const TCP_ECHO_REQUEST: &[u8] = b"frame-os tcp echo\n";
 
@@ -1166,9 +1197,13 @@ enum TcpProbe {
     None,
     /// 4b: connect (drive the 3-way handshake); the serial oracle confirms it.
     Handshake,
-    /// 4c: connect, send a request, and verify the echoed reply (validates the
+    /// 4c/4d: connect, send a request, verify the echoed reply (validates the
     /// outbound data path's seq + checksum — the host TCP would drop a bad one).
     Echo,
+    /// 4e: listen on the guestfwd target so the kernel's active open succeeds
+    /// (the serial oracle "[tcp] connected (active open)" confirms `$SynSent` →
+    /// `$Established`).
+    Active,
 }
 
 fn run_qemu_once(
@@ -1179,7 +1214,19 @@ fn run_qemu_once(
     timeout_secs: u64,
     tcp_probe: TcpProbe,
 ) -> Result<()> {
-    let mut cmd = qemu_base_command(artifacts, ovmf_vars, blk_disk);
+    // 4e: for the active-open test, the guestfwd target must be listening when
+    // QEMU starts (QEMU connects to it at startup), so bind it before spawning.
+    let active_listener = if tcp_probe == TcpProbe::Active {
+        let l = std::net::TcpListener::bind(("127.0.0.1", TCP_ACTIVE_PORT))
+            .context("failed to bind the active-open listener")?;
+        l.set_nonblocking(true).ok();
+        Some(l)
+    } else {
+        None
+    };
+    let mut active_streams: Vec<std::net::TcpStream> = Vec::new();
+
+    let mut cmd = qemu_base_command(artifacts, ovmf_vars, blk_disk, tcp_probe == TcpProbe::Active);
     cmd.args(["-serial"])
         .arg(format!("file:{}", serial_path.display()))
         .stdout(Stdio::null())
@@ -1210,6 +1257,12 @@ fn run_qemu_once(
         match child.try_wait().context("failed to poll qemu process")? {
             Some(_status) => break,
             None => {
+                // 4e: accept the kernel's active-open connection (nonblocking).
+                if let Some(ref l) = active_listener {
+                    if let Ok((stream, _)) = l.accept() {
+                        active_streams.push(stream); // keep alive
+                    }
+                }
                 // Connect only once the kernel is actually serving (it logs
                 // "[tcp] listening" when it enters the serve loop). Connecting
                 // earlier piles up dead slirp connections that the guest would
@@ -1218,7 +1271,10 @@ fn run_qemu_once(
                 let serving = std::fs::read_to_string(serial_path)
                     .map(|s| s.contains("[tcp] listening on :7"))
                     .unwrap_or(false);
-                if tcp_probe != TcpProbe::None && !probed && serving {
+                if matches!(tcp_probe, TcpProbe::Handshake | TcpProbe::Echo)
+                    && !probed
+                    && serving
+                {
                     let addr = std::net::SocketAddr::from(([127, 0, 0, 1], TCP_PROBE_PORT));
                     if let Ok(mut stream) =
                         std::net::TcpStream::connect_timeout(&addr, Duration::from_millis(500))
@@ -1241,7 +1297,7 @@ fn run_qemu_once(
                                     eprintln!("    (echo attempt: read {buf:?})");
                                 }
                             }
-                            TcpProbe::None => {}
+                            TcpProbe::None | TcpProbe::Active => {}
                         }
                     }
                 }
@@ -1277,6 +1333,7 @@ fn run_smoke_test(
     let tcp_probe = match test.name {
         "tcp_handshake_b5" => TcpProbe::Handshake,
         "tcp_echo_b5" => TcpProbe::Echo,
+        "tcp_active_open_b5" => TcpProbe::Active,
         _ => TcpProbe::None,
     };
     if reboot {
