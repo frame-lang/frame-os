@@ -52,6 +52,13 @@ cargo xtask pico-flash --port /dev/ttyACM0
 
 `framec` must be installed before any `cargo build` step that touches Frame source — the build scripts shell out to it. `cargo xtask install-tools` handles the rest (Rust targets, optional QEMU on systems where it's straightforward to install).
 
+**Dev container (recommended for bare-metal work).** The bare-metal track builds and runs inside a Linux container — source stays on the host, builds/tests/QEMU run in Docker. This gives dev/CI parity and a working Linux TAP path for the networking tests (which macOS can't provide). See [`docker/README.md`](docker/README.md):
+
+```sh
+docker build -t frameos-dev docker/
+docker/run.sh "cargo xtask qemu-test"
+```
+
 See [`docs/roadmap.md`](docs/roadmap.md) for the milestone-by-milestone plan and what's actually working today.
 
 ## Supported platforms
