@@ -244,10 +244,20 @@ pub mod elf {
 pub mod net {
     use std::cell::Cell;
 
+    /// Mirror of the kernel's `crate::net::RxDescriptor` — the parsed summary
+    /// threaded down the RxPipeline classify→dispatch graph.
+    #[derive(Clone, Copy, Default, Debug)]
+    pub struct RxDescriptor {
+        pub ethertype: u16,
+        pub ip_proto: u8,
+    }
+
     thread_local! {
         static REQUESTS: Cell<u32> = const { Cell::new(0) };
         static ARMS: Cell<u32> = const { Cell::new(0) };
         static FAILED: Cell<bool> = const { Cell::new(false) };
+        // Which RxPipeline leaf last fired (for the pipeline behavioral tests).
+        static DISPATCH: Cell<&'static str> = const { Cell::new("") };
     }
 
     pub fn arp_send_request() {
@@ -260,6 +270,17 @@ pub mod net {
         FAILED.with(|c| c.set(true));
     }
 
+    // RxPipeline leaves — record which protocol the descriptor was dispatched to.
+    pub fn on_arp(_pkt: RxDescriptor) {
+        DISPATCH.with(|c| c.set("arp"));
+    }
+    pub fn on_icmp(_pkt: RxDescriptor) {
+        DISPATCH.with(|c| c.set("icmp"));
+    }
+    pub fn on_udp(_pkt: RxDescriptor) {
+        DISPATCH.with(|c| c.set("udp"));
+    }
+
     // Test inspectors.
     pub fn requests_sent() -> u32 {
         REQUESTS.with(|c| c.get())
@@ -270,10 +291,14 @@ pub mod net {
     pub fn failed() -> bool {
         FAILED.with(|c| c.get())
     }
+    pub fn last_dispatch() -> &'static str {
+        DISPATCH.with(|c| c.get())
+    }
     pub fn reset() {
         REQUESTS.with(|c| c.set(0));
         ARMS.with(|c| c.set(0));
         FAILED.with(|c| c.set(false));
+        DISPATCH.with(|c| c.set(""));
     }
 }
 
@@ -304,3 +329,6 @@ include!(concat!(env!("OUT_DIR"), "/open_file.rs"));
 // ArpResolver (B5 Step 2a): one IPv4→MAC resolution's lifecycle. Actions call
 // crate::net::* (the host double above counts requests/arms/failure).
 include!(concat!(env!("OUT_DIR"), "/arp_resolver.rs"));
+// RxPipeline (B5 Step 3): classify→dispatch a received frame, threading an
+// RxDescriptor via enter params. Actions call crate::net::{on_arp,on_icmp,on_udp}.
+include!(concat!(env!("OUT_DIR"), "/rx_pipeline.rs"));

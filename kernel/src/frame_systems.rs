@@ -65,3 +65,7 @@ include!(concat!(env!("OUT_DIR"), "/open_file.rs"));
 // call crate::net::{arp_send_request,arp_arm_timer,arp_on_failed}; the enter
 // handler arms the retransmit timer (the native timer-wheel pattern).
 include!(concat!(env!("OUT_DIR"), "/arp_resolver.rs"));
+// RxPipeline (B5 Step 3): classify a received frame and dispatch to a protocol
+// handler, threading an RxDescriptor down the classify→dispatch graph via enter
+// params. Actions call crate::net::{on_arp,on_icmp,on_udp}.
+include!(concat!(env!("OUT_DIR"), "/rx_pipeline.rs"));

@@ -12,8 +12,19 @@
 // timers, rehearsed small here. ARP/timer state is single-flight (one
 // resolution at a time at Step 2a), so plain statics suffice.
 
-use crate::frame_systems::ArpResolver;
+use crate::frame_systems::{ArpResolver, RxPipeline};
 use crate::{interrupts, serial, virtio_net};
+
+/// The small parsed summary of a received frame that flows down the
+/// `RxPipeline` classify→dispatch graph as an enter parameter. The frame bytes
+/// themselves stay in the native `RX_FRAME` buffer; this carries just what the
+/// pipeline routes on. (`#[derive(Clone, Default)]` — required for framec's
+/// typed enter-arg context.)
+#[derive(Clone, Copy, Default, Debug)]
+pub struct RxDescriptor {
+    pub ethertype: u16,
+    pub ip_proto: u8,
+}
 
 const ETHERTYPE_ARP: [u8; 2] = [0x08, 0x06];
 const ETHERTYPE_IPV4: [u8; 2] = [0x08, 0x00];
@@ -35,6 +46,21 @@ const ARP_RETRANSMIT_TICKS: u64 = 100;
 static mut GATEWAY_MAC: [u8; 6] = [0; 6];
 static mut ARP_DEADLINE: u64 = 0;
 static mut ARP_FAILED: bool = false;
+
+// RX pipeline state (B5 Step 3). Single-flight: the network code is driven from
+// one boot-context loop with IRQs used only to wake it, so one buffer + a set
+// of dispatch flags suffice.
+static mut RX_FRAME: [u8; virtio_net::MAX_FRAME] = [0; virtio_net::MAX_FRAME];
+static mut RX_LEN: usize = 0;
+static mut ARP_GATEWAY_SEEN: bool = false; // on_arp saw the gateway's reply
+static mut ICMP_REPLY_SEEN: bool = false; // on_icmp saw our ping's reply
+static mut EXPECTED_PING_SEQ: u16 = 0;
+static mut PIPELINE: Option<RxPipeline> = None;
+
+fn pipeline() -> &'static mut RxPipeline {
+    let p = &raw mut PIPELINE;
+    unsafe { (*p).get_or_insert_with(RxPipeline::__create) }
+}
 
 // --- helpers called by the ArpResolver Frame system ------------------------
 
@@ -95,6 +121,70 @@ fn is_gateway_arp_reply(frame: &[u8]) -> bool {
 fn store_gateway_mac(frame: &[u8]) {
     let p = &raw mut GATEWAY_MAC;
     unsafe { (*p).copy_from_slice(&frame[22..28]) };
+}
+
+// --- RX pipeline dispatch (B5 Step 3) --------------------------------------
+
+/// The current frame in the native RX buffer (`RX_FRAME[..RX_LEN]`).
+fn rx_frame() -> &'static [u8] {
+    let n = unsafe { (&raw const RX_LEN).read() };
+    let p = &raw const RX_FRAME;
+    let full: &'static [u8] = unsafe { &*p }; // bind raw ptr, then deref+borrow
+    &full[..n]
+}
+
+/// Parse the classification descriptor from a received frame (ethertype, and
+/// for IPv4 the protocol). The `RxPipeline` routes on these; the per-protocol
+/// handlers re-read `RX_FRAME` for their specifics.
+fn parse_descriptor(frame: &[u8]) -> RxDescriptor {
+    let mut d = RxDescriptor::default();
+    if frame.len() >= 14 {
+        d.ethertype = u16::from_be_bytes([frame[12], frame[13]]);
+        if d.ethertype == 0x0800 && frame.len() >= 14 + 20 {
+            d.ip_proto = frame[14 + 9];
+        }
+    }
+    d
+}
+
+/// Pipeline leaf (`$Arp`): if this is the gateway's ARP reply, store its MAC
+/// and flag it for the resolution loop.
+pub fn on_arp(_pkt: RxDescriptor) {
+    let frame = rx_frame();
+    if is_gateway_arp_reply(frame) {
+        store_gateway_mac(frame);
+        unsafe { (&raw mut ARP_GATEWAY_SEEN).write(true) };
+    }
+}
+
+/// Pipeline leaf (`$Icmp`): if this is our ping's echo reply, flag it.
+pub fn on_icmp(_pkt: RxDescriptor) {
+    let seq = unsafe { (&raw const EXPECTED_PING_SEQ).read() };
+    if is_icmp_echo_reply(rx_frame(), seq) {
+        unsafe { (&raw mut ICMP_REPLY_SEEN).write(true) };
+    }
+}
+
+/// Pipeline leaf (`$Udp`): a UDP datagram arrived. (Delivered to a `UdpSocket`
+/// at B5 Step 3b; a no-op for now.)
+pub fn on_udp(_pkt: RxDescriptor) {}
+
+/// Pump one received frame through the `RxPipeline`: copy it into the native
+/// RX buffer, parse its descriptor, and `deliver` it to the Frame classifier
+/// (which dispatches to `on_arp`/`on_icmp`/`on_udp`). Returns false if no frame
+/// was waiting.
+fn pump() -> bool {
+    let p = &raw mut RX_FRAME;
+    let buf = unsafe { &mut *p };
+    match virtio_net::poll_rx(buf) {
+        Some(n) => {
+            unsafe { (&raw mut RX_LEN).write(n) };
+            let desc = parse_descriptor(rx_frame());
+            pipeline().deliver(desc);
+            true
+        }
+        None => false,
+    }
 }
 
 // --- IPv4 + ICMP echo (B5 Step 2b) -----------------------------------------
@@ -189,17 +279,19 @@ pub fn run_demo() {
     print_mac(&virtio_net::mac());
     serial::writeln("");
 
-    unsafe { (&raw mut ARP_FAILED).write(false) };
+    unsafe {
+        (&raw mut ARP_FAILED).write(false);
+        (&raw mut ARP_GATEWAY_SEEN).write(false);
+    }
 
     interrupts::enable();
     // Construction runs $Incomplete.$>() → first request sent + timer armed.
     let mut arpr = ArpResolver::__create();
     let overall = interrupts::ticks() + 1000;
-    let mut buf = [0u8; virtio_net::MAX_FRAME];
     while !arpr.is_resolved() && !arpr.is_failed() && interrupts::ticks() < overall {
-        if let Some(n) = virtio_net::poll_rx(&mut buf) {
-            if is_gateway_arp_reply(&buf[..n]) {
-                store_gateway_mac(&buf[..n]);
+        if pump() {
+            // The RxPipeline classified the frame; on_arp flags a gateway reply.
+            if unsafe { (&raw const ARP_GATEWAY_SEEN).read() } {
                 arpr.reply(); // -> $Resolved
             }
         } else if arp_timer_expired() {
@@ -230,16 +322,18 @@ pub fn run_demo() {
 /// inbound ICMP can actually reach the guest.
 fn ping_gateway() {
     serial::writeln("[icmp] ping 10.0.2.2 seq 0");
+    unsafe {
+        (&raw mut EXPECTED_PING_SEQ).write(0);
+        (&raw mut ICMP_REPLY_SEEN).write(false);
+    }
     send_ping(0);
 
     interrupts::enable();
     let deadline = interrupts::ticks() + 300;
-    let mut buf = [0u8; virtio_net::MAX_FRAME];
-    let mut got = false;
     while interrupts::ticks() < deadline {
-        if let Some(n) = virtio_net::poll_rx(&mut buf) {
-            if is_icmp_echo_reply(&buf[..n], 0) {
-                got = true;
+        if pump() {
+            // The RxPipeline classified the frame; on_icmp flags our echo reply.
+            if unsafe { (&raw const ICMP_REPLY_SEEN).read() } {
                 break;
             }
         } else {
@@ -248,6 +342,7 @@ fn ping_gateway() {
     }
     interrupts::disable();
 
+    let got = unsafe { (&raw const ICMP_REPLY_SEEN).read() };
     if got {
         serial::writeln("[icmp] reply from 10.0.2.2 seq 0");
         serial::writeln("[net] ping ok");

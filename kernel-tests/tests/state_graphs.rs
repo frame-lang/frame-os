@@ -154,3 +154,11 @@ fn arp_resolver_state_graph_snapshot() {
     };
     insta::assert_snapshot!("arp_resolver_state_graph", dot);
 }
+
+#[test]
+fn rx_pipeline_state_graph_snapshot() {
+    let Some(dot) = frame_to_dot("rx_pipeline.frs") else {
+        return; // framec unavailable; test skipped
+    };
+    insta::assert_snapshot!("rx_pipeline_state_graph", dot);
+}

@@ -1,0 +1,81 @@
+// frame/rx_pipeline.frs
+//
+// RxPipeline — classify one received Ethernet frame and dispatch it to the
+// right protocol handler (B5 Step 3). The marquee "data pipeline" Frame
+// system: a parsed packet descriptor flows down a classify → dispatch graph
+// as an **enter parameter** (`-> (pkt) $Next` → `$>(pkt: ...)`), so each stage
+// receives the descriptor it routes on. The frame *bytes* stay in a native
+// buffer (`crate::net`); the descriptor (`RxDescriptor`) is the small parsed
+// summary that rides the transitions — the "thread the descriptor, keep the
+// payload native" recipe, on real packets.
+//
+// State graph:
+//
+//   $Idle ─ deliver(pkt) ─► $Classifying ─┬─ ARP ──► $Arp  ──► $Idle
+//                                          ├─ IPv4 ─► $Ipv4 ─┬─ ICMP ─► $Icmp ─► $Idle
+//                                          │                 └─ UDP ──► $Udp  ─► $Idle
+//                                          └─ other ─────────────────────────► $Idle
+//
+// Each leaf's enter handler calls the matching native handler (which re-reads
+// the native RX buffer for its protocol specifics) and returns to $Idle, ready
+// for the next frame. Classification is plain `if` on descriptor fields —
+// Frame guards are native conditionals around transitions.
+
+@@[target("rust")]
+
+@@system RxPipeline {
+    interface:
+        deliver(pkt: crate::net::RxDescriptor)
+
+    machine:
+        $Idle {
+            deliver(pkt: crate::net::RxDescriptor) {
+                -> (pkt) $Classifying
+            }
+        }
+
+        $Classifying {
+            $>(pkt: crate::net::RxDescriptor) {
+                if pkt.ethertype == 0x0806 {
+                    -> (pkt) $Arp
+                } else if pkt.ethertype == 0x0800 {
+                    -> (pkt) $Ipv4
+                } else {
+                    -> $Idle
+                }
+            }
+        }
+
+        $Arp {
+            $>(pkt: crate::net::RxDescriptor) {
+                crate::net::on_arp(pkt);
+                -> $Idle
+            }
+        }
+
+        $Ipv4 {
+            $>(pkt: crate::net::RxDescriptor) {
+                if pkt.ip_proto == 1 {
+                    -> (pkt) $Icmp
+                } else if pkt.ip_proto == 17 {
+                    -> (pkt) $Udp
+                } else {
+                    -> $Idle
+                }
+            }
+        }
+
+        $Icmp {
+            $>(pkt: crate::net::RxDescriptor) {
+                crate::net::on_icmp(pkt);
+                -> $Idle
+            }
+        }
+
+        $Udp {
+            $>(pkt: crate::net::RxDescriptor) {
+                crate::net::on_udp(pkt);
+                -> $Idle
+            }
+        }
+}

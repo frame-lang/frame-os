@@ -165,6 +165,7 @@ const DIAGRAMS: &[(&str, &str)] = &[
     ("mount.frs", "mount.svg"),
     ("open_file.frs", "open_file.svg"),
     ("arp_resolver.frs", "arp_resolver.svg"),
+    ("rx_pipeline.frs", "rx_pipeline.svg"),
 ];
 
 fn diagrams(mode: DiagramMode) -> Result<()> {

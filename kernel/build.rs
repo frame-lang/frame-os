@@ -31,6 +31,7 @@ const FRAME_SYSTEMS: &[(&str, &str)] = &[
     ("mount", "mount.frs"),
     ("open_file", "open_file.frs"),
     ("arp_resolver", "arp_resolver.frs"),
+    ("rx_pipeline", "rx_pipeline.frs"),
     ("kernel", "kernel.frs"),
 ];
 
