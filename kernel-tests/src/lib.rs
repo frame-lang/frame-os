@@ -150,12 +150,18 @@ pub mod usermode {
 pub mod elf {
     use std::cell::Cell;
 
+    /// Mirror of the kernel's `crate::elf::ElfHeader` — the descriptor threaded
+    /// down the ElfLoader phase pipeline as an enter param.
+    #[derive(Clone, Copy, Default)]
+    pub struct ElfHeader {
+        pub phoff: u64,
+        pub phentsize: u16,
+        pub phnum: u16,
+    }
+
     thread_local! {
         static BYTES: Cell<&'static [u8]> = const { Cell::new(&[]) };
         static ENTRY: Cell<u64> = const { Cell::new(0) };
-        static PHOFF: Cell<u64> = const { Cell::new(0) };
-        static PHENTSIZE: Cell<u16> = const { Cell::new(0) };
-        static PHNUM: Cell<u16> = const { Cell::new(0) };
         static STACK_TOP: Cell<u64> = const { Cell::new(0) };
     }
 
@@ -177,23 +183,24 @@ pub mod elf {
         STACK_TOP.with(|c| c.set(0));
     }
 
-    pub fn read_header() -> bool {
+    pub fn read_header() -> Option<ElfHeader> {
         BYTES.with(|c| {
             let b = c.get();
             match (rd_u64(b, 24), rd_u64(b, 32), rd_u16(b, 54), rd_u16(b, 56)) {
                 (Some(entry), Some(phoff), Some(phentsize), Some(phnum)) => {
                     ENTRY.with(|e| e.set(entry));
-                    PHOFF.with(|e| e.set(phoff));
-                    PHENTSIZE.with(|e| e.set(phentsize));
-                    PHNUM.with(|e| e.set(phnum));
-                    true
+                    Some(ElfHeader {
+                        phoff,
+                        phentsize,
+                        phnum,
+                    })
                 }
-                _ => false,
+                _ => None,
             }
         })
     }
 
-    pub fn validate_header() -> bool {
+    pub fn validate_header(hdr: ElfHeader) -> bool {
         BYTES.with(|c| {
             let b = c.get();
             if b.len() < 64 || &b[0..4] != b"\x7fELF" || b[4] != 2 || b[5] != 1 {
@@ -202,14 +209,13 @@ pub mod elf {
             if !matches!((rd_u16(b, 16), rd_u16(b, 18)), (Some(2), Some(0x3E))) {
                 return false;
             }
-            let ph_end = PHOFF.with(|e| e.get())
-                + PHNUM.with(|e| e.get()) as u64 * PHENTSIZE.with(|e| e.get()) as u64;
-            (ph_end as usize) <= b.len() && PHENTSIZE.with(|e| e.get()) >= 56
+            let ph_end = hdr.phoff + hdr.phnum as u64 * hdr.phentsize as u64;
+            (ph_end as usize) <= b.len() && hdr.phentsize >= 56
         })
     }
 
-    // Mapping is stubbed on the host (no paging). Both succeed.
-    pub fn map_segments() -> bool {
+    // Mapping is stubbed on the host (no paging). Succeeds.
+    pub fn map_segments(_hdr: ElfHeader) -> bool {
         true
     }
 

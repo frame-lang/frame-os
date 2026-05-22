@@ -28,6 +28,14 @@
 // crate::elf owns the bytes + mapping mechanics (read_header / validate_header
 // / map_segments / build_stack / cleanup / entry_va / stack_top); ElfLoader
 // owns the phase order + the failure routing.
+//
+// Data pipeline (B5): `read_header` parses the ELF header into an `ElfHeader`
+// descriptor, which flows down the phases as an **enter parameter**
+// (`-> (hdr) $ValidatingHeader` → `$>(hdr: crate::elf::ElfHeader)` → ...), so
+// the validate + map phases receive the parsed header they act on rather than
+// re-reading a shared global. The bulk payload (the ELF bytes, the target
+// page table, the mapped-pages rollback list) stays native in `crate::elf` —
+// the cookbook "thread the parsed descriptor, keep the payload native" recipe.
 
 @@[target("rust")]
 
@@ -43,8 +51,9 @@
     machine:
         $ReadingHeader {
             $>() {
-                if crate::elf::read_header() {
-                    -> $ValidatingHeader
+                if let Some(hdr) = crate::elf::read_header() {
+                    // Thread the parsed header down the pipeline.
+                    -> (hdr) $ValidatingHeader
                 } else {
                     self.err = "truncated ELF header".to_string();
                     -> $Failed
@@ -53,9 +62,9 @@
         }
 
         $ValidatingHeader {
-            $>() {
-                if crate::elf::validate_header() {
-                    -> $MappingSegments
+            $>(hdr: crate::elf::ElfHeader) {
+                if crate::elf::validate_header(hdr) {
+                    -> (hdr) $MappingSegments
                 } else {
                     self.err = "not a valid x86-64 executable".to_string();
                     -> $Failed
@@ -64,8 +73,8 @@
         }
 
         $MappingSegments {
-            $>() {
-                if crate::elf::map_segments() {
+            $>(hdr: crate::elf::ElfHeader) {
+                if crate::elf::map_segments(hdr) {
                     -> $BuildingStack
                 } else {
                     self.err = "segment mapping failed".to_string();

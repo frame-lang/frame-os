@@ -24,13 +24,21 @@ const PAGE: u64 = 4096;
 const USER_STACK_VA: u64 = 0x0000_0000_2000_0000; // proven-free user VA
 const MAX_TRACKED: usize = 64; // mapped pages we can roll back on failure
 
+/// The parsed ELF header fields that flow down the `ElfLoader` phase pipeline
+/// as an enter parameter (`$ReadingHeader → $ValidatingHeader → $MappingSegments`).
+/// Frame threads this descriptor; the *bytes*, target `pml4`, and the mapped-
+/// pages rollback list stay in the `ELF` global (accumulating native payload).
+#[derive(Clone, Copy, Default)]
+pub struct ElfHeader {
+    pub phoff: u64,
+    pub phentsize: u16,
+    pub phnum: u16,
+}
+
 struct ElfState {
     bytes: &'static [u8],
     pml4: u64,
-    entry: u64,
-    phoff: u64,
-    phentsize: u16,
-    phnum: u16,
+    entry: u64, // kept for the entry_va() query, read after the load settles
     stack_top: u64,
     mapped: [(u64, u64); MAX_TRACKED], // (virt, frame_phys)
     mapped_n: usize,
@@ -40,9 +48,6 @@ static mut ELF: ElfState = ElfState {
     bytes: &[],
     pml4: 0,
     entry: 0,
-    phoff: 0,
-    phentsize: 0,
-    phnum: 0,
     stack_top: 0,
     mapped: [(0, 0); MAX_TRACKED],
     mapped_n: 0,
@@ -82,32 +87,33 @@ pub fn prepare(bytes: &'static [u8], pml4: u64) {
     e.bytes = bytes;
     e.pml4 = pml4;
     e.entry = 0;
-    e.phoff = 0;
-    e.phentsize = 0;
-    e.phnum = 0;
     e.stack_top = 0;
     e.mapped_n = 0;
 }
 
-/// Phase 1: read the ELF header fields. False if the image is too short.
-pub fn read_header() -> bool {
+/// Phase 1: read the ELF header fields, returning them as the descriptor that
+/// flows down the pipeline. None if the image is too short. (`entry` is also
+/// stashed in the global for the post-load `entry_va()` query.)
+pub fn read_header() -> Option<ElfHeader> {
     let e = elf();
     let b = e.bytes;
     let (Some(entry), Some(phoff), Some(phentsize), Some(phnum)) =
         (rd_u64(b, 24), rd_u64(b, 32), rd_u16(b, 54), rd_u16(b, 56))
     else {
-        return false;
+        return None;
     };
-    e.entry = entry;
-    e.phoff = phoff;
-    e.phentsize = phentsize;
-    e.phnum = phnum;
-    true
+    e.entry = entry; // stashed for the post-load entry_va() query
+    Some(ElfHeader {
+        phoff,
+        phentsize,
+        phnum,
+    })
 }
 
 /// Phase 2: validate magic + that this is a 64-bit little-endian x86-64
-/// executable, and that the program-header table is in bounds.
-pub fn validate_header() -> bool {
+/// executable, and that the program-header table (from the threaded header) is
+/// in bounds.
+pub fn validate_header(hdr: ElfHeader) -> bool {
     let e = elf();
     let b = e.bytes;
     if b.len() < 64 || &b[0..4] != b"\x7fELF" {
@@ -120,16 +126,17 @@ pub fn validate_header() -> bool {
         (Some(2), Some(0x3E)) => {} // ET_EXEC, EM_X86_64
         _ => return false,
     }
-    let ph_end = e.phoff + (e.phnum as u64) * (e.phentsize as u64);
-    (ph_end as usize) <= b.len() && e.phentsize >= 56
+    let ph_end = hdr.phoff + (hdr.phnum as u64) * (hdr.phentsize as u64);
+    (ph_end as usize) <= b.len() && hdr.phentsize >= 56
 }
 
-/// Phase 3: map every PT_LOAD segment at its p_vaddr. False on allocation
-/// failure (the loader then transitions to $Failed, which calls `cleanup`).
-pub fn map_segments() -> bool {
+/// Phase 3: map every PT_LOAD segment at its p_vaddr, walking the program
+/// headers named by the threaded descriptor. False on allocation failure (the
+/// loader then transitions to $Failed, which calls `cleanup`).
+pub fn map_segments(hdr: ElfHeader) -> bool {
     let e = elf();
-    for i in 0..e.phnum as u64 {
-        let off = (e.phoff + i * e.phentsize as u64) as usize;
+    for i in 0..hdr.phnum as u64 {
+        let off = (hdr.phoff + i * hdr.phentsize as u64) as usize;
         let b = e.bytes;
         let (
             Some(p_type),
