@@ -1,0 +1,87 @@
+---
+source: kernel-tests/tests/state_graphs.rs
+expression: dot
+---
+digraph UsbMsd {
+    compound=true
+    node [color="deepskyblue4" style="rounded, filled" fillcolor="azure"]
+    edge[color="red"]
+
+    Entry[width=0.2 shape="circle" style="filled" fillcolor="black" label=""]
+    Entry -> Idle
+
+    Idle [label = <
+        <table CELLBORDER="0" CELLPADDING="5" style="rounded">
+            <tr><td><b>Idle</b></td></tr>
+            <hr/>
+            <tr><td align="left"><font point-size="10">
+begin(cmd: u8)<br ALIGN="LEFT"/>state()<br ALIGN="LEFT"/>
+            </font></td></tr>
+        </table>
+    > margin=0 shape=none]
+    Complete [label = <
+        <table CELLBORDER="0" CELLPADDING="5" style="rounded">
+            <tr><td><b>Complete</b></td></tr>
+            <hr/>
+            <tr><td align="left"><font point-size="10">
+is_complete()<br ALIGN="LEFT"/>state()<br ALIGN="LEFT"/>
+            </font></td></tr>
+        </table>
+    > margin=0 shape=none]
+    Failed [label = <
+        <table CELLBORDER="0" CELLPADDING="5" style="rounded">
+            <tr><td><b>Failed</b></td></tr>
+            <hr/>
+            <tr><td align="left"><font point-size="10">
+is_failed()<br ALIGN="LEFT"/>state()<br ALIGN="LEFT"/>
+            </font></td></tr>
+        </table>
+    > margin=0 shape=none]
+    subgraph cluster_Active {
+        label = <
+            <table cellborder="0" border="0">
+                <tr><td>Active</td></tr>
+                <hr/>
+                <tr><td align="left"><font point-size="10">
+fail()<br ALIGN="LEFT"/>
+                </font></td></tr>
+            </table>
+        >
+        style = rounded
+        Active [shape="point" width="0"]
+
+        CommandPhase [label = <
+            <table CELLBORDER="0" CELLPADDING="5" style="rounded">
+                <tr><td><b>CommandPhase</b></td></tr>
+                <hr/>
+                <tr><td align="left"><font point-size="10">
+$&gt;()<br ALIGN="LEFT"/>cbw_sent()<br ALIGN="LEFT"/>state()<br ALIGN="LEFT"/>
+                </font></td></tr>
+            </table>
+        > margin=0 shape=none]
+        DataPhase [label = <
+            <table CELLBORDER="0" CELLPADDING="5" style="rounded">
+                <tr><td><b>DataPhase</b></td></tr>
+                <hr/>
+                <tr><td align="left"><font point-size="10">
+$&gt;()<br ALIGN="LEFT"/>data_received()<br ALIGN="LEFT"/>state()<br ALIGN="LEFT"/>
+                </font></td></tr>
+            </table>
+        > margin=0 shape=none]
+        StatusPhase [label = <
+            <table CELLBORDER="0" CELLPADDING="5" style="rounded">
+                <tr><td><b>StatusPhase</b></td></tr>
+                <hr/>
+                <tr><td align="left"><font point-size="10">
+$&gt;()<br ALIGN="LEFT"/>status_received()<br ALIGN="LEFT"/>state()<br ALIGN="LEFT"/>
+                </font></td></tr>
+            </table>
+        > margin=0 shape=none]
+    }
+
+    Idle -> CommandPhase [label=" begin "]
+    CommandPhase -> DataPhase [label=" cbw_sent "]
+    DataPhase -> StatusPhase [label=" data_received "]
+    StatusPhase -> Complete [label=" status_received "]
+    Active -> Failed [label=" fail " ltail="cluster_Active"]
+}

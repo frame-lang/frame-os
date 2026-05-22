@@ -594,12 +594,20 @@ unsafe extern "C" fn kmain() -> ! {
         // connect → reset (a timed transition) → enabled, readying the device
         // for enumeration.
         xhci::run_port_lifecycle();
-        // B6 Step 3: enumerate the device through the UsbEnumeration Frame system
-        // — Enable Slot → Address Device → GET_DESCRIPTOR → SET_CONFIGURATION.
+        // B6 Step 3 / R3a: enumerate every attached device concurrently through
+        // the UsbEnumeration Frame system — Enable Slot → Address Device →
+        // GET_DESCRIPTOR → SET_CONFIGURATION, one instance per device.
         xhci::run_enumeration();
-        // B6 Step 4: configure the interrupt endpoint and complete one transfer
-        // (a HID key report) through the UsbTransfer Frame system.
+        // R3b: read each device's configuration descriptor and classify it (HID
+        // keyboard/mouse, mass storage), so the class-specific drivers below
+        // route by class rather than table index.
+        xhci::classify_devices();
+        // B6 Step 4: configure the keyboard's interrupt endpoint and complete one
+        // transfer (a HID key report) through the UsbTransfer Frame system.
         xhci::run_transfer();
+        // R3b: drive the mass-storage device's SCSI commands over Bulk-Only
+        // Transport through the UsbMsd Frame system.
+        xhci::run_msd();
     }
 
     // B2 Step 3 (fatal path): deliberately fault on an unmapped, non-lazy

@@ -96,6 +96,12 @@ include!(concat!(env!("OUT_DIR"), "/usb_enumeration.rs"));
 // (crate::xhci::queue_interrupt_in); the driver dispatches complete()/fail() on
 // the Transfer Event; $Complete reads the result (crate::xhci::on_report).
 include!(concat!(env!("OUT_DIR"), "/usb_transfer.rs"));
+// UsbMsd (R3b): one Bulk-Only Transport transaction's phase lifecycle ($Idle →
+// $CommandPhase → $DataPhase → $StatusPhase → $Complete|$Failed). Each phase's
+// enter handler issues the next bulk transfer (crate::xhci::msd_*); the driver
+// dispatches the phase events on the bulk Transfer Events. Run once per SCSI
+// command (INQUIRY → READ CAPACITY → READ(10)).
+include!(concat!(env!("OUT_DIR"), "/usb_msd.rs"));
 // EventCounter (B7): a tiny system driven by cross-core posts. Pure (no native
 // deps). Its instance is pinned to one core; other cores post tick(n) events
 // into an MPSC queue (crosscore.rs) that the owning core drains + dispatches.

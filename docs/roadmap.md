@@ -623,11 +623,23 @@ regions" question.
   by **real asynchronous hardware completions** rather than synthetic events.
   Validated by `usb_multiport_r3a`; the four B6 single-device tests still pass
   (keyboard stays device 0 / slot 1, so the keypress transfer is unaffected).
-- **R3b (mass-storage bulk/SCSI) — remaining.** Add a `usb-storage` device:
-  configure **bulk** IN/OUT endpoints (a new endpoint type vs the HID interrupt-IN),
-  a new `UsbMsd` FSM modeling the Bulk-Only Transport lifecycle (CBW → data → CSW),
-  and drive a SCSI `INQUIRY` / `READ CAPACITY(10)` / `READ(10)` over bulk transfers.
-  A genuinely new device class + transfer type.
+- **R3b (mass-storage bulk/SCSI) — done.** Added a `usb-storage` device (backed by
+  a raw image with a magic in block 0). It enumerates alongside the HID devices;
+  because it is USB3 it sorts onto a lower port, so device identity moved from table
+  index to **interface class**: `classify_devices` reads each device's configuration
+  descriptor (the first interface's class/protocol + bulk endpoint addresses) and
+  routes by class — the keypress transfer to the HID keyboard, SCSI to the
+  mass-storage device. `run_msd` then configures the device's **bulk** IN/OUT
+  endpoints (a new endpoint type vs the HID interrupt-IN) and drives three SCSI
+  commands — `INQUIRY`, `READ CAPACITY(10)`, `READ(10)` of block 0 — each through one
+  `UsbMsd` Frame instance's Bulk-Only Transport phase lifecycle
+  (`$CommandPhase`→`$DataPhase`→`$StatusPhase`, CBW → data → CSW). Native owns the
+  CBW/CSW byte layout, the SCSI CDB, the bulk rings + TRBs, and the CSW validation;
+  Frame owns the BOT phase lifecycle. Serial: `bulk endpoints configured (IN + OUT)`
+  → `INQUIRY vendor 'QEMU' product 'QEMU HARDDISK'` → `capacity: 128 blocks of 512
+  bytes` → `block 0 first 8 bytes: FRAMEOS!` (proof of a real media read). Validated
+  by `usb_msd_r3b` + `usb_msd_behavior` (4 host tests) + a state-graph snapshot.
+  A genuinely new device class + transfer type. **R3 complete.**
 
 ### R7 — message-passing internals: scheduler-as-actor + a per-core reactor (Frame-relevant, near-term)
 

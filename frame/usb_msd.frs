@@ -1,0 +1,106 @@
+// frame/usb_msd.frs
+//
+// UsbMsd — one USB Mass-Storage Bulk-Only Transport (BOT) transaction (R3b).
+// A SCSI command over USB BOT is a three-phase exchange on the device's bulk
+// endpoints:
+//
+//   1. Command phase  — a 31-byte Command Block Wrapper (CBW), carrying the SCSI
+//                       CDB, sent on the bulk OUT endpoint.
+//   2. Data phase     — the command's data, here always device-to-host (bulk IN):
+//                       INQUIRY data, the READ CAPACITY result, or a data block.
+//   3. Status phase   — a 13-byte Command Status Wrapper (CSW) read on bulk IN.
+//
+// This system models those phases as states; native (`crate::xhci`) owns the
+// CBW/CSW byte layout, the SCSI CDB, and the bulk-ring TRBs + doorbells. Each
+// state's enter handler issues the next bulk transfer (non-blocking); the native
+// driver loop waits for the transfer's completion event and dispatches the
+// matching phase event back here. The driver runs one instance per SCSI command
+// (INQUIRY → READ CAPACITY → READ(10)) — a sequence of same-type lifecycles, the
+// BOT analog of the per-connection / per-device pattern.
+//
+// State graph:
+//
+//   $Idle ─ begin(cmd) ─► $CommandPhase ─ cbw_sent ─► $DataPhase ─ data_received ─►
+//   $StatusPhase ─ status_received ─► $Complete
+//        │ (any active phase, via the $Active parent => $^)
+//        └─ fail ─► $Failed
+//
+// `fail()` from any active phase funnels to `$Failed` through the `$Active`
+// parent (`=> $^` — the TcpConnection.$Open / UsbEnumeration.$Enumerating idiom).
+
+@@[target("rust")]
+
+@@system UsbMsd {
+    interface:
+        begin(cmd: u8)
+        cbw_sent()
+        data_received()
+        status_received()
+        fail()
+        state(): String = "Idle".to_string()
+        is_complete(): bool = false
+        is_failed(): bool = false
+
+    machine:
+        $Idle {
+            begin(cmd: u8) {
+                self.cmd = cmd;
+                -> $CommandPhase
+            }
+            state(): String { @@:("Idle".to_string()) }
+        }
+
+        $CommandPhase => $Active {
+            $>() {
+                crate::xhci::msd_send_cbw(self.cmd);
+            }
+            cbw_sent() {
+                -> $DataPhase
+            }
+            state(): String { @@:("CommandPhase".to_string()) }
+            => $^
+        }
+
+        $DataPhase => $Active {
+            $>() {
+                crate::xhci::msd_recv_data(self.cmd);
+            }
+            data_received() {
+                -> $StatusPhase
+            }
+            state(): String { @@:("DataPhase".to_string()) }
+            => $^
+        }
+
+        $StatusPhase => $Active {
+            $>() {
+                crate::xhci::msd_recv_csw();
+            }
+            status_received() {
+                -> $Complete
+            }
+            state(): String { @@:("StatusPhase".to_string()) }
+            => $^
+        }
+
+        $Complete {
+            is_complete(): bool { @@:(true) }
+            state(): String { @@:("Complete".to_string()) }
+        }
+
+        $Failed {
+            is_failed(): bool { @@:(true) }
+            state(): String { @@:("Failed".to_string()) }
+        }
+
+        // Parent: a failed transfer at any active phase tears the transaction
+        // down to $Failed. The active children forward `fail()` here via `=> $^`.
+        $Active {
+            fail() {
+                -> $Failed
+            }
+        }
+
+    domain:
+        cmd: u8 = 0
+}

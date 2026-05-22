@@ -461,6 +461,11 @@ pub mod xhci {
         // Transfer actions (UsbTransfer).
         static QUEUED_TRANSFERS: Cell<u32> = const { Cell::new(0) };
         static REPORTS_READ: Cell<u32> = const { Cell::new(0) };
+        // Mass-storage actions (UsbMsd).
+        static CBW_CMD: Cell<u8> = const { Cell::new(0) };
+        static CBWS_SENT: Cell<u32> = const { Cell::new(0) };
+        static DATA_RECVS: Cell<u32> = const { Cell::new(0) };
+        static CSW_RECVS: Cell<u32> = const { Cell::new(0) };
     }
 
     pub fn begin_port_reset(port: u8) {
@@ -493,6 +498,16 @@ pub mod xhci {
     }
     pub fn on_report() {
         REPORTS_READ.with(|c| c.set(c.get() + 1));
+    }
+    pub fn msd_send_cbw(cmd: u8) {
+        CBW_CMD.with(|c| c.set(cmd));
+        CBWS_SENT.with(|c| c.set(c.get() + 1));
+    }
+    pub fn msd_recv_data(_cmd: u8) {
+        DATA_RECVS.with(|c| c.set(c.get() + 1));
+    }
+    pub fn msd_recv_csw() {
+        CSW_RECVS.with(|c| c.set(c.get() + 1));
     }
 
     /// Test inspectors.
@@ -529,6 +544,18 @@ pub mod xhci {
     pub fn reports_read() -> u32 {
         REPORTS_READ.with(|c| c.get())
     }
+    pub fn cbw_cmd() -> u8 {
+        CBW_CMD.with(|c| c.get())
+    }
+    pub fn cbws_sent() -> u32 {
+        CBWS_SENT.with(|c| c.get())
+    }
+    pub fn data_recvs() -> u32 {
+        DATA_RECVS.with(|c| c.get())
+    }
+    pub fn csw_recvs() -> u32 {
+        CSW_RECVS.with(|c| c.get())
+    }
     pub fn reset() {
         RESET_PORT.with(|c| c.set(0));
         RESETS.with(|c| c.set(0));
@@ -541,6 +568,10 @@ pub mod xhci {
         CONFIGURED_SLOT.with(|c| c.set(0));
         QUEUED_TRANSFERS.with(|c| c.set(0));
         REPORTS_READ.with(|c| c.set(0));
+        CBW_CMD.with(|c| c.set(0));
+        CBWS_SENT.with(|c| c.set(0));
+        DATA_RECVS.with(|c| c.set(0));
+        CSW_RECVS.with(|c| c.set(0));
     }
 }
 
@@ -594,5 +625,9 @@ include!(concat!(env!("OUT_DIR"), "/usb_enumeration.rs"));
 // UsbTransfer (B6 Step 4): one transfer's lifecycle. Actions call
 // crate::xhci::{queue_interrupt_in,on_report} (the host double above counts them).
 include!(concat!(env!("OUT_DIR"), "/usb_transfer.rs"));
+// UsbMsd (R3b): one Bulk-Only Transport transaction's phase lifecycle. Actions
+// call crate::xhci::{msd_send_cbw,msd_recv_data,msd_recv_csw} (the host double
+// above counts them); the SCSI command threads via the FSM domain.
+include!(concat!(env!("OUT_DIR"), "/usb_msd.rs"));
 // EventCounter (B7): the cross-core-post demo system. Pure (no native deps).
 include!(concat!(env!("OUT_DIR"), "/event_counter.rs"));

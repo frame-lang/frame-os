@@ -179,6 +179,7 @@ const DIAGRAMS: &[(&str, &str)] = &[
     ("hub_port.frs", "hub_port.svg"),
     ("usb_enumeration.frs", "usb_enumeration.svg"),
     ("usb_transfer.frs", "usb_transfer.svg"),
+    ("usb_msd.frs", "usb_msd.svg"),
     ("event_counter.frs", "event_counter.svg"),
 ];
 
@@ -315,11 +316,26 @@ struct QemuArtifacts {
     /// invocation gets a fresh copy (see `fresh_blk_disk`) so a write test
     /// can't corrupt another's disk.
     blk_template: PathBuf,
+    /// A small raw image attached as a USB mass-storage device (R3b). Block 0
+    /// carries a fixed magic so the kernel's SCSI READ(10) can verify it read
+    /// real media. Attached read-only (the demo only reads), so it can be shared.
+    usb_disk: PathBuf,
     /// Directory under `target/` where per-invocation vars copies live.
     qemu_dir: PathBuf,
 }
 
 const BLK_DISK_BLOCKS: u32 = 2048; // 1 MiB / 512
+
+/// USB mass-storage backing image: 64 KiB (128 × 512-byte blocks), block 0
+/// stamped with an 8-byte magic ("FRAMEOS!") the SCSI READ(10) test checks.
+const USB_DISK_BLOCKS: u32 = 128;
+const USB_DISK_MAGIC: &[u8; 8] = b"FRAMEOS!";
+
+fn build_usb_disk_image() -> Vec<u8> {
+    let mut img = vec![0u8; USB_DISK_BLOCKS as usize * 512];
+    img[..8].copy_from_slice(USB_DISK_MAGIC);
+    img
+}
 
 fn prepare_qemu_artifacts(workspace: &Path) -> Result<QemuArtifacts> {
     let kernel_elf = build_kernel(workspace)?;
@@ -342,11 +358,18 @@ fn prepare_qemu_artifacts(workspace: &Path) -> Result<QemuArtifacts> {
     std::fs::write(&blk_template, &image)
         .with_context(|| format!("failed to write {}", blk_template.display()))?;
 
+    // The USB mass-storage backing image (R3b): a small raw disk with a magic in
+    // block 0. Written once and attached read-only, so a shared copy is safe.
+    let usb_disk = qemu_dir.join("usb-msd.img");
+    std::fs::write(&usb_disk, build_usb_disk_image())
+        .with_context(|| format!("failed to write {}", usb_disk.display()))?;
+
     Ok(QemuArtifacts {
         esp_img,
         ovmf_code,
         ovmf_vars_template,
         blk_template,
+        usb_disk,
         qemu_dir,
     })
 }
@@ -614,6 +637,18 @@ fn qemu_base_command(
         // B0–B5 (nothing touches USB there).
         .args(["-device", "usb-kbd,bus=xhci.0"])
         .args(["-device", "usb-mouse,bus=xhci.0"])
+        // R3b: a USB mass-storage device (Bulk-Only Transport / SCSI) on a third
+        // port. The kernel enumerates it alongside the HID devices, then
+        // configures its bulk IN/OUT endpoints and drives SCSI INQUIRY / READ
+        // CAPACITY / READ(10) through the UsbMsd Frame system. Attached read-only
+        // (the demo only reads), backed by a shared raw image with a magic in
+        // block 0.
+        .args(["-drive"])
+        .arg(format!(
+            "if=none,id=usbdisk,format=raw,readonly=on,file={}",
+            artifacts.usb_disk.display()
+        ))
+        .args(["-device", "usb-storage,drive=usbdisk,bus=xhci.0"])
         .args(["-display", "none"])
         // isa-debug-exit: the kernel's halt path writes port 0xf4, which
         // makes QEMU exit cleanly (code (val<<1)|1) once the boot/demos are
@@ -1467,11 +1502,16 @@ const SMOKE_TESTS: &[SmokeTest] = &[
         // many-concurrent-same-type-lifecycle-FSMs question, answered on hardware.
         name: "usb_multiport_r3a",
         expect_contains: &[
-            "[usb] device connected on port 5",
-            "[usb] device connected on port 6",
             "[usb] device configured (slot 1)",
             "[usb] device configured (slot 2)",
-            "[usb] enumerated 2 of 2 devices",
+            "[usb] device configured (slot 3)",
+            "[usb] enumerated 3 of 3 devices",
+            // Classification order follows the device table (port order): the
+            // USB3 mass-storage device sorts onto a lower port than the USB2 HID
+            // devices, so it is slot 1, then keyboard, then mouse.
+            "is mass storage",
+            "is HID keyboard",
+            "is HID mouse",
         ],
         expect_absent: &[
             "KERNEL EXCEPTION",
@@ -1480,6 +1520,29 @@ const SMOKE_TESTS: &[SmokeTest] = &[
             "[usb] command failed during enumeration",
             "[usb] control transfer failed during enumeration",
             "[usb] enable slot timed out",
+        ],
+        timeout_secs: 30,
+    },
+    SmokeTest {
+        // R3b: USB mass storage over Bulk-Only Transport + SCSI. The kernel
+        // configures the storage device's bulk IN/OUT endpoints, then runs three
+        // SCSI commands (INQUIRY, READ CAPACITY(10), READ(10) of block 0), each
+        // through one UsbMsd Frame instance's CBW → data → CSW phase lifecycle.
+        // A genuinely new device class + transfer type (bulk, not interrupt-IN).
+        // The block-0 magic ("FRAMEOS!") proves a real media read.
+        name: "usb_msd_r3b",
+        expect_contains: &[
+            "[usb] bulk endpoints configured (IN + OUT)",
+            "[msd] INQUIRY vendor 'QEMU",
+            "[msd] capacity: 128 blocks of 512 bytes",
+            "[msd] block 0 first 8 bytes: FRAMEOS!",
+        ],
+        expect_absent: &[
+            "KERNEL EXCEPTION",
+            "KERNEL PANIC",
+            "triple fault",
+            "[msd] configure bulk endpoints failed",
+            "[msd] command did not complete",
         ],
         timeout_secs: 30,
     },

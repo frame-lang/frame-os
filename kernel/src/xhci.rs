@@ -19,7 +19,7 @@
 // physical address space — so the BAR's physical base is directly addressable.
 // All register access is volatile.
 
-use crate::frame_systems::{HubPort, UsbEnumeration, UsbTransfer};
+use crate::frame_systems::{HubPort, UsbEnumeration, UsbMsd, UsbTransfer};
 use crate::{frames, interrupts, paging, pci, serial};
 use core::ptr::{read_volatile, write_volatile};
 
@@ -129,6 +129,15 @@ struct Device {
     slot: u8,            // xHCI slot id (0 until Enable Slot completes)
     reset_deadline: u64, // HubPort reset-settle deadline (PIT ticks)
     configured: bool,    // reached UsbEnumeration.$Configured
+    // Class identity, parsed from the configuration descriptor (R3b). The first
+    // interface's class/subclass/protocol: HID keyboard = 3/1/1, HID mouse =
+    // 3/1/2, Mass Storage (Bulk-Only, SCSI) = 8/6/0x50.
+    iface_class: u8,
+    iface_protocol: u8,
+    // Endpoint addresses parsed from the config descriptor (0 if absent). A USB
+    // endpoint address has the IN/OUT direction in bit 7 and the number in 3:0.
+    bulk_in_ep: u8,
+    bulk_out_ep: u8,
     // Enumeration DMA structures.
     device_ctx_phys: u64,
     input_ctx_phys: u64,
@@ -141,6 +150,17 @@ struct Device {
     ep1_enqueue: usize,
     ep1_pcs: u32,
     report_buf_phys: u64,
+    // Mass-storage Bulk-Only Transport structures (R3b): a transfer ring +
+    // cursor per bulk endpoint, and DMA buffers for the CBW, data, and CSW.
+    bulk_in_ring_phys: u64,
+    bulk_in_enq: usize,
+    bulk_in_pcs: u32,
+    bulk_out_ring_phys: u64,
+    bulk_out_enq: usize,
+    bulk_out_pcs: u32,
+    cbw_buf_phys: u64,
+    data_buf_phys: u64,
+    csw_buf_phys: u64,
 }
 
 const DEVICE_INIT: Device = Device {
@@ -149,6 +169,10 @@ const DEVICE_INIT: Device = Device {
     slot: 0,
     reset_deadline: 0,
     configured: false,
+    iface_class: 0,
+    iface_protocol: 0,
+    bulk_in_ep: 0,
+    bulk_out_ep: 0,
     device_ctx_phys: 0,
     input_ctx_phys: 0,
     ep0_ring_phys: 0,
@@ -159,6 +183,15 @@ const DEVICE_INIT: Device = Device {
     ep1_enqueue: 0,
     ep1_pcs: 1,
     report_buf_phys: 0,
+    bulk_in_ring_phys: 0,
+    bulk_in_enq: 0,
+    bulk_in_pcs: 1,
+    bulk_out_ring_phys: 0,
+    bulk_out_enq: 0,
+    bulk_out_pcs: 1,
+    cbw_buf_phys: 0,
+    data_buf_phys: 0,
+    csw_buf_phys: 0,
 };
 
 static mut DEVICES: [Device; MAX_DEVICES] = [DEVICE_INIT; MAX_DEVICES];
@@ -1017,10 +1050,15 @@ fn wait_cmd_completion(deadline: u64) -> bool {
 /// endpoint, then complete one interrupt-IN transfer through the `UsbTransfer`
 /// Frame system. Called from kmain after enumeration reaches `$Configured`.
 pub fn run_transfer() {
-    set_cur_dev(0);
-    let slot = unsafe { (*dslot(0)).slot };
-    if !unsafe { (*dslot(0)).configured } || slot == 0 {
-        return; // device not configured
+    // Route by class, not table index: with a USB3 mass-storage device present,
+    // the keyboard is no longer device 0.
+    let Some(i) = keyboard_device() else {
+        return; // no keyboard attached
+    };
+    set_cur_dev(i);
+    let slot = unsafe { (*dslot(i)).slot };
+    if slot == 0 {
+        return;
     }
     interrupts::enable();
 
@@ -1178,6 +1216,505 @@ pub fn run_enumeration() {
     serial::write_str(" of ");
     serial::write_u32_decimal(n as u32);
     serial::writeln(" devices");
+    interrupts::disable();
+}
+
+// --- device classification (R3b) -------------------------------------------
+//
+// With more than one class of device attached (HID + mass storage), index in
+// the device table no longer identifies *what* a device is — a USB3 mass-storage
+// device sorts onto a lower port than the USB2 HID devices. So after enumeration
+// we read each device's *configuration descriptor* and record the first
+// interface's class/protocol + its bulk endpoint addresses. Routing (which
+// device gets the keypress transfer, which gets SCSI) is then by class, not by
+// table position — exactly what a real OS does.
+
+const USB_DT_INTERFACE: u8 = 4;
+const USB_DT_ENDPOINT: u8 = 5;
+const CONFIG_DESC_LEN: u32 = 64; // enough for config + one interface + its endpoints
+
+const CLASS_HID: u8 = 0x03;
+const CLASS_MSD: u8 = 0x08; // Mass Storage
+const EP_ATTR_BULK: u8 = 0x02; // bmAttributes transfer-type field == bulk
+
+/// Wait (bounded, in the driver — not a Frame handler) for the next Transfer
+/// Event, returning whether it completed OK (success or short packet).
+fn wait_transfer_completion(deadline: u64) -> bool {
+    while interrupts::ticks() < deadline {
+        if let Some(ev) = controller().and_then(|x| x.poll_event()) {
+            if trb_type(ev[3]) == TRB_TRANSFER_EVENT {
+                let code = completion_code(ev[2]);
+                return code == COMPLETION_SUCCESS || code == COMPLETION_SHORT_PACKET;
+            }
+        }
+        interrupts::wait_for_interrupt();
+    }
+    false
+}
+
+/// Read device `i`'s configuration descriptor on EP0 and parse the first
+/// interface's class/protocol and its bulk IN/OUT endpoint addresses into the
+/// device table. Returns whether the read succeeded.
+fn classify_device(i: usize) -> bool {
+    set_cur_dev(i);
+    let buf = unsafe { (*curdev()).desc_buf_phys };
+    if buf == 0 {
+        return false;
+    }
+    // Drain any leftover completion events from enumeration so the wait below
+    // blocks for *this* config-descriptor read's completion, not a stale one.
+    while let Some(x) = controller() {
+        if x.poll_event().is_none() {
+            break;
+        }
+    }
+    // GET_DESCRIPTOR(Configuration, index 0): wValue=0x0200, wLength=CONFIG_DESC_LEN.
+    let d0 = 0x80 | (6 << 8) | (0x0200 << 16);
+    let d1 = CONFIG_DESC_LEN << 16;
+    enqueue_ep0(d0, d1, 8, (TRB_SETUP_STAGE << 10) | TRB_IDT | TRT_IN);
+    enqueue_ep0(
+        buf as u32,
+        (buf >> 32) as u32,
+        CONFIG_DESC_LEN,
+        (TRB_DATA_STAGE << 10) | TRB_DIR_IN,
+    );
+    enqueue_ep0(0, 0, 0, (TRB_STATUS_STAGE << 10) | TRB_IOC);
+    let slot = unsafe { (*curdev()).slot };
+    if let Some(x) = controller() {
+        x.ring_doorbell(slot, EP0_DCI);
+    }
+    if !wait_transfer_completion(interrupts::ticks() + 100) {
+        return false;
+    }
+
+    // Walk the returned descriptor blob by bLength. Record the FIRST interface's
+    // class/protocol (class 0 is the "not yet seen" sentinel — never a real
+    // interface class) and any bulk endpoint addresses.
+    let v = frames::phys_to_virt(buf);
+    let total = (unsafe { read_volatile(v.add(2) as *const u16) } as usize).min(CONFIG_DESC_LEN as usize);
+    let mut off = unsafe { read_volatile(v) } as usize; // skip the config descriptor itself
+    while off + 2 <= total {
+        let blen = unsafe { read_volatile(v.add(off)) } as usize;
+        if blen == 0 {
+            break;
+        }
+        let dtype = unsafe { read_volatile(v.add(off + 1)) };
+        if dtype == USB_DT_INTERFACE && blen >= 9 && unsafe { (*curdev()).iface_class } == 0 {
+            unsafe {
+                (*curdev()).iface_class = read_volatile(v.add(off + 5));
+                (*curdev()).iface_protocol = read_volatile(v.add(off + 7));
+            }
+        } else if dtype == USB_DT_ENDPOINT && blen >= 7 {
+            let addr = unsafe { read_volatile(v.add(off + 2)) };
+            let attrs = unsafe { read_volatile(v.add(off + 3)) };
+            if attrs & 0x3 == EP_ATTR_BULK {
+                if addr & 0x80 != 0 {
+                    unsafe { (*curdev()).bulk_in_ep = addr };
+                } else {
+                    unsafe { (*curdev()).bulk_out_ep = addr };
+                }
+            }
+        }
+        off += blen;
+    }
+    true
+}
+
+/// Classify every configured device (read its config descriptor) and log what
+/// each is. Called from kmain after enumeration, before the class-specific
+/// drivers (keypress transfer, SCSI) run.
+pub fn classify_devices() {
+    interrupts::enable();
+    for i in 0..MAX_DEVICES {
+        if !unsafe { (*dslot(i)).in_use && (*dslot(i)).configured } {
+            continue;
+        }
+        classify_device(i);
+        let (slot, cls, proto) = unsafe {
+            let d = dslot(i);
+            ((*d).slot, (*d).iface_class, (*d).iface_protocol)
+        };
+        let label = match (cls, proto) {
+            (CLASS_HID, 1) => "HID keyboard",
+            (CLASS_HID, 2) => "HID mouse",
+            (CLASS_HID, _) => "HID",
+            (CLASS_MSD, _) => "mass storage",
+            _ => "other",
+        };
+        serial::write_str("[usb] slot ");
+        serial::write_u32_decimal(slot as u32);
+        serial::write_str(" is ");
+        serial::write_str(label);
+        serial::write_str(" (class ");
+        serial::write_u32_decimal(cls as u32);
+        serial::writeln(")");
+    }
+    interrupts::disable();
+}
+
+/// Find the first configured device of `class` (optionally matching `protocol`).
+fn find_device(class: u8, protocol: Option<u8>) -> Option<usize> {
+    (0..MAX_DEVICES).find(|&i| unsafe {
+        let d = dslot(i);
+        (*d).in_use
+            && (*d).configured
+            && (*d).iface_class == class
+            && protocol.map_or(true, |p| (*d).iface_protocol == p)
+    })
+}
+/// The configured HID keyboard, if attached (for the interrupt-IN keypress).
+pub fn keyboard_device() -> Option<usize> {
+    find_device(CLASS_HID, Some(1))
+}
+/// The configured mass-storage device, if attached (for SCSI over bulk).
+pub fn mass_storage_device() -> Option<usize> {
+    find_device(CLASS_MSD, None)
+}
+
+// --- USB mass storage: Bulk-Only Transport + SCSI (R3b) --------------------
+//
+// The native half of the `UsbMsd` Frame system: configure the device's bulk
+// endpoints, build the CBW / SCSI CDB and read the data + CSW. Frame owns the
+// three-phase BOT lifecycle; this owns the byte layout and the bulk-ring TRBs.
+
+// SCSI operation codes we issue.
+const SCSI_INQUIRY: u8 = 0x12;
+const SCSI_READ_CAPACITY10: u8 = 0x25;
+const SCSI_READ10: u8 = 0x28;
+
+// xHCI endpoint types for the EP context (bits 5:3 of dword1).
+const EP_TYPE_BULK_OUT: u32 = 2;
+const EP_TYPE_BULK_IN: u32 = 6;
+
+const CBW_SIGNATURE: u32 = 0x4342_5355; // 'USBC' little-endian
+const CSW_SIGNATURE: u32 = 0x5342_5355; // 'USBS' little-endian
+const CBW_LEN: u32 = 31;
+const CSW_LEN: u32 = 13;
+
+/// xHCI Device Context Index for a USB endpoint address (dir in bit 7, number in
+/// bits 3:0): DCI = number * 2 + (1 if IN else 0).
+fn dci_of(ep_addr: u8) -> u32 {
+    let num = (ep_addr & 0x0F) as u32;
+    num * 2 + if ep_addr & 0x80 != 0 { 1 } else { 0 }
+}
+
+/// Bulk max-packet size by USB speed (the PORTSC speed field): SS=1024, HS=512,
+/// otherwise 64.
+fn bulk_mps(speed: u32) -> u32 {
+    match speed {
+        4 => 1024, // SuperSpeed
+        3 => 512,  // High-Speed
+        _ => 64,
+    }
+}
+
+/// The SCSI CDB + (cdb_len, data_in_len) for `cmd`. All three commands here read
+/// data device-to-host. READ(10) reads LBA 0, one block (512 bytes).
+fn scsi_cdb(cmd: u8) -> ([u8; 16], u8, u32) {
+    let mut cdb = [0u8; 16];
+    cdb[0] = cmd;
+    match cmd {
+        SCSI_INQUIRY => {
+            cdb[4] = 36; // allocation length
+            (cdb, 6, 36)
+        }
+        SCSI_READ_CAPACITY10 => (cdb, 10, 8),
+        SCSI_READ10 => {
+            // LBA 0 (bytes 2..6 big-endian, all zero), transfer length 1 block
+            // (bytes 7..9 big-endian).
+            cdb[8] = 1;
+            (cdb, 10, 512)
+        }
+        _ => (cdb, 6, 0),
+    }
+}
+
+/// Configure the mass-storage device's bulk IN + OUT endpoints (a Configure
+/// Endpoint command adding both), allocating their transfer rings. Non-blocking
+/// in the sense of the HID path's `configure_endpoint`; the caller waits for the
+/// command completion.
+fn configure_bulk_endpoints(i: usize) {
+    set_cur_dev(i);
+    let (port, in_ep, out_ep) = unsafe {
+        let d = dslot(i);
+        ((*d).port, (*d).bulk_in_ep, (*d).bulk_out_ep)
+    };
+    let Some(x) = controller() else { return };
+    let speed = (x.portsc(port) >> 10) & 0xF;
+    let mps = bulk_mps(speed);
+    let cs = if x.ctx_64 { 64usize } else { 32 };
+    let in_dci = dci_of(in_ep);
+    let out_dci = dci_of(out_ep);
+    let max_dci = in_dci.max(out_dci);
+
+    let Some(in_ring) = alloc_zeroed_page() else { return };
+    let Some(out_ring) = alloc_zeroed_page() else { return };
+    write_link_trb(in_ring, in_ring);
+    write_link_trb(out_ring, out_ring);
+    unsafe {
+        let d = curdev();
+        (*d).bulk_in_ring_phys = in_ring;
+        (*d).bulk_in_enq = 0;
+        (*d).bulk_in_pcs = 1;
+        (*d).bulk_out_ring_phys = out_ring;
+        (*d).bulk_out_enq = 0;
+        (*d).bulk_out_pcs = 1;
+    }
+
+    let Some(ictx) = alloc_zeroed_page() else { return };
+    let v = frames::phys_to_virt(ictx);
+    unsafe {
+        // Input Control Context: Add A0 (slot) | A(in_dci) | A(out_dci).
+        write_volatile(
+            v.add(4) as *mut u32,
+            (1 << 0) | (1 << in_dci) | (1 << out_dci),
+        );
+        // Slot Context: Context Entries = highest DCI, speed, root port.
+        write_volatile(v.add(cs) as *mut u32, (max_dci << 27) | (speed << 20));
+        write_volatile(v.add(cs + 4) as *mut u32, (port as u32) << 16);
+        // Bulk IN EP context.
+        let ep_in = cs * (1 + in_dci as usize);
+        write_volatile(
+            v.add(ep_in + 4) as *mut u32,
+            (EP_TYPE_BULK_IN << 3) | (3 << 1) | (mps << 16),
+        );
+        write_volatile(v.add(ep_in + 8) as *mut u32, (in_ring as u32) | 1);
+        write_volatile(v.add(ep_in + 12) as *mut u32, (in_ring >> 32) as u32);
+        write_volatile(v.add(ep_in + 16) as *mut u32, mps);
+        // Bulk OUT EP context.
+        let ep_out = cs * (1 + out_dci as usize);
+        write_volatile(
+            v.add(ep_out + 4) as *mut u32,
+            (EP_TYPE_BULK_OUT << 3) | (3 << 1) | (mps << 16),
+        );
+        write_volatile(v.add(ep_out + 8) as *mut u32, (out_ring as u32) | 1);
+        write_volatile(v.add(ep_out + 12) as *mut u32, (out_ring >> 32) as u32);
+        write_volatile(v.add(ep_out + 16) as *mut u32, mps);
+    }
+
+    let slot = unsafe { (*curdev()).slot };
+    x.enqueue_cmd(
+        ictx as u32,
+        (ictx >> 32) as u32,
+        0,
+        (TRB_CONFIGURE_ENDPOINT << 10) | ((slot as u32) << 24),
+    );
+    x.ring_command_doorbell();
+}
+
+/// Enqueue a Normal TRB `(buf, len)` on the current device's bulk IN or OUT ring,
+/// stamping the producer cycle and following the Link TRB at wrap.
+fn enqueue_bulk(is_in: bool, buf: u64, len: u32) {
+    let d = curdev();
+    let (ring_phys, mut enq, mut pcs) = unsafe {
+        if is_in {
+            ((*d).bulk_in_ring_phys, (*d).bulk_in_enq, (*d).bulk_in_pcs)
+        } else {
+            ((*d).bulk_out_ring_phys, (*d).bulk_out_enq, (*d).bulk_out_pcs)
+        }
+    };
+    let ring = frames::phys_to_virt(ring_phys);
+    if enq >= RING_TRBS - 1 {
+        let link = unsafe { ring.add((RING_TRBS - 1) * TRB_SIZE) };
+        unsafe { write_volatile(link.add(12) as *mut u32, (6 << 10) | (1 << 1) | pcs) };
+        enq = 0;
+        pcs ^= 1;
+    }
+    let trb = unsafe { ring.add(enq * TRB_SIZE) };
+    // Normal TRB, IOC (1<<5); Interrupt-on-Short-Packet (1<<2) for IN reads.
+    let isp = if is_in { 1 << 2 } else { 0 };
+    unsafe {
+        write_volatile(trb as *mut u32, buf as u32);
+        write_volatile(trb.add(4) as *mut u32, (buf >> 32) as u32);
+        write_volatile(trb.add(8) as *mut u32, len);
+        write_volatile(trb.add(12) as *mut u32, (TRB_NORMAL << 10) | (1 << 5) | isp | pcs);
+    }
+    unsafe {
+        if is_in {
+            (*d).bulk_in_enq = enq + 1;
+            (*d).bulk_in_pcs = pcs;
+        } else {
+            (*d).bulk_out_enq = enq + 1;
+            (*d).bulk_out_pcs = pcs;
+        }
+    }
+}
+
+/// `UsbMsd.$CommandPhase.$>`: build the CBW for SCSI `cmd` and send it on the
+/// bulk OUT endpoint.
+pub fn msd_send_cbw(cmd: u8) {
+    // Allocate the BOT DMA buffers once (per device).
+    unsafe {
+        if (*curdev()).cbw_buf_phys == 0 {
+            let (Some(c), Some(dbuf), Some(s)) =
+                (alloc_zeroed_page(), alloc_zeroed_page(), alloc_zeroed_page())
+            else {
+                return;
+            };
+            (*curdev()).cbw_buf_phys = c;
+            (*curdev()).data_buf_phys = dbuf;
+            (*curdev()).csw_buf_phys = s;
+        }
+    }
+    let (cdb, cdb_len, data_len) = scsi_cdb(cmd);
+    let cbw = unsafe { (*curdev()).cbw_buf_phys };
+    let v = frames::phys_to_virt(cbw);
+    unsafe {
+        write_volatile(v as *mut u32, CBW_SIGNATURE);
+        write_volatile(v.add(4) as *mut u32, cmd as u32); // dCBWTag (use the opcode)
+        write_volatile(v.add(8) as *mut u32, data_len); // dCBWDataTransferLength
+        write_volatile(v.add(12), 0x80); // bmCBWFlags = data IN
+        write_volatile(v.add(13), 0); // bCBWLUN
+        write_volatile(v.add(14), cdb_len); // bCBWCBLength
+        for (j, b) in cdb.iter().enumerate() {
+            write_volatile(v.add(15 + j), *b);
+        }
+    }
+    enqueue_bulk(false, cbw, CBW_LEN);
+    let slot = unsafe { (*curdev()).slot };
+    let out_dci = dci_of(unsafe { (*curdev()).bulk_out_ep });
+    if let Some(x) = controller() {
+        x.ring_doorbell(slot, out_dci);
+    }
+}
+
+/// `UsbMsd.$DataPhase.$>`: read the command's data on the bulk IN endpoint.
+pub fn msd_recv_data(cmd: u8) {
+    let (_, _, data_len) = scsi_cdb(cmd);
+    let buf = unsafe { (*curdev()).data_buf_phys };
+    enqueue_bulk(true, buf, data_len);
+    let slot = unsafe { (*curdev()).slot };
+    let in_dci = dci_of(unsafe { (*curdev()).bulk_in_ep });
+    if let Some(x) = controller() {
+        x.ring_doorbell(slot, in_dci);
+    }
+}
+
+/// `UsbMsd.$StatusPhase.$>`: read the 13-byte CSW on the bulk IN endpoint.
+pub fn msd_recv_csw() {
+    let csw = unsafe { (*curdev()).csw_buf_phys };
+    enqueue_bulk(true, csw, CSW_LEN);
+    let slot = unsafe { (*curdev()).slot };
+    let in_dci = dci_of(unsafe { (*curdev()).bulk_in_ep });
+    if let Some(x) = controller() {
+        x.ring_doorbell(slot, in_dci);
+    }
+}
+
+/// Whether the current device's CSW is valid: correct signature + status 0
+/// (command passed). Read after the status-phase transfer completes.
+fn csw_ok() -> bool {
+    let v = frames::phys_to_virt(unsafe { (*curdev()).csw_buf_phys });
+    let sig = unsafe { read_volatile(v as *const u32) };
+    let status = unsafe { read_volatile(v.add(12)) };
+    sig == CSW_SIGNATURE && status == 0
+}
+
+/// Parse + log the data a completed SCSI command returned.
+fn msd_report(cmd: u8) {
+    let data = frames::phys_to_virt(unsafe { (*curdev()).data_buf_phys });
+    match cmd {
+        SCSI_INQUIRY => {
+            // Vendor ID @ byte 8 (8 chars), Product ID @ 16 (16 chars).
+            serial::write_str("[msd] INQUIRY vendor '");
+            for j in 8..16 {
+                serial::write_byte(unsafe { read_volatile(data.add(j)) });
+            }
+            serial::write_str("' product '");
+            for j in 16..32 {
+                serial::write_byte(unsafe { read_volatile(data.add(j)) });
+            }
+            serial::writeln("'");
+        }
+        SCSI_READ_CAPACITY10 => {
+            // Last LBA (big-endian @0) + block size (big-endian @4).
+            let be = |o: usize| -> u32 {
+                let b = |k: usize| unsafe { read_volatile(data.add(k)) } as u32;
+                (b(o) << 24) | (b(o + 1) << 16) | (b(o + 2) << 8) | b(o + 3)
+            };
+            let last_lba = be(0);
+            let blk = be(4);
+            serial::write_str("[msd] capacity: ");
+            serial::write_u32_decimal(last_lba + 1);
+            serial::write_str(" blocks of ");
+            serial::write_u32_decimal(blk);
+            serial::writeln(" bytes");
+        }
+        SCSI_READ10 => {
+            serial::write_str("[msd] block 0 first 8 bytes: ");
+            for j in 0..8 {
+                serial::write_byte(unsafe { read_volatile(data.add(j)) });
+            }
+            serial::writeln("");
+        }
+        _ => {}
+    }
+}
+
+/// Drive the mass-storage device's SCSI sequence over Bulk-Only Transport: read
+/// INQUIRY, READ CAPACITY(10), then READ(10) of block 0. Each command runs one
+/// `UsbMsd` Frame instance through its CBW → data → CSW phases; native does the
+/// bulk transfers + byte layout. Demonstrates a new device class + transfer type.
+pub fn run_msd() {
+    let Some(i) = mass_storage_device() else {
+        return;
+    };
+    set_cur_dev(i);
+    let slot = unsafe { (*dslot(i)).slot };
+    serial::write_str("[usb] mass storage on slot ");
+    serial::write_u32_decimal(slot as u32);
+    serial::writeln(" — configuring bulk endpoints");
+
+    interrupts::enable();
+    configure_bulk_endpoints(i);
+    if !wait_cmd_completion(interrupts::ticks() + 100) {
+        serial::writeln("[msd] configure bulk endpoints failed");
+        interrupts::disable();
+        return;
+    }
+    serial::writeln("[usb] bulk endpoints configured (IN + OUT)");
+
+    for cmd in [SCSI_INQUIRY, SCSI_READ_CAPACITY10, SCSI_READ10] {
+        set_cur_dev(i);
+        let mut m = UsbMsd::__create(); // $Idle
+        m.begin(cmd); // → $CommandPhase ($> sends the CBW)
+        let deadline = interrupts::ticks() + 200;
+        while !m.is_complete() && !m.is_failed() && interrupts::ticks() < deadline {
+            if let Some(ev) = controller().and_then(|x| x.poll_event()) {
+                if trb_type(ev[3]) == TRB_TRANSFER_EVENT {
+                    let code = completion_code(ev[2]);
+                    let ok = code == COMPLETION_SUCCESS || code == COMPLETION_SHORT_PACKET;
+                    set_cur_dev(i);
+                    if !ok {
+                        m.fail();
+                    } else {
+                        match m.state().as_str() {
+                            "CommandPhase" => m.cbw_sent(),   // → $DataPhase
+                            "DataPhase" => m.data_received(), // → $StatusPhase
+                            // The CSW was just read; verify its signature + status
+                            // before declaring success (a bad CSW → $Failed).
+                            "StatusPhase" => {
+                                if csw_ok() {
+                                    m.status_received() // → $Complete
+                                } else {
+                                    m.fail()
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            } else {
+                interrupts::wait_for_interrupt();
+            }
+        }
+        set_cur_dev(i);
+        if m.is_complete() {
+            msd_report(cmd);
+        } else {
+            serial::writeln("[msd] command did not complete");
+        }
+    }
     interrupts::disable();
 }
 
