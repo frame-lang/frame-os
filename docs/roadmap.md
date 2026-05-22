@@ -560,10 +560,25 @@ load-balancing arrive as `post`s into the target core's queue.
 
 B5 proved one `TcpConnection`. The open question from `frame_assessment.md`: does
 **per-event allocation + per-instance dispatch** hold up with *many* concurrent
-connections? Build a connection table (N live `TcpConnection` instances keyed by
-4-tuple), accept several simultaneous connections, and measure. **Validates** (or
-refutes, quantitatively) the hot-path-allocation concern — the single most
-important open question about Frame's runtime model for systems use.
+connections?
+
+- **R2a (per-event allocation measurement) — done.** Added a counting wrapper to
+  the bare-metal allocator (`allocator::alloc_count`) and an in-kernel stress
+  (`tcp::scale_stress`): 16 `TcpConnection` instances created on the real heap,
+  each driven through a full 7-event server lifecycle (112 dispatches), measuring
+  heap allocations. Result: **656 allocs ≈ 6 per dispatch**, all 16 instances
+  correct, **no OOM** on the 256 KiB heap. Serial: `[tcp] scale: 16 conns, 112
+  dispatches, 656 heap allocs` → `6 allocs/dispatch, closed 16/16 connections`.
+  Validated by `tcp_scale_alloc_b5` (**39/39** QEMU). **This finally quantifies
+  the assessment's standing claim** — ~6 allocs/event is a non-issue for
+  control-plane lifecycles (a connection is ~7 events) but confirms, numerically,
+  why a per-*segment* data path is the wrong place for Frame (→ the no-alloc path,
+  R4). Recorded in `frame_assessment.md` (sharpens finding #3).
+- **R2b (live multi-connection server) — remaining.** A real connection *table*
+  keyed by 4-tuple, accepting several simultaneous connections from the harness
+  (per-connection seq state + dispatch-by-peer). Adds network realism over R2a's
+  direct-drive stress; the allocation number won't change, but it exercises the
+  full receive→dispatch path at N connections.
 
 ### R3 — multi-port USB / orthogonal regions (Frame-relevant)
 

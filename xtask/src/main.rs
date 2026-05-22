@@ -1353,6 +1353,22 @@ const SMOKE_TESTS: &[SmokeTest] = &[
         timeout_secs: 30,
     },
     SmokeTest {
+        // R2a: per-event allocation at scale. 16 TcpConnection FSM instances are
+        // created on the real kernel heap and driven through a full lifecycle
+        // (7 dispatches each = 112), with a counting allocator measuring the heap
+        // allocations — quantifying Frame's per-event allocation cost. All 16 must
+        // transition correctly to $Closed with no OOM. (The alloc *count* depends
+        // on the framec version, so the oracle pins the deterministic dispatch +
+        // closed counts.)
+        name: "tcp_scale_alloc_b5",
+        expect_contains: &[
+            "[tcp] scale: 16 conns, 112 dispatches,",
+            "allocs/dispatch, closed 16/16 connections",
+        ],
+        expect_absent: &["KERNEL EXCEPTION", "KERNEL PANIC", "triple fault"],
+        timeout_secs: 30,
+    },
+    SmokeTest {
         // B6 Step 1: xHCI USB host-controller bring-up. The kernel discovers the
         // qemu-xhci controller (PCI class 0C0330), maps its MMIO window, resets
         // it, stands up the DCBAA/command-ring/event-ring, sets Run, and detects

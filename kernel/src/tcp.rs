@@ -376,6 +376,77 @@ pub fn connect(peer_mac: [u8; 6], peer_ip: [u8; 4], peer_port: u16, local_port: 
     conn().open_active(); // $Closed → $SynSent, sends SYN
 }
 
+/// R2a — per-event allocation measurement at scale. Create `N` fresh
+/// `TcpConnection` FSM instances on the real (spinlocked) kernel heap and drive
+/// each through a full passive (server) lifecycle — `$Closed → $Listen →
+/// $SynReceived → $Established → (echo) → $FinWait1 → $TimeWait → $Closed` — with
+/// synthetic client segments, counting heap allocations across the whole run.
+///
+/// This finally *quantifies* the assessment's standing claim that "every Frame
+/// dispatch allocates" — reporting allocations per dispatch and confirming N
+/// independent instances all transition correctly with no OOM on a 256 KiB heap.
+/// (It drives the FSMs directly, not real network traffic — the live multi-
+/// connection server with simultaneous peers is the deeper R2b. The senders the
+/// FSM calls TX harmless frames to the last peer; `deliver_data` is a no-op since
+/// we zero the echo buffer.)
+pub fn scale_stress() {
+    const N: u32 = 16;
+    wr(&raw mut LAST_PAYLOAD_LEN, 0); // no echo payload → no TX noise from deliver_data
+
+    let syn = TcpSegment {
+        syn: true,
+        ..TcpSegment::default()
+    };
+    let ack = TcpSegment {
+        ack: true,
+        ..TcpSegment::default()
+    };
+    let data = TcpSegment {
+        ack: true,
+        payload_len: 8,
+        ..TcpSegment::default()
+    };
+    let finack = TcpSegment {
+        fin: true,
+        ack: true,
+        ..TcpSegment::default()
+    };
+
+    let before = crate::allocator::alloc_count();
+    let mut dispatches: u64 = 0;
+    let mut closed: u32 = 0;
+    for _ in 0..N {
+        let mut c = TcpConnection::__create();
+        c.open_passive(); // $Closed → $Listen
+        c.segment(syn); // → $SynReceived (send_syn_ack)
+        c.segment(ack); // → $Established
+        c.segment(data); // $Established: echo branch (deliver_data, no-op here)
+        c.close(); // → $FinWait1 (send_fin)
+        c.segment(finack); // → $TimeWait
+        c.timeout(); // $TimeWait → $Closed
+        dispatches += 7;
+        if c.state() == "Closed" {
+            closed += 1;
+        }
+    }
+    let allocs = crate::allocator::alloc_count() - before;
+
+    serial::write_str("[tcp] scale: ");
+    serial::write_u32_decimal(N);
+    serial::write_str(" conns, ");
+    serial::write_u32_decimal(dispatches as u32);
+    serial::write_str(" dispatches, ");
+    serial::write_u32_decimal(allocs as u32);
+    serial::writeln(" heap allocs");
+    serial::write_str("[tcp] scale: ");
+    serial::write_u32_decimal((allocs / dispatches.max(1)) as u32);
+    serial::write_str(" allocs/dispatch, closed ");
+    serial::write_u32_decimal(closed);
+    serial::write_str("/");
+    serial::write_u32_decimal(N);
+    serial::writeln(" connections");
+}
+
 /// Passive-open the connection on `port` ($Closed → $Listen).
 pub fn listen(port: u16) {
     wr(&raw mut LOCAL_PORT, port);

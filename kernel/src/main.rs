@@ -527,6 +527,11 @@ unsafe extern "C" fn kmain() -> ! {
     // pattern.
     net::run_demo();
 
+    // R2a: measure Frame's per-event allocation at scale — spin up 16
+    // TcpConnection FSM instances on the real kernel heap, drive each through a
+    // full lifecycle, and report allocations per dispatch.
+    tcp::scale_stress();
+
     // B6 Step 1: bring up the xHCI USB host controller (PCI discovery + MMIO +
     // reset + DCBAA/command-ring/event-ring setup + Run), then report any device
     // connected on a port.

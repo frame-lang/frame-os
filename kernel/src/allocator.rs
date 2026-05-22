@@ -12,10 +12,44 @@
 // manager exists, `init()` will hand it a region of mapped physical
 // memory instead of a static array.
 
+use core::alloc::{GlobalAlloc, Layout};
+use core::sync::atomic::{AtomicU64, Ordering};
 use linked_list_allocator::LockedHeap;
 
+/// The global allocator, wrapped to **count allocations**. Frame's runtime
+/// allocates on every event dispatch (an `Rc<FrameEvent>` + a context map), so a
+/// running count lets us *measure* that per-event cost — the number the
+/// `frame_assessment.md` flagged but never quantified (see R2 / `tcp::scale_stress`).
+/// The counter is a `Relaxed` atomic bump per `alloc`; negligible overhead.
+struct CountingHeap {
+    inner: LockedHeap,
+    allocs: AtomicU64,
+}
+impl CountingHeap {
+    const fn empty() -> Self {
+        Self {
+            inner: LockedHeap::empty(),
+            allocs: AtomicU64::new(0),
+        }
+    }
+}
+unsafe impl GlobalAlloc for CountingHeap {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        self.allocs.fetch_add(1, Ordering::Relaxed);
+        self.inner.alloc(layout)
+    }
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        self.inner.dealloc(ptr, layout);
+    }
+}
+
 #[global_allocator]
-static ALLOCATOR: LockedHeap = LockedHeap::empty();
+static ALLOCATOR: CountingHeap = CountingHeap::empty();
+
+/// Total heap allocations since boot (for the per-event-allocation measurement).
+pub fn alloc_count() -> u64 {
+    ALLOCATOR.allocs.load(Ordering::Relaxed)
+}
 
 /// Heap size. 256 KiB is comfortable headroom for B0's allocation needs
 /// (boot HSM event/compartment plumbing) without bloating the kernel
@@ -41,6 +75,6 @@ pub fn init() {
     // a raw pointer to the start of the buffer.
     let heap_start = core::ptr::addr_of_mut!(HEAP) as *mut u8;
     unsafe {
-        ALLOCATOR.lock().init(heap_start, HEAP_SIZE);
+        ALLOCATOR.inner.lock().init(heap_start, HEAP_SIZE);
     }
 }
