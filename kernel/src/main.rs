@@ -281,8 +281,11 @@ unsafe extern "C" fn kmain() -> ! {
         // for enumeration.
         xhci::run_port_lifecycle();
         // B6 Step 3: enumerate the device through the UsbEnumeration Frame system
-        // — Enable Slot → Address Device (descriptors + configuration in 3c).
+        // — Enable Slot → Address Device → GET_DESCRIPTOR → SET_CONFIGURATION.
         xhci::run_enumeration();
+        // B6 Step 4: configure the interrupt endpoint and complete one transfer
+        // (a HID key report) through the UsbTransfer Frame system.
+        xhci::run_transfer();
     }
 
     // B2 Step 3 (fatal path): deliberately fault on an unmapped, non-lazy

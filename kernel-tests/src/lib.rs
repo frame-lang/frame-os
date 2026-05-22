@@ -458,6 +458,9 @@ pub mod xhci {
         static DESC_READS: Cell<u32> = const { Cell::new(0) };
         static SET_CONFIG_SLOT: Cell<u8> = const { Cell::new(0) };
         static CONFIGURED_SLOT: Cell<u8> = const { Cell::new(0) };
+        // Transfer actions (UsbTransfer).
+        static QUEUED_TRANSFERS: Cell<u32> = const { Cell::new(0) };
+        static REPORTS_READ: Cell<u32> = const { Cell::new(0) };
     }
 
     pub fn begin_port_reset(port: u8) {
@@ -484,6 +487,12 @@ pub mod xhci {
     }
     pub fn on_configured(slot: u8) {
         CONFIGURED_SLOT.with(|c| c.set(slot));
+    }
+    pub fn queue_interrupt_in() {
+        QUEUED_TRANSFERS.with(|c| c.set(c.get() + 1));
+    }
+    pub fn on_report() {
+        REPORTS_READ.with(|c| c.set(c.get() + 1));
     }
 
     /// Test inspectors.
@@ -514,6 +523,12 @@ pub mod xhci {
     pub fn configured_slot() -> u8 {
         CONFIGURED_SLOT.with(|c| c.get())
     }
+    pub fn queued_transfers() -> u32 {
+        QUEUED_TRANSFERS.with(|c| c.get())
+    }
+    pub fn reports_read() -> u32 {
+        REPORTS_READ.with(|c| c.get())
+    }
     pub fn reset() {
         RESET_PORT.with(|c| c.set(0));
         RESETS.with(|c| c.set(0));
@@ -524,6 +539,8 @@ pub mod xhci {
         DESC_READS.with(|c| c.set(0));
         SET_CONFIG_SLOT.with(|c| c.set(0));
         CONFIGURED_SLOT.with(|c| c.set(0));
+        QUEUED_TRANSFERS.with(|c| c.set(0));
+        REPORTS_READ.with(|c| c.set(0));
     }
 }
 
@@ -574,3 +591,6 @@ include!(concat!(env!("OUT_DIR"), "/hub_port.rs"));
 // crate::xhci::{cmd_enable_slot,address_device,on_address_assigned} (the host
 // double above records them); slot threads via the FSM domain.
 include!(concat!(env!("OUT_DIR"), "/usb_enumeration.rs"));
+// UsbTransfer (B6 Step 4): one transfer's lifecycle. Actions call
+// crate::xhci::{queue_interrupt_in,on_report} (the host double above counts them).
+include!(concat!(env!("OUT_DIR"), "/usb_transfer.rs"));

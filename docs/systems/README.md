@@ -53,6 +53,7 @@ These run inside the bare-metal kernel image. They do not appear in the hosted-m
 | [`IpReassembly`](ip_reassembly.md) | B5 | Documented | Reassemble a fragmented IPv4 datagram: `$Idle → $Reassembling → ($Complete \| $Expired)`, threading a `Fragment` via enter params (self-transition re-store). The second data-pipeline; validated by a real `ping -s 4000` over TAP. |
 | [`HubPort`](hub_port.md) | B6 | Documented | One xHCI port's connect/reset/enable lifecycle: `$Disconnected → $Connected → $Resetting → $Enabled`, disconnect funneled via an `$Attached` parent (`=> $^`). Timed reset transition; drives the qemu-xhci usb-kbd port to enabled. |
 | [`UsbEnumeration`](usb_enumeration.md) | B6 | Documented | A device's full enumeration lifecycle: `$Powered → $SlotEnabled → $AddressAssigned → $DeviceDescribed → $Configured`, fail funneled via an `$Enumerating` parent. Enter handlers issue xHCI commands / EP0 control transfers; completion events advance the FSM. Enumerates the qemu-xhci usb-kbd end to end. |
+| [`UsbTransfer`](usb_transfer.md) | B6 | Documented | One transfer's lifecycle: `$Idle → $InFlight → ($Complete \| $Failed)`. `$InFlight` queues the transfer; a Transfer Event advances the FSM; `$Complete` reads the result. Completes a real interrupt-IN HID key report from the qemu-xhci usb-kbd (closes B6-3). |
 
 ## Shared systems
 

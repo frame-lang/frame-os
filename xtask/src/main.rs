@@ -178,6 +178,7 @@ const DIAGRAMS: &[(&str, &str)] = &[
     ("ip_reassembly.frs", "ip_reassembly.svg"),
     ("hub_port.frs", "hub_port.svg"),
     ("usb_enumeration.frs", "usb_enumeration.svg"),
+    ("usb_transfer.frs", "usb_transfer.svg"),
 ];
 
 fn diagrams(mode: DiagramMode) -> Result<()> {
@@ -1392,6 +1393,30 @@ const SMOKE_TESTS: &[SmokeTest] = &[
         ],
         timeout_secs: 30,
     },
+    SmokeTest {
+        // B6 Step 4 (closes B6-3): the UsbTransfer Frame system completes a real
+        // interrupt-IN transfer. The kernel configures the keyboard's interrupt
+        // endpoint (Configure Endpoint + EP1 ring), queues an interrupt-IN read,
+        // and logs "waiting for key report"; the harness then injects a keypress
+        // via the QEMU monitor (`sendkey a`), so the keyboard produces a HID
+        // report and the transfer completes ($InFlight → $Complete).
+        name: "usb_transfer_b6",
+        expect_contains: &[
+            "[usb] device configured (slot 1)",
+            "[usb] interrupt endpoint configured (EP1 IN)",
+            "[usb] waiting for key report",
+            "[usb] HID report:",
+            "[usb] key transfer complete",
+        ],
+        expect_absent: &[
+            "KERNEL EXCEPTION",
+            "KERNEL PANIC",
+            "triple fault",
+            "[usb] configure endpoint failed",
+            "[usb] key report not received (no transfer)",
+        ],
+        timeout_secs: 30,
+    },
 ];
 
 fn run_qemu_test() -> Result<()> {
@@ -1459,6 +1484,9 @@ const TCP_PROBE_PORT: u16 = 15580;
 const TCP_ACTIVE_PORT: u16 = 15581;
 /// The request the echo probe sends; the kernel echoes it back verbatim.
 const TCP_ECHO_REQUEST: &[u8] = b"frame-os tcp echo\n";
+/// Host port for the QEMU HMP monitor (the B6 usb-transfer test connects here to
+/// `sendkey` a keypress, completing the keyboard's interrupt-IN transfer).
+const MONITOR_PORT: u16 = 15582;
 
 /// What (if anything) the harness drives over the forwarded TCP port.
 #[derive(Clone, Copy, PartialEq)]
@@ -1482,6 +1510,7 @@ fn run_qemu_once(
     serial_path: &Path,
     timeout_secs: u64,
     tcp_probe: TcpProbe,
+    usb_key: bool,
 ) -> Result<()> {
     // 4e: for the active-open test, the guestfwd target must be listening when
     // QEMU starts (QEMU connects to it at startup), so bind it before spawning.
@@ -1508,6 +1537,12 @@ fn run_qemu_once(
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .stdin(Stdio::null());
+    // B6 Step 4: a TCP HMP monitor so the harness can `sendkey` a keypress,
+    // completing the keyboard's interrupt-IN transfer.
+    if usb_key {
+        cmd.args(["-monitor"])
+            .arg(format!("tcp:127.0.0.1:{MONITOR_PORT},server,nowait"));
+    }
 
     let mut child = cmd.spawn().context("failed to invoke qemu-system-x86_64")?;
 
@@ -1518,6 +1553,7 @@ fn run_qemu_once(
     // make the host TCP drop it, so reading it back validates the data path).
     let mut probed = false;
     let mut echo_ok = false;
+    let mut key_sent = false;
 
     // Poll for QEMU's natural exit, otherwise force-kill at timeout.
     // The kernel's `halt_forever()` writes `isa-debug-exit` (port 0xf4)
@@ -1577,6 +1613,19 @@ fn run_qemu_once(
                         }
                     }
                 }
+                // B6 Step 4: once the kernel has queued the interrupt-IN read
+                // (it logs "[usb] waiting for key report"), inject a keypress via
+                // the QEMU monitor so the keyboard produces a report and the
+                // transfer completes.
+                if usb_key && !key_sent {
+                    let waiting = std::fs::read_to_string(serial_path)
+                        .map(|s| s.contains("[usb] waiting for key report"))
+                        .unwrap_or(false);
+                    if waiting && send_monitor_command(MONITOR_PORT, "sendkey a\n") {
+                        eprintln!("    (sent `sendkey a` to QEMU monitor)");
+                        key_sent = true;
+                    }
+                }
                 if Instant::now() >= deadline {
                     let _ = child.kill();
                     let _ = child.wait();
@@ -1593,6 +1642,24 @@ fn run_qemu_once(
         bail!("TCP echo not verified: the harness never read the echoed request back");
     }
     Ok(())
+}
+
+/// Send one HMP command to QEMU's TCP monitor (`sendkey`). Best-effort: connect,
+/// write the command line, give QEMU a moment to process it before the socket
+/// closes, return whether the write succeeded.
+fn send_monitor_command(port: u16, command: &str) -> bool {
+    use std::io::Write;
+    let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+    match std::net::TcpStream::connect_timeout(&addr, Duration::from_millis(500)) {
+        Ok(mut stream) => {
+            let ok = stream.write_all(command.as_bytes()).is_ok() && stream.flush().is_ok();
+            // Hold the connection briefly so QEMU's HMP reader processes the line
+            // before we drop the socket.
+            std::thread::sleep(Duration::from_millis(100));
+            ok
+        }
+        Err(_) => false,
+    }
 }
 
 fn run_smoke_test(
@@ -1612,6 +1679,8 @@ fn run_smoke_test(
         "tcp_active_open_b5" => TcpProbe::Active,
         _ => TcpProbe::None,
     };
+    // The B6 transfer test injects a keypress via the QEMU monitor.
+    let usb_key = test.name == "usb_transfer_b6";
     if reboot {
         let ovmf1 = fresh_ovmf_vars(artifacts, &format!("{}-boot1", test.name))?;
         let boot1_log = serial_path.with_extension("boot1.log");
@@ -1623,6 +1692,7 @@ fn run_smoke_test(
             &boot1_log,
             test.timeout_secs,
             TcpProbe::None,
+            false,
         )?;
     }
     let ovmf_vars = fresh_ovmf_vars(artifacts, test.name)?;
@@ -1633,6 +1703,7 @@ fn run_smoke_test(
         serial_path,
         test.timeout_secs,
         tcp_probe,
+        usb_key,
     )?;
 
     // Read the captured serial output.

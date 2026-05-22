@@ -19,7 +19,7 @@
 // physical address space — so the BAR's physical base is directly addressable.
 // All register access is volatile.
 
-use crate::frame_systems::{HubPort, UsbEnumeration};
+use crate::frame_systems::{HubPort, UsbEnumeration, UsbTransfer};
 use crate::{frames, interrupts, paging, pci, serial};
 use core::ptr::{read_volatile, write_volatile};
 
@@ -543,15 +543,21 @@ pub fn run_port_lifecycle() {
 // driver loop that dequeues completion events and dispatches the matching FSM
 // event. Frame owns the enumeration *stage*; this owns the TRBs + contexts.
 
-const TRB_ENABLE_SLOT: u32 = 9;
-const TRB_ADDRESS_DEVICE: u32 = 11;
+const TRB_NORMAL: u32 = 1;
 const TRB_SETUP_STAGE: u32 = 2;
 const TRB_DATA_STAGE: u32 = 3;
 const TRB_STATUS_STAGE: u32 = 4;
+const TRB_ENABLE_SLOT: u32 = 9;
+const TRB_ADDRESS_DEVICE: u32 = 11;
+const TRB_CONFIGURE_ENDPOINT: u32 = 12;
 const TRB_TRANSFER_EVENT: u32 = 32;
 const TRB_CMD_COMPLETION: u32 = 33;
 const COMPLETION_SUCCESS: u32 = 1;
 const COMPLETION_SHORT_PACKET: u32 = 13; // an IN transfer returning < requested — fine
+
+// The HID boot keyboard's interrupt-IN endpoint: USB endpoint 1 IN → xHCI
+// Device Context Index 3 (DCI = endpoint*2 + direction; EP1 IN = 1*2+1).
+const EP1_IN_DCI: u32 = 3;
 
 // TRB control-dword flags.
 const TRB_IDT: u32 = 1 << 6; // Immediate Data (Setup packet rides in the TRB)
@@ -570,6 +576,13 @@ static mut EP0_RING_PHYS: u64 = 0;
 static mut EP0_ENQUEUE: usize = 0;
 static mut EP0_PCS: u32 = 1;
 static mut DESC_BUF_PHYS: u64 = 0;
+// Transfer state (B6 Step 4): the configured device's slot, the interrupt
+// endpoint's (EP1-IN) transfer ring + cursor, and a DMA buffer for the report.
+static mut CONFIGURED_SLOT: u8 = 0;
+static mut EP1_RING_PHYS: u64 = 0;
+static mut EP1_ENQUEUE: usize = 0;
+static mut EP1_PCS: u32 = 1;
+static mut REPORT_BUF_PHYS: u64 = 0;
 
 fn trb_type(d3: u32) -> u32 {
     (d3 >> 10) & 0x3F
@@ -751,11 +764,191 @@ pub fn set_configuration(slot: u8) {
     }
 }
 
-/// `UsbEnumeration.$Configured.$>`: the device is configured and usable.
+/// `UsbEnumeration.$Configured.$>`: the device is configured and usable. Latch
+/// the slot so the transfer step (B6 Step 4) can address the device.
 pub fn on_configured(slot: u8) {
+    unsafe { (&raw mut CONFIGURED_SLOT).write(slot) };
     serial::write_str("[usb] device configured (slot ");
     serial::write_u32_decimal(slot as u32);
     serial::writeln(")");
+}
+
+// --- USB transfer (B6 Step 4) ----------------------------------------------
+//
+// Configure the keyboard's interrupt-IN endpoint, then read a key report off it.
+// `configure_endpoint` is native prep (a Configure Endpoint command); the
+// `UsbTransfer` Frame system models the transfer itself (queue → complete).
+
+/// Build an input context that adds EP1-IN (the boot keyboard's interrupt
+/// endpoint), allocate its transfer ring, and issue a Configure Endpoint command
+/// so the controller will service interrupt transfers on it. Non-blocking.
+fn configure_endpoint(slot: u8) {
+    let port = unsafe { (&raw const CONNECTED_PORT).read() };
+    let Some(x) = controller() else { return };
+    let speed = (x.portsc(port) >> 10) & 0xF;
+    let cs = if x.ctx_64 { 64usize } else { 32 };
+
+    let Some(ep1) = alloc_zeroed_page() else { return };
+    write_link_trb(ep1, ep1);
+    unsafe {
+        (&raw mut EP1_RING_PHYS).write(ep1);
+        (&raw mut EP1_ENQUEUE).write(0);
+        (&raw mut EP1_PCS).write(1);
+    }
+
+    let Some(ictx) = alloc_zeroed_page() else { return };
+    let v = frames::phys_to_virt(ictx);
+    unsafe {
+        // Input Control Context: Add A0 (slot — to bump Context Entries) + A3
+        // (EP1-IN, DCI 3).
+        write_volatile(v.add(4) as *mut u32, (1 << 0) | (1 << EP1_IN_DCI));
+        // Slot Context: Context Entries = 3 (highest DCI now), Speed, Root port.
+        write_volatile(v.add(cs) as *mut u32, (3 << 27) | (speed << 20));
+        write_volatile(v.add(cs + 4) as *mut u32, (port as u32) << 16);
+        // EP1-IN Context at DCI 3 → offset (1 + 3) * ctx_size.
+        let ep = cs * (1 + EP1_IN_DCI as usize);
+        // dword0: Interval (bits 23:16) — a polling period the controller accepts.
+        write_volatile(v.add(ep) as *mut u32, 8 << 16);
+        // dword1: EP Type = 7 (Interrupt IN, bits 5:3), CErr = 3 (bits 2:1),
+        // Max Packet Size = 8 (boot report, bits 31:16).
+        write_volatile(v.add(ep + 4) as *mut u32, (7 << 3) | (3 << 1) | (8 << 16));
+        // TR Dequeue Pointer = EP1 ring | DCS(1).
+        write_volatile(v.add(ep + 8) as *mut u32, (ep1 as u32) | 1);
+        write_volatile(v.add(ep + 12) as *mut u32, (ep1 >> 32) as u32);
+        write_volatile(v.add(ep + 16) as *mut u32, 8); // Average TRB Length
+    }
+
+    x.enqueue_cmd(
+        ictx as u32,
+        (ictx >> 32) as u32,
+        0,
+        (TRB_CONFIGURE_ENDPOINT << 10) | ((slot as u32) << 24),
+    );
+    x.ring_command_doorbell();
+}
+
+/// `UsbTransfer.$InFlight.$>`: queue an interrupt-IN transfer on EP1 — a Normal
+/// TRB pointing at the report buffer (IOC + interrupt-on-short-packet), then ring
+/// the EP1 doorbell. The keyboard completes it with a Transfer Event when a key
+/// report arrives (driven by the harness's injected keypress).
+pub fn queue_interrupt_in() {
+    // Report DMA buffer (allocate once).
+    if unsafe { (&raw const REPORT_BUF_PHYS).read() } == 0 {
+        if let Some(b) = alloc_zeroed_page() {
+            unsafe { (&raw mut REPORT_BUF_PHYS).write(b) };
+        } else {
+            return;
+        }
+    }
+    let buf = unsafe { (&raw const REPORT_BUF_PHYS).read() };
+    let slot = unsafe { (&raw const CONFIGURED_SLOT).read() };
+
+    // Normal TRB on the EP1 ring: 8-byte boot report, IOC + ISP.
+    let ring_phys = unsafe { (&raw const EP1_RING_PHYS).read() };
+    let mut enq = unsafe { (&raw const EP1_ENQUEUE).read() };
+    let mut pcs = unsafe { (&raw const EP1_PCS).read() };
+    let ring = frames::phys_to_virt(ring_phys);
+    if enq >= RING_TRBS - 1 {
+        let link = unsafe { ring.add((RING_TRBS - 1) * TRB_SIZE) };
+        unsafe { write_volatile(link.add(12) as *mut u32, (6 << 10) | (1 << 1) | pcs) };
+        enq = 0;
+        pcs ^= 1;
+    }
+    let trb = unsafe { ring.add(enq * TRB_SIZE) };
+    unsafe {
+        write_volatile(trb as *mut u32, buf as u32);
+        write_volatile(trb.add(4) as *mut u32, (buf >> 32) as u32);
+        write_volatile(trb.add(8) as *mut u32, 8); // TRB Transfer Length
+        // Normal, Interrupt-On-Completion (1<<5), Interrupt-on-Short-Packet (1<<2).
+        write_volatile(trb.add(12) as *mut u32, (TRB_NORMAL << 10) | (1 << 5) | (1 << 2) | pcs);
+    }
+    unsafe {
+        (&raw mut EP1_ENQUEUE).write(enq + 1);
+        (&raw mut EP1_PCS).write(pcs);
+    }
+
+    if let Some(x) = controller() {
+        x.ring_doorbell(slot, EP1_IN_DCI);
+    }
+    serial::writeln("[usb] waiting for key report");
+}
+
+/// `UsbTransfer.$Complete.$>`: the interrupt transfer completed — read + log the
+/// 8-byte HID boot keyboard report (byte 0 = modifiers, byte 2 = first keycode).
+pub fn on_report() {
+    let buf = unsafe { (&raw const REPORT_BUF_PHYS).read() };
+    if buf == 0 {
+        return;
+    }
+    let v = frames::phys_to_virt(buf);
+    let modifiers = unsafe { read_volatile(v) };
+    let keycode = unsafe { read_volatile(v.add(2)) };
+    serial::write_str("[usb] HID report: modifiers ");
+    serial::write_hex_u64(modifiers as u64);
+    serial::write_str(" keycode ");
+    serial::write_hex_u64(keycode as u64);
+    serial::writeln("");
+    serial::writeln("[usb] key transfer complete");
+}
+
+/// Wait (bounded, in the driver — not in a Frame handler) for the next Command
+/// Completion Event, returning whether it was Success.
+fn wait_cmd_completion(deadline: u64) -> bool {
+    while interrupts::ticks() < deadline {
+        if let Some(ev) = controller().and_then(|x| x.poll_event()) {
+            if trb_type(ev[3]) == TRB_CMD_COMPLETION {
+                return completion_code(ev[2]) == COMPLETION_SUCCESS;
+            }
+        }
+        interrupts::wait_for_interrupt();
+    }
+    false
+}
+
+/// Drive the post-enumeration transfer: configure the keyboard's interrupt
+/// endpoint, then complete one interrupt-IN transfer through the `UsbTransfer`
+/// Frame system. Called from kmain after enumeration reaches `$Configured`.
+pub fn run_transfer() {
+    let slot = unsafe { (&raw const CONFIGURED_SLOT).read() };
+    if slot == 0 {
+        return; // device not configured
+    }
+    interrupts::enable();
+
+    // 1. Configure the interrupt endpoint (native prep) + wait for the command.
+    configure_endpoint(slot);
+    if !wait_cmd_completion(interrupts::ticks() + 100) {
+        serial::writeln("[usb] configure endpoint failed");
+        interrupts::disable();
+        return;
+    }
+    serial::writeln("[usb] interrupt endpoint configured (EP1 IN)");
+
+    // 2. The transfer itself: queue an interrupt-IN read and wait for the key
+    //    report (the harness injects a keypress via the QEMU monitor).
+    let mut t = UsbTransfer::__create();
+    t.start(); // $InFlight.$> queues the transfer + logs "waiting for key report"
+    let deadline = interrupts::ticks() + 600; // ~6s for the harness to send a key
+    while interrupts::ticks() < deadline {
+        if let Some(ev) = controller().and_then(|x| x.poll_event()) {
+            if trb_type(ev[3]) == TRB_TRANSFER_EVENT {
+                let code = completion_code(ev[2]);
+                if code == COMPLETION_SUCCESS || code == COMPLETION_SHORT_PACKET {
+                    t.complete(); // → $Complete ($> reads the report)
+                } else {
+                    t.fail();
+                }
+            }
+        }
+        if t.is_complete() || t.is_failed() {
+            break;
+        }
+        interrupts::wait_for_interrupt();
+    }
+    if !t.is_complete() {
+        serial::writeln("[usb] key report not received (no transfer)");
+    }
+    interrupts::disable();
 }
 
 /// Drive the connected, enabled device through enumeration. Creates the

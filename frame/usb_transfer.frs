@@ -1,0 +1,63 @@
+// frame/usb_transfer.frs
+//
+// UsbTransfer — one USB transfer's lifecycle (B6 Step 4): `$Idle → $InFlight →
+// ($Complete | $Failed)`. After the device is `$Configured` and its interrupt
+// endpoint is set up (a Configure Endpoint command, native), this models the
+// transfer itself: the enter handler of `$InFlight` *queues* the transfer
+// (non-blocking — a TRB on the endpoint's transfer ring + a doorbell ring), and
+// the native driver dispatches `complete()`/`fail()` when the controller posts
+// the Transfer Event. `$Complete`'s enter handler consumes the result (here: the
+// 8-byte HID keyboard report).
+//
+// This is the same "enter kicks the async op, the completion event advances the
+// FSM" shape as `TcpConnection` and `UsbEnumeration` — the generic transfer
+// lifecycle the roadmap names (control/bulk/interrupt all share it).
+//
+//   $Idle ─ start ─► $InFlight ─┬─ complete ─► $Complete
+//                               └─ fail ─────► $Failed
+
+@@[target("rust")]
+
+@@system UsbTransfer {
+    interface:
+        start()
+        complete()
+        fail()
+        state(): String = "Idle".to_string()
+        is_complete(): bool = false
+        is_failed(): bool = false
+
+    machine:
+        $Idle {
+            start() {
+                -> $InFlight
+            }
+            state(): String { @@:("Idle".to_string()) }
+        }
+
+        $InFlight {
+            $>() {
+                crate::xhci::queue_interrupt_in();
+            }
+            complete() {
+                -> $Complete
+            }
+            fail() {
+                -> $Failed
+            }
+            state(): String { @@:("InFlight".to_string()) }
+        }
+
+        $Complete {
+            $>() {
+                crate::xhci::on_report();
+            }
+            is_complete(): bool { @@:(true) }
+            state(): String { @@:("Complete".to_string()) }
+        }
+
+        $Failed {
+            is_failed(): bool { @@:(true) }
+            state(): String { @@:("Failed".to_string()) }
+        }
+}

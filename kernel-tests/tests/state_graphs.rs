@@ -202,3 +202,11 @@ fn usb_enumeration_state_graph_snapshot() {
     };
     insta::assert_snapshot!("usb_enumeration_state_graph", dot);
 }
+
+#[test]
+fn usb_transfer_state_graph_snapshot() {
+    let Some(dot) = frame_to_dot("usb_transfer.frs") else {
+        return; // framec unavailable; test skipped
+    };
+    insta::assert_snapshot!("usb_transfer_state_graph", dot);
+}

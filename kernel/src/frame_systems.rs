@@ -91,3 +91,8 @@ include!(concat!(env!("OUT_DIR"), "/hub_port.rs"));
 // command (crate::xhci::{cmd_enable_slot,address_device,...}); the native driver
 // dispatches the milestone events on command completions. slot threads via domain.
 include!(concat!(env!("OUT_DIR"), "/usb_enumeration.rs"));
+// UsbTransfer (B6 Step 4): one transfer's lifecycle ($Idle → $InFlight →
+// $Complete|$Failed). $InFlight's enter handler queues the transfer
+// (crate::xhci::queue_interrupt_in); the driver dispatches complete()/fail() on
+// the Transfer Event; $Complete reads the result (crate::xhci::on_report).
+include!(concat!(env!("OUT_DIR"), "/usb_transfer.rs"));
