@@ -66,6 +66,12 @@ enum SubCmd {
     /// and asserts expected substrings appear (and panic markers
     /// do not). Fails the whole run non-zero if any test fails.
     QemuTest,
+
+    /// B5-3: boot the kernel on a real TAP link and `ping` it from the host.
+    /// Requires a Linux host with NET_ADMIN + /dev/net/tun (the dev container
+    /// with `TAP=1 docker/run.sh "cargo xtask qemu-tap"`). Sets up `tap0`,
+    /// boots QEMU with `-netdev tap`, pings the guest, and asserts a reply.
+    QemuTap,
 }
 
 fn main() -> Result<()> {
@@ -77,6 +83,7 @@ fn main() -> Result<()> {
         SubCmd::RegenDiagrams => diagrams(DiagramMode::Regen),
         SubCmd::Qemu => run_qemu(),
         SubCmd::QemuTest => run_qemu_test(),
+        SubCmd::QemuTap => run_qemu_tap(),
     }
 }
 
@@ -315,7 +322,7 @@ fn prepare_qemu_artifacts(workspace: &Path) -> Result<QemuArtifacts> {
     let esp_img = build_esp_image(workspace, &kernel_elf, &limine_dir)?;
 
     let (ovmf_code, ovmf_vars_template) = find_ovmf()?;
-    let qemu_dir = workspace.join("target").join("qemu");
+    let qemu_dir = target_dir(workspace).join("qemu");
     std::fs::create_dir_all(&qemu_dir)?;
 
     // An mkfs'd virtio-blk disk template (B4): formatted with the Frame OS FS
@@ -456,7 +463,7 @@ fn build_fs_image(total_blocks: u32, files: &[(&str, &[u8])]) -> Vec<u8> {
 /// can't leak into the user link.
 fn build_user_disk_elf(workspace: &Path) -> Result<Vec<u8>> {
     let user_dir = workspace.join("user");
-    let user_target = workspace.join("target").join("user-disk-elf");
+    let user_target = target_dir(workspace).join("user-disk-elf");
 
     let status = Command::new(std::env::var("CARGO").unwrap_or_else(|_| "cargo".into()))
         .current_dir(&user_dir)
@@ -513,11 +520,24 @@ fn fresh_ovmf_vars(artifacts: &QemuArtifacts, tag: &str) -> Result<PathBuf> {
 /// arguments. Callers add the serial routing they want
 /// (`-serial stdio` for interactive, `-serial file:<path>` for smoke
 /// tests) and then either spawn or run.
+/// How QEMU's virtio-net `net0` netdev is wired up.
+enum NetMode {
+    /// User-mode networking (slirp): no host privilege, CI-friendly. The
+    /// default for every smoke test. `guestfwd` is set only for the 4e
+    /// active-open test (QEMU connects to the guestfwd target at startup,
+    /// so a listener must already be up — we mustn't add it otherwise).
+    Slirp { guestfwd: bool },
+    /// A host TAP device (`ifname`), giving a real inbound L2 peer. Needs
+    /// NET_ADMIN + /dev/net/tun (Linux container). Used by `qemu-tap` to
+    /// validate the kernel's inbound ARP/ICMP responders (B5 Step 5).
+    Tap { ifname: String },
+}
+
 fn qemu_base_command(
     artifacts: &QemuArtifacts,
     ovmf_vars: &Path,
     blk_disk: &Path,
-    guestfwd: bool,
+    net: &NetMode,
 ) -> Command {
     let mut cmd = Command::new("qemu-system-x86_64");
     cmd.args(["-machine", "q35", "-cpu", "qemu64", "-m", "256M"])
@@ -543,22 +563,30 @@ fn qemu_base_command(
             "-device",
             "virtio-blk-pci,drive=blk0,disable-modern=on,disable-legacy=off",
         ])
-        // virtio-net on QEMU user-mode networking (slirp): no host privilege,
-        // CI-friendly. `disable-modern=on` forces the legacy I/O-BAR interface
-        // our driver speaks. slirp answers ARP for the gateway (10.0.2.2), which
-        // the B5 Step 1 demo relies on. TAP is the deferred production path.
-        // hostfwd forwards host 127.0.0.1:TCP_PROBE_PORT → guest :7 (the B5 4b/4c
-        // passive tests connect in). guestfwd (only for the 4e active-open test —
-        // QEMU connects to the target at startup, so a listener must be up and we
-        // mustn't add it otherwise) forwards the guest's connection to 10.0.2.2:9
-        // → host 127.0.0.1:TCP_ACTIVE_PORT, where the kernel connects out.
+        // virtio-net. `disable-modern=on` forces the legacy I/O-BAR interface
+        // our driver speaks. Two wirings:
+        //
+        //   Slirp (user-mode networking): no host privilege, CI-friendly, the
+        //   default for every smoke test. slirp answers ARP for the gateway
+        //   (10.0.2.2), which the B5 Step 1 demo relies on. hostfwd forwards
+        //   host 127.0.0.1:TCP_PROBE_PORT → guest :7 (the B5 4b/4c passive tests
+        //   connect in). guestfwd (only for the 4e active-open test) forwards the
+        //   guest's connection to 10.0.2.100:9 → host 127.0.0.1:TCP_ACTIVE_PORT.
+        //
+        //   Tap: a real host TAP device, giving an actual inbound L2 peer so a
+        //   real `ping 10.0.2.15` from the host reaches the kernel's inbound
+        //   ARP/ICMP responders (B5 Step 5). Needs NET_ADMIN + /dev/net/tun.
         .args(["-netdev"])
-        .arg(if guestfwd {
-            format!(
+        .arg(match net {
+            NetMode::Slirp { guestfwd: true } => format!(
                 "user,id=net0,hostfwd=tcp::{TCP_PROBE_PORT}-:7,guestfwd=tcp:10.0.2.100:9-tcp:127.0.0.1:{TCP_ACTIVE_PORT}"
-            )
-        } else {
-            format!("user,id=net0,hostfwd=tcp::{TCP_PROBE_PORT}-:7")
+            ),
+            NetMode::Slirp { guestfwd: false } => {
+                format!("user,id=net0,hostfwd=tcp::{TCP_PROBE_PORT}-:7")
+            }
+            NetMode::Tap { ifname } => {
+                format!("tap,id=net0,ifname={ifname},script=no,downscript=no")
+            }
         })
         .args([
             "-device",
@@ -589,7 +617,12 @@ fn run_qemu() -> Result<()> {
     eprintln!("booting kernel in QEMU (Ctrl-C or Ctrl-A x to quit)...");
     let ovmf_vars = fresh_ovmf_vars(&artifacts, "run")?;
     let blk_disk = fresh_blk_disk(&artifacts, "run")?;
-    let mut cmd = qemu_base_command(&artifacts, &ovmf_vars, &blk_disk, false);
+    let mut cmd = qemu_base_command(
+        &artifacts,
+        &ovmf_vars,
+        &blk_disk,
+        &NetMode::Slirp { guestfwd: false },
+    );
     cmd.args(["-serial", "stdio"]);
     let status = cmd
         .status()
@@ -601,6 +634,154 @@ fn run_qemu() -> Result<()> {
     if !status.success() && status.code() != Some(33) {
         bail!("qemu exited with status: {status}");
     }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// `cargo xtask qemu-tap` — real inbound networking over a host TAP (B5 Step 5)
+//
+// slirp can't give the kernel a genuine inbound L2 peer: it answers ARP/ICMP
+// for its own virtual gateway, but nothing on the host can `ping 10.0.2.15` and
+// reach the *guest's* responders. A TAP device can. This subcommand:
+//
+//   1. brings up a tap0 device, host side 10.0.2.1/24;
+//   2. boots the kernel with `-netdev tap,ifname=tap0` (no slirp);
+//   3. `ping`s 10.0.2.15 from the host in a retry loop while the guest boots;
+//   4. asserts the ping succeeds AND the serial shows "[icmp] answered ping".
+//
+// It needs NET_ADMIN + /dev/net/tun, so it only runs in the Linux dev container
+// launched with `TAP=1 docker/run.sh "cargo xtask qemu-tap"`. The guest reaches
+// its inbound-serve window because, with no slirp gateway, ARP-gateway
+// resolution fails and run_demo() falls into serve_inbound() (see net.rs).
+// ---------------------------------------------------------------------------
+
+const TAP_IFNAME: &str = "tap0";
+const TAP_HOST_IP: &str = "10.0.2.1/24";
+const GUEST_IP: &str = "10.0.2.15";
+
+/// Run `ip <args>`, bailing with context on failure.
+fn ip_cmd(args: &[&str]) -> Result<()> {
+    let status = Command::new("ip")
+        .args(args)
+        .status()
+        .with_context(|| format!("failed to invoke `ip {}`", args.join(" ")))?;
+    if !status.success() {
+        bail!("`ip {}` failed with status: {status}", args.join(" "));
+    }
+    Ok(())
+}
+
+fn tap_setup() -> Result<()> {
+    // Best-effort teardown of a stale tap0 from a previous aborted run, then
+    // create it fresh, give the host an address on the link, and bring it up.
+    let _ = Command::new("ip")
+        .args(["tuntap", "del", "dev", TAP_IFNAME, "mode", "tap"])
+        .status();
+    ip_cmd(&["tuntap", "add", "dev", TAP_IFNAME, "mode", "tap"])?;
+    ip_cmd(&["addr", "add", TAP_HOST_IP, "dev", TAP_IFNAME])?;
+    ip_cmd(&["link", "set", TAP_IFNAME, "up"])?;
+    Ok(())
+}
+
+fn tap_teardown() {
+    let _ = Command::new("ip")
+        .args(["tuntap", "del", "dev", TAP_IFNAME, "mode", "tap"])
+        .status();
+}
+
+fn run_qemu_tap() -> Result<()> {
+    let workspace = workspace_root()?;
+    let artifacts = prepare_qemu_artifacts(&workspace)?;
+    let ovmf_vars = fresh_ovmf_vars(&artifacts, "tap")?;
+    let blk_disk = fresh_blk_disk(&artifacts, "tap")?;
+    let serial_path = artifacts.qemu_dir.join("serial-tap.txt");
+    let _ = std::fs::remove_file(&serial_path);
+
+    tap_setup().context("TAP setup failed — run via `TAP=1 docker/run.sh` (needs NET_ADMIN + /dev/net/tun)")?;
+    // Ensure the TAP device is torn down no matter how we exit below.
+    let result = run_qemu_tap_inner(&artifacts, &ovmf_vars, &blk_disk, &serial_path);
+    tap_teardown();
+    result
+}
+
+fn run_qemu_tap_inner(
+    artifacts: &QemuArtifacts,
+    ovmf_vars: &Path,
+    blk_disk: &Path,
+    serial_path: &Path,
+) -> Result<()> {
+    let mut cmd = qemu_base_command(
+        artifacts,
+        ovmf_vars,
+        blk_disk,
+        &NetMode::Tap {
+            ifname: TAP_IFNAME.to_string(),
+        },
+    );
+    cmd.args(["-serial"])
+        .arg(format!("file:{}", serial_path.display()))
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .stdin(Stdio::null());
+
+    eprintln!("[tap] booting kernel with tap0 (host {TAP_HOST_IP}); pinging guest {GUEST_IP}...");
+    let mut child = cmd.spawn().context("failed to invoke qemu-system-x86_64")?;
+
+    // Ping the guest in a retry loop while it boots into its serve_inbound()
+    // window. Success = a `ping -c1` returns AND the serial shows the kernel
+    // answered (so we know the *guest's* responder replied, not some stray).
+    let mut pinged = false;
+    let deadline = Instant::now() + Duration::from_secs(40);
+    loop {
+        if child.try_wait().context("failed to poll qemu process")?.is_some() {
+            break; // kernel halted (serve window closed)
+        }
+        if !pinged {
+            let ok = Command::new("ping")
+                .args(["-c", "1", "-W", "1", GUEST_IP])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false);
+            if ok {
+                pinged = true;
+                eprintln!("[tap] ping {GUEST_IP}: reply received");
+            }
+        }
+        let answered = std::fs::read_to_string(serial_path)
+            .map(|s| s.contains("[icmp] answered ping"))
+            .unwrap_or(false);
+        if pinged && answered {
+            break; // both signals seen — done early
+        }
+        if Instant::now() >= deadline {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+
+    // Always stop QEMU before the caller tears down tap0 — otherwise QEMU is
+    // still holding the device's fd and `ip tuntap del` races it ("Device or
+    // resource busy"). The kernel may already have halted (serve window closed),
+    // in which case kill/wait are harmless no-ops.
+    let _ = child.kill();
+    let _ = child.wait();
+
+    let serial = std::fs::read_to_string(serial_path).unwrap_or_default();
+    let answered = serial.contains("[icmp] answered ping");
+    if !pinged {
+        bail!("TAP ping failed: no reply from {GUEST_IP} (serial answered={answered})");
+    }
+    if !answered {
+        bail!("TAP ping: host got a reply but the kernel never logged \"[icmp] answered ping\"");
+    }
+    // Confirm the ARP responder fired too (the ping reply implies it, but log it
+    // explicitly so the B5-5 oracle is complete).
+    if serial.contains("[arp] answered who-has 10.0.2.15") {
+        eprintln!("[tap] kernel answered ARP who-has + ICMP echo: ok");
+    }
+    eprintln!("[tap] OK — kernel answered a real inbound ping over TAP (B5 Step 5)");
     Ok(())
 }
 
@@ -1129,7 +1310,7 @@ fn run_qemu_test() -> Result<()> {
     let workspace = workspace_root()?;
     let artifacts = prepare_qemu_artifacts(&workspace)?;
 
-    let serial_dir = workspace.join("target").join("qemu-smoke");
+    let serial_dir = target_dir(&workspace).join("qemu-smoke");
     std::fs::create_dir_all(&serial_dir)
         .with_context(|| format!("failed to create {}", serial_dir.display()))?;
 
@@ -1226,7 +1407,14 @@ fn run_qemu_once(
     };
     let mut active_streams: Vec<std::net::TcpStream> = Vec::new();
 
-    let mut cmd = qemu_base_command(artifacts, ovmf_vars, blk_disk, tcp_probe == TcpProbe::Active);
+    let mut cmd = qemu_base_command(
+        artifacts,
+        ovmf_vars,
+        blk_disk,
+        &NetMode::Slirp {
+            guestfwd: tcp_probe == TcpProbe::Active,
+        },
+    );
     cmd.args(["-serial"])
         .arg(format!("file:{}", serial_path.display()))
         .stdout(Stdio::null())
@@ -1412,8 +1600,7 @@ fn build_kernel(workspace: &Path) -> Result<PathBuf> {
     if !status.success() {
         bail!("kernel build failed");
     }
-    let elf = workspace
-        .join("target")
+    let elf = target_dir(workspace)
         .join("x86_64-unknown-none")
         .join("debug")
         .join("frame-os-kernel");
@@ -1428,7 +1615,7 @@ fn build_kernel(workspace: &Path) -> Result<PathBuf> {
 /// thereafter. The binary branch ships prebuilt UEFI / BIOS bootloader
 /// images, which we just need to copy into our ESP layout.
 fn ensure_limine_binaries(workspace: &Path) -> Result<PathBuf> {
-    let limine_dir = workspace.join("target").join("limine");
+    let limine_dir = target_dir(workspace).join("limine");
     let bootx64 = limine_dir.join("BOOTX64.EFI");
     if bootx64.exists() {
         return Ok(limine_dir);
@@ -1467,10 +1654,10 @@ fn ensure_limine_binaries(workspace: &Path) -> Result<PathBuf> {
 ///   /kernel.elf             ← our compiled kernel
 ///   /limine.conf            ← Limine configuration
 fn build_esp_image(workspace: &Path, kernel_elf: &Path, limine_dir: &Path) -> Result<PathBuf> {
-    let img = workspace.join("target").join("limine-esp.img");
+    let img = target_dir(workspace).join("limine-esp.img");
 
     // Write limine.conf to a temp file we can `mcopy` later.
-    let conf_tmp = workspace.join("target").join("limine.conf");
+    let conf_tmp = target_dir(workspace).join("limine.conf");
     let limine_conf = "\
 # Limine configuration generated by `cargo xtask qemu`.
 # `serial: yes` mirrors Limine's own boot output to the COM1 port so we
@@ -1624,4 +1811,18 @@ fn workspace_root() -> Result<PathBuf> {
         .parent()
         .ok_or_else(|| anyhow!("xtask is not inside a workspace"))?
         .to_path_buf())
+}
+
+/// The directory cargo writes build artifacts into. Honors `CARGO_TARGET_DIR`
+/// (the dev container sets it to `/target`, a named volume kept off the bind
+/// mount), falling back to `<workspace>/target`. Every xtask-derived artifact
+/// path (kernel ELF, ESP image, QEMU scratch dirs, Limine binaries) must route
+/// through here: `build_kernel` runs `cargo build`, which obeys
+/// `CARGO_TARGET_DIR`, so reading the ELF back from a hardcoded
+/// `<workspace>/target` would silently pick up a stale cross-build instead.
+fn target_dir(workspace: &Path) -> PathBuf {
+    match std::env::var_os("CARGO_TARGET_DIR") {
+        Some(dir) => PathBuf::from(dir),
+        None => workspace.join("target"),
+    }
 }

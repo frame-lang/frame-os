@@ -135,6 +135,84 @@ fn store_gateway_mac(frame: &[u8]) {
     unsafe { (*p).copy_from_slice(&frame[22..28]) };
 }
 
+// --- inbound responders (answer who-has + ping; used over TAP) --------------
+
+/// Is `frame` an ARP request asking for *our* IP?
+fn is_arp_request_for_us(frame: &[u8]) -> bool {
+    frame.len() >= 42
+        && frame[12..14] == ETHERTYPE_ARP
+        && frame[20..22] == ARP_OPER_REQUEST
+        && frame[38..42] == GUEST_IP // target protocol addr = us
+}
+
+/// Answer an ARP request for our IP: send a reply (sender = us, target = the
+/// requester). Lets a peer (e.g. a TAP host) resolve our MAC before sending.
+fn send_arp_reply(frame: &[u8]) {
+    let mac = virtio_net::mac();
+    let mut f = [0u8; 42];
+    f[0..6].copy_from_slice(&frame[6..12]); // dst = requester's MAC
+    f[6..12].copy_from_slice(&mac); // src = us
+    f[12..14].copy_from_slice(&ETHERTYPE_ARP);
+    f[14..16].copy_from_slice(&[0x00, 0x01]); // htype = Ethernet
+    f[16..18].copy_from_slice(&ETHERTYPE_IPV4); // ptype = IPv4
+    f[18] = 6;
+    f[19] = 4;
+    f[20..22].copy_from_slice(&ARP_OPER_REPLY);
+    f[22..28].copy_from_slice(&mac); // sender hardware addr = us
+    f[28..32].copy_from_slice(&GUEST_IP); // sender protocol addr = us
+    f[32..38].copy_from_slice(&frame[22..28]); // target hardware addr = requester
+    f[38..42].copy_from_slice(&frame[28..32]); // target protocol addr = requester
+    serial::writeln("[arp] answered who-has 10.0.2.15");
+    virtio_net::tx_frame(&f);
+}
+
+/// Is `frame` an ICMP echo *request* addressed to us?
+fn is_icmp_echo_request_to_us(frame: &[u8]) -> bool {
+    if frame.len() < 14 + 20 + 8
+        || frame[12..14] != ETHERTYPE_IPV4
+        || frame[14] >> 4 != 4
+        || frame[14 + 9] != IP_PROTO_ICMP
+        || frame[30..34] != GUEST_IP
+    {
+        return false;
+    }
+    let icmp = 14 + (frame[14] & 0x0F) as usize * 4;
+    frame.len() > icmp && frame[icmp] == ICMP_ECHO_REQUEST
+}
+
+/// Reply to an ICMP echo request: reflect the datagram with src/dst swapped and
+/// the type set to echo-reply, recomputing both checksums. The id/seq/payload
+/// are echoed back verbatim (so the sender's `ping` matches them).
+fn send_icmp_echo_reply(frame: &[u8]) {
+    let mut f = [0u8; virtio_net::MAX_FRAME];
+    let n = frame.len().min(f.len());
+    f[..n].copy_from_slice(&frame[..n]);
+
+    // Ethernet: dst = the requester (old src), src = us.
+    let mac = virtio_net::mac();
+    f.copy_within(6..12, 0); // dst = old src
+    f[6..12].copy_from_slice(&mac); // src = us
+
+    // IPv4: src = us, dst = the requester (old src); recompute the header checksum.
+    let mut requester_ip = [0u8; 4];
+    requester_ip.copy_from_slice(&f[26..30]);
+    f[26..30].copy_from_slice(&GUEST_IP);
+    f[30..34].copy_from_slice(&requester_ip);
+    f[24..26].copy_from_slice(&[0, 0]);
+    let ip_csum = checksum(&f[14..34]);
+    f[24..26].copy_from_slice(&ip_csum.to_be_bytes());
+
+    // ICMP: echo-reply, recompute the checksum over the message + payload.
+    let icmp = 14 + (f[14] & 0x0F) as usize * 4;
+    f[icmp] = ICMP_ECHO_REPLY;
+    f[icmp + 2..icmp + 4].copy_from_slice(&[0, 0]);
+    let icmp_csum = checksum(&f[icmp..n]);
+    f[icmp + 2..icmp + 4].copy_from_slice(&icmp_csum.to_be_bytes());
+
+    serial::writeln("[icmp] answered ping");
+    virtio_net::tx_frame(&f[..n]);
+}
+
 // --- RX pipeline dispatch (B5 Step 3) --------------------------------------
 
 /// The current frame in the native RX buffer (`RX_FRAME[..RX_LEN]`).
@@ -159,20 +237,29 @@ fn parse_descriptor(frame: &[u8]) -> RxDescriptor {
     d
 }
 
-/// Pipeline leaf (`$Arp`): if this is the gateway's ARP reply, store its MAC
-/// and flag it for the resolution loop.
+/// Pipeline leaf (`$Arp`): if this is the gateway's ARP reply, latch its MAC
+/// (client path); if it's a request for *our* address, answer it (responder
+/// path — used over TAP, where a peer ARPs us before sending).
 pub fn on_arp(_pkt: RxDescriptor) {
     let frame = rx_frame();
     if is_gateway_arp_reply(frame) {
         store_gateway_mac(frame);
         unsafe { (&raw mut ARP_GATEWAY_SEEN).write(true) };
+    } else if is_arp_request_for_us(frame) {
+        send_arp_reply(frame);
     }
 }
 
-/// Pipeline leaf (`$Icmp`): if this is our ping's echo reply, flag it.
+/// Pipeline leaf (`$Icmp`): if it's an echo *request* to us, reply (responder —
+/// answers `ping`); if it's our own ping's echo *reply*, flag it (client path).
 pub fn on_icmp(_pkt: RxDescriptor) {
+    let frame = rx_frame();
+    if is_icmp_echo_request_to_us(frame) {
+        send_icmp_echo_reply(frame);
+        return;
+    }
     let seq = unsafe { (&raw const EXPECTED_PING_SEQ).read() };
-    if is_icmp_echo_reply(rx_frame(), seq) {
+    if is_icmp_echo_reply(frame, seq) {
         unsafe { (&raw mut ICMP_REPLY_SEEN).write(true) };
     }
 }
@@ -327,6 +414,10 @@ pub fn run_demo() {
     serial::write_str("[net] MAC ");
     print_mac(&virtio_net::mac());
     serial::writeln("");
+    // The pump loops below also run the inbound responders (answer ARP-for-us +
+    // ICMP echo), so over a TAP link a host `ping` to 10.0.2.15 is answered
+    // during the net-demo window (B5-3). Over slirp these never fire (no peer
+    // ARPs/pings us); the slirp client demos run as normal.
 
     unsafe {
         (&raw mut ARP_FAILED).write(false);
@@ -336,7 +427,9 @@ pub fn run_demo() {
     interrupts::enable();
     // Construction runs $Incomplete.$>() → first request sent + timer armed.
     let mut arpr = ArpResolver::__create();
-    let overall = interrupts::ticks() + 1000;
+    // slirp answers in a tick or two; cap modestly so a no-gateway link (TAP)
+    // doesn't stall the net demo (the responders still answer pings meanwhile).
+    let overall = interrupts::ticks() + 150;
     while !arpr.is_resolved() && !arpr.is_failed() && interrupts::ticks() < overall {
         if pump() {
             // The RxPipeline classified the frame; on_arp flags a gateway reply.
@@ -352,7 +445,15 @@ pub fn run_demo() {
     interrupts::disable();
 
     if !arpr.is_resolved() {
-        serial::writeln("[net] gateway resolution did not complete");
+        // No gateway answered our ARP. Over slirp this never happens (slirp
+        // always answers for 10.0.2.2), so reaching here means we're on a bare
+        // L2 link with no slirp services — i.e. the TAP path. The slirp client
+        // demos (ping/DHCP/TCP-out) all need the gateway, so skip them; instead
+        // serve inbound for a bounded window so a host `ping 10.0.2.15` reaches
+        // our ARP/ICMP responders (B5 Step 5). The host harness pings during
+        // this window and checks for "[icmp] answered ping".
+        serial::writeln("[net] no gateway (TAP link): serving inbound");
+        serve_inbound();
         return;
     }
     serial::write_str("[arp] resolved 10.0.2.2 -> ");
@@ -377,6 +478,24 @@ pub fn run_demo() {
     // listener — exercising the $SynSent path. Reaches $Established if the
     // harness is listening; a fast RST (no listener) just falls through.
     tcp_connect();
+}
+
+
+/// Serve inbound traffic for a bounded window: pump RX through the RxPipeline,
+/// whose $Arp/$Icmp leaves answer who-has-10.0.2.15 and echo-request-to-us (the
+/// `send_arp_reply`/`send_icmp_echo_reply` responders). Used on the TAP path so
+/// a real host `ping 10.0.2.15` is answered. ~10s (1000 ticks at 100 Hz) gives
+/// the host harness ample time to bring its side up and ping after the guest
+/// boots. Returns when the window expires (then run_demo halts the kernel).
+fn serve_inbound() {
+    interrupts::enable();
+    let deadline = interrupts::ticks() + 1000;
+    while interrupts::ticks() < deadline {
+        if !pump() {
+            interrupts::wait_for_interrupt();
+        }
+    }
+    interrupts::disable();
 }
 
 /// Active-open a connection to the gateway:9 (slirp guestfwd → host listener)

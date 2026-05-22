@@ -53,11 +53,16 @@ The networking tests that need a real inbound L2 peer (answering `ping`, IP
 reassembly) require a TAP device + `NET_ADMIN`. Set `TAP=1`:
 
 ```sh
-TAP=1 docker/run.sh "<networking command>"
+TAP=1 docker/run.sh "cargo xtask qemu-tap"   # B5-3: ping the guest over tap0
 ```
 
 which adds `--cap-add=NET_ADMIN --device /dev/net/tun`. (Without it, the
 container has no TAP and the build/QEMU-slirp tests run unprivileged as usual.)
+
+`cargo xtask qemu-tap` brings up `tap0` (host side `10.0.2.1/24`), boots the
+kernel with `-netdev tap`, `ping`s the guest at `10.0.2.15`, and asserts both a
+reply and `[icmp] answered ping` in the serial capture — i.e. the *guest's*
+inbound ARP + ICMP responders answered a real L2 peer (which slirp can't be).
 
 ## Notes
 
