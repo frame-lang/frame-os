@@ -29,6 +29,7 @@ const FRAME_SYSTEMS: &[(&str, &str)] = &[
     ("rx_pipeline", "rx_pipeline.frs"),
     ("udp_socket", "udp_socket.frs"),
     ("tcp_connection", "tcp_connection.frs"),
+    ("ip_reassembly", "ip_reassembly.frs"),
 ];
 
 fn main() -> Result<()> {

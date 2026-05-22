@@ -36,6 +36,7 @@ mod fs;
 mod gdt;
 mod interrupts;
 mod io;
+mod ip_reasm;
 mod net;
 mod paging;
 mod pci;

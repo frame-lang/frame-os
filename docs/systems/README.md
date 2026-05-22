@@ -50,6 +50,7 @@ These run inside the bare-metal kernel image. They do not appear in the hosted-m
 | [`RxPipeline`](rx_pipeline.md) | B5 | Documented | Classify a received frame and dispatch it: `$Idle → $Classifying → ($Arp \| $Ipv4 → $Icmp \| $Udp)`, threading a parsed `RxDescriptor` down the graph via enter params. The marquee data-pipeline recipe. |
 | [`UdpSocket`](udp_socket.md) | B5 | Documented | One UDP socket's bind lifecycle: `$Unbound → $Bound`. `recv()` is gated to `$Bound` (bind state as the invariant). The `RxPipeline` `$Udp` leaf delivers to it; drives the DHCP exchange. |
 | [`TcpConnection`](tcp_connection.md) | B5 | Documented (FSM; live handshake at 4b–4d) | The full RFC-793 state machine: 11 states under an `$Open` parent funneling RST → `$Closed`. The deepest Frame system; segments processed per-state, timers via enter handlers. |
+| [`IpReassembly`](ip_reassembly.md) | B5 | Documented | Reassemble a fragmented IPv4 datagram: `$Idle → $Reassembling → ($Complete \| $Expired)`, threading a `Fragment` via enter params (self-transition re-store). The second data-pipeline; validated by a real `ping -s 4000` over TAP. |
 
 ## Shared systems
 

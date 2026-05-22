@@ -175,6 +175,7 @@ const DIAGRAMS: &[(&str, &str)] = &[
     ("rx_pipeline.frs", "rx_pipeline.svg"),
     ("udp_socket.frs", "udp_socket.svg"),
     ("tcp_connection.frs", "tcp_connection.svg"),
+    ("ip_reassembly.frs", "ip_reassembly.svg"),
 ];
 
 fn diagrams(mode: DiagramMode) -> Result<()> {
@@ -727,33 +728,37 @@ fn run_qemu_tap_inner(
     eprintln!("[tap] booting kernel with tap0 (host {TAP_HOST_IP}); pinging guest {GUEST_IP}...");
     let mut child = cmd.spawn().context("failed to invoke qemu-system-x86_64")?;
 
-    // Ping the guest in a retry loop while it boots into its serve_inbound()
-    // window. Success = a `ping -c1` returns AND the serial shows the kernel
-    // answered (so we know the *guest's* responder replied, not some stray).
-    let mut pinged = false;
-    let deadline = Instant::now() + Duration::from_secs(40);
+    // Two probes during the guest's serve_inbound() window, each retried while it
+    // boots. Success of each = a `ping` reply returns AND the serial confirms the
+    // *guest* did the work (so we know the guest's responder/reassembly replied):
+    //   1. a normal ping  → "[icmp] answered ping"            (B5-3, single frame)
+    //   2. a 4000-byte ping (fragments at the 1500 MTU)       (B5-5, reassembly)
+    //      → the guest reassembles ("[ip] reassembled …"), replies, and re-fragments
+    //        the >MTU reply outbound so the host's ping round-trips.
+    let mut small_ping = false;
+    let mut frag_ping = false;
+    let deadline = Instant::now() + Duration::from_secs(45);
     loop {
         if child.try_wait().context("failed to poll qemu process")?.is_some() {
             break; // kernel halted (serve window closed)
         }
-        if !pinged {
-            let ok = Command::new("ping")
-                .args(["-c", "1", "-W", "1", GUEST_IP])
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status()
-                .map(|s| s.success())
-                .unwrap_or(false);
-            if ok {
-                pinged = true;
+        if !small_ping {
+            if ping_once(GUEST_IP, None) {
+                small_ping = true;
                 eprintln!("[tap] ping {GUEST_IP}: reply received");
             }
+        } else if !frag_ping {
+            // Fragmented ping: -s 4000 → ~4028-byte datagram → 3 IP fragments.
+            if ping_once(GUEST_IP, Some(4000)) {
+                frag_ping = true;
+                eprintln!("[tap] ping -s 4000 {GUEST_IP}: reassembled round-trip ok");
+            }
         }
-        let answered = std::fs::read_to_string(serial_path)
-            .map(|s| s.contains("[icmp] answered ping"))
-            .unwrap_or(false);
-        if pinged && answered {
-            break; // both signals seen — done early
+        let serial = std::fs::read_to_string(serial_path).unwrap_or_default();
+        let answered = serial.contains("[icmp] answered ping");
+        let reassembled = serial.contains("[ip] reassembled");
+        if small_ping && frag_ping && answered && reassembled {
+            break; // all signals seen — done early
         }
         if Instant::now() >= deadline {
             break;
@@ -770,19 +775,48 @@ fn run_qemu_tap_inner(
 
     let serial = std::fs::read_to_string(serial_path).unwrap_or_default();
     let answered = serial.contains("[icmp] answered ping");
-    if !pinged {
+    let reassembled = serial.contains("[ip] reassembled");
+    if !small_ping {
         bail!("TAP ping failed: no reply from {GUEST_IP} (serial answered={answered})");
     }
     if !answered {
         bail!("TAP ping: host got a reply but the kernel never logged \"[icmp] answered ping\"");
     }
+    if !frag_ping {
+        bail!(
+            "TAP fragmented ping (-s 4000) failed: no reassembled round-trip from {GUEST_IP} \
+             (serial reassembled={reassembled})"
+        );
+    }
+    if !reassembled {
+        bail!(
+            "TAP fragmented ping: host got a reply but the kernel never logged \"[ip] reassembled\""
+        );
+    }
     // Confirm the ARP responder fired too (the ping reply implies it, but log it
-    // explicitly so the B5-5 oracle is complete).
+    // explicitly so the oracle is complete).
     if serial.contains("[arp] answered who-has 10.0.2.15") {
         eprintln!("[tap] kernel answered ARP who-has + ICMP echo: ok");
     }
-    eprintln!("[tap] OK — kernel answered a real inbound ping over TAP (B5 Step 5)");
+    eprintln!("[tap] OK — kernel answered a real inbound ping (B5-3) and reassembled a");
+    eprintln!("[tap]      fragmented ping, fragmenting the reply outbound (B5-5), over TAP");
     Ok(())
+}
+
+/// One `ping -c1` to `ip`, optionally with a payload size (`-s`). Returns whether
+/// a reply came back. A large `-s` forces the request to fragment at the MTU.
+fn ping_once(ip: &str, size: Option<usize>) -> bool {
+    let mut cmd = Command::new("ping");
+    cmd.args(["-c", "1", "-W", "1"]);
+    if let Some(s) = size {
+        cmd.arg("-s").arg(s.to_string());
+    }
+    cmd.arg(ip)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
 }
 
 // ---------------------------------------------------------------------------

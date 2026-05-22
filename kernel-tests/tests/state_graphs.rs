@@ -178,3 +178,11 @@ fn tcp_connection_state_graph_snapshot() {
     };
     insta::assert_snapshot!("tcp_connection_state_graph", dot);
 }
+
+#[test]
+fn ip_reassembly_state_graph_snapshot() {
+    let Some(dot) = frame_to_dot("ip_reassembly.frs") else {
+        return; // framec unavailable; test skipped
+    };
+    insta::assert_snapshot!("ip_reassembly_state_graph", dot);
+}

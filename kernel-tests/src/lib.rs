@@ -375,6 +375,70 @@ pub mod tcp {
     }
 }
 
+/// Host test-double for the kernel's `ip_reasm` module. The generated
+/// `IpReassembly` actions call `crate::ip_reasm::{store, is_complete,
+/// on_complete, on_expired}`, and `fragment(frag)` reads a `Fragment`. Here the
+/// fragment is a plain struct the tests build; `store` counts calls,
+/// `is_complete` is a settable flag (so a test drives the `$Reassembling →
+/// $Complete` guard), and `on_complete`/`on_expired` latch so a test can assert
+/// the terminal action fired. The real reassembly *algorithm* (coverage map,
+/// reconstruction) lives in the kernel and is validated end-to-end by the
+/// `qemu-tap` fragmented ping; these tests pin the FSM's *transitions*.
+pub mod ip_reasm {
+    use std::cell::Cell;
+
+    /// Mirror of the kernel's `crate::ip_reasm::Fragment` — the parsed fragment
+    /// summary threaded into the IpReassembly FSM as an enter param.
+    #[derive(Clone, Copy, Default, Debug)]
+    pub struct Fragment {
+        pub offset: usize,
+        pub len: usize,
+        pub more: bool,
+        pub ident: u16,
+    }
+
+    thread_local! {
+        static STORED: Cell<u32> = const { Cell::new(0) };
+        static COMPLETE: Cell<bool> = const { Cell::new(false) };
+        static COMPLETED: Cell<bool> = const { Cell::new(false) };
+        static EXPIRED: Cell<bool> = const { Cell::new(false) };
+    }
+
+    pub fn store(_frag: Fragment) {
+        STORED.with(|c| c.set(c.get() + 1));
+    }
+    pub fn is_complete() -> bool {
+        COMPLETE.with(|c| c.get())
+    }
+    pub fn on_complete() {
+        COMPLETED.with(|c| c.set(true));
+    }
+    pub fn on_expired() {
+        EXPIRED.with(|c| c.set(true));
+    }
+
+    /// Test control: what the next `is_complete()` guard reports.
+    pub fn set_complete(b: bool) {
+        COMPLETE.with(|c| c.set(b));
+    }
+    /// Test inspectors.
+    pub fn stored() -> u32 {
+        STORED.with(|c| c.get())
+    }
+    pub fn completed() -> bool {
+        COMPLETED.with(|c| c.get())
+    }
+    pub fn expired() -> bool {
+        EXPIRED.with(|c| c.get())
+    }
+    pub fn reset() {
+        STORED.with(|c| c.set(0));
+        COMPLETE.with(|c| c.set(false));
+        COMPLETED.with(|c| c.set(false));
+        EXPIRED.with(|c| c.set(false));
+    }
+}
+
 // Pull in the framec-generated systems. Each generated file ends with
 // `pub use _<name>_framec::*;`, re-exporting the system type at this crate's
 // root. SerialDriver first (Kernel holds one in its domain). Task and
@@ -410,3 +474,7 @@ include!(concat!(env!("OUT_DIR"), "/udp_socket.rs"));
 // TcpConnection (B5 Step 4): the RFC-793 state machine. Actions call
 // crate::tcp::* (the host double above records them); segment() reads seg fields.
 include!(concat!(env!("OUT_DIR"), "/tcp_connection.rs"));
+// IpReassembly (B5 Step 6): the fragment-reassembly lifecycle. Actions call
+// crate::ip_reasm::* (the host double above counts/controls them); fragment()
+// threads a Fragment via enter params (self-transition re-store).
+include!(concat!(env!("OUT_DIR"), "/ip_reassembly.rs"));

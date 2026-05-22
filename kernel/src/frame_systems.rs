@@ -76,3 +76,8 @@ include!(concat!(env!("OUT_DIR"), "/udp_socket.rs"));
 // (segment encode/parse + the connection's seq state + timers). tcp.rs holds the
 // instance; the RxPipeline $Tcp leaf delivers segments to it.
 include!(concat!(env!("OUT_DIR"), "/tcp_connection.rs"));
+// IpReassembly (B5 Step 6): stitch a fragmented IPv4 datagram back together,
+// threading a Fragment descriptor via enter params (self-transition re-store).
+// Actions call crate::ip_reasm::{store,is_complete,on_complete,on_expired};
+// ip_reasm.rs holds the instance + buffer + coverage map.
+include!(concat!(env!("OUT_DIR"), "/ip_reassembly.rs"));

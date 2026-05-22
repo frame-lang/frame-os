@@ -276,7 +276,12 @@ pub fn on_irq() {
 
 /// Transmit one raw Ethernet frame. Prefixes the zeroed virtio_net_hdr, copies
 /// the frame, publishes a single device-readable descriptor on the TX queue,
-/// and notifies. Fire-and-forget (we don't wait on the TX used ring here).
+/// notifies, and **waits for the device to consume the descriptor** before
+/// returning. The wait matters: we reuse one TX buffer + one descriptor, so a
+/// caller transmitting several frames back-to-back (outbound IP fragmentation —
+/// a >MTU reply split into fragments) would otherwise overwrite the buffer while
+/// a frame is still in flight. The spin is bounded so a wedged device can't hang
+/// the kernel; under QEMU TCG the used ring advances within a few iterations.
 pub fn tx_frame(frame: &[u8]) {
     let d = dev();
     if !d.present {
@@ -295,6 +300,24 @@ pub fn tx_frame(frame: &[u8]) {
         avail_push(&mut d.tx, 0);
     }
     io::outw(d.io_base + R_QUEUE_NOTIFY, TX_QUEUE);
+
+    // Wait for the TX used ring to advance (the device finished with our buffer).
+    unsafe {
+        let used = (d.tx.virt + d.tx.used_off) as *const u8;
+        let mut spins: u32 = 0;
+        loop {
+            let used_idx = (used.add(2) as *const u16).read();
+            if used_idx != d.tx.last_used {
+                d.tx.last_used = used_idx;
+                break;
+            }
+            if spins >= 100_000_000 {
+                break; // bounded — don't hang on a misbehaving device
+            }
+            spins += 1;
+            core::hint::spin_loop();
+        }
+    }
 }
 
 /// Drain one received frame, if the RX used ring has advanced. Copies the L2

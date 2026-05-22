@@ -180,12 +180,22 @@ fn is_icmp_echo_request_to_us(frame: &[u8]) -> bool {
     frame.len() > icmp && frame[icmp] == ICMP_ECHO_REQUEST
 }
 
-/// Reply to an ICMP echo request: reflect the datagram with src/dst swapped and
-/// the type set to echo-reply, recomputing both checksums. The id/seq/payload
-/// are echoed back verbatim (so the sender's `ping` matches them).
-fn send_icmp_echo_reply(frame: &[u8]) {
-    let mut f = [0u8; virtio_net::MAX_FRAME];
-    let n = frame.len().min(f.len());
+/// Largest ICMP echo reply we'll build (Eth + IP + a reassembled 8 KiB payload).
+/// A `ping -s 4000` lands here via reassembly; the reply is fragmented on TX.
+const REPLY_MAX: usize = 14 + 20 + 8192;
+static mut REPLY_BUF: [u8; REPLY_MAX] = [0; REPLY_MAX];
+static mut FRAG_OUT: [u8; virtio_net::MAX_FRAME] = [0; virtio_net::MAX_FRAME];
+
+/// Reply to an ICMP echo request held in `frame` (a whole Eth+IP+ICMP datagram —
+/// possibly *larger than the MTU* because it was reassembled). Reflects the
+/// datagram with src/dst swapped and the type set to echo-reply, recomputing
+/// both checksums, then transmits it — fragmenting outbound if it exceeds the
+/// link MTU (so a `ping -s 4000` round-trips). Used by both the single-frame
+/// responder (`on_icmp`) and the reassembled path (`on_reassembled_ipv4`).
+fn reply_to_echo_request(frame: &[u8]) {
+    let n = frame.len().min(REPLY_MAX);
+    let bp = &raw mut REPLY_BUF;
+    let f = unsafe { &mut *bp };
     f[..n].copy_from_slice(&frame[..n]);
 
     // Ethernet: dst = the requester (old src), src = us.
@@ -193,24 +203,76 @@ fn send_icmp_echo_reply(frame: &[u8]) {
     f.copy_within(6..12, 0); // dst = old src
     f[6..12].copy_from_slice(&mac); // src = us
 
-    // IPv4: src = us, dst = the requester (old src); recompute the header checksum.
+    // IPv4: src = us, dst = the requester (old src); clear any frag fields (the
+    // reply is built whole — TX re-fragments) and recompute the header checksum.
+    let ihl = (f[14] & 0x0F) as usize * 4;
     let mut requester_ip = [0u8; 4];
     requester_ip.copy_from_slice(&f[26..30]);
     f[26..30].copy_from_slice(&GUEST_IP);
     f[30..34].copy_from_slice(&requester_ip);
+    f[20..22].copy_from_slice(&[0, 0]); // flags + fragment offset
     f[24..26].copy_from_slice(&[0, 0]);
-    let ip_csum = checksum(&f[14..34]);
+    let ip_csum = checksum(&f[14..14 + ihl]);
     f[24..26].copy_from_slice(&ip_csum.to_be_bytes());
 
     // ICMP: echo-reply, recompute the checksum over the message + payload.
-    let icmp = 14 + (f[14] & 0x0F) as usize * 4;
+    let icmp = 14 + ihl;
     f[icmp] = ICMP_ECHO_REPLY;
     f[icmp + 2..icmp + 4].copy_from_slice(&[0, 0]);
     let icmp_csum = checksum(&f[icmp..n]);
     f[icmp + 2..icmp + 4].copy_from_slice(&icmp_csum.to_be_bytes());
 
     serial::writeln("[icmp] answered ping");
-    virtio_net::tx_frame(&f[..n]);
+    tx_ipv4_fragmented(&f[..n]);
+}
+
+/// Transmit a complete IPv4 datagram (`frame` = Eth + IP + payload). If it fits
+/// the link MTU, send it as one frame; otherwise split the IP payload into
+/// MTU-sized, 8-byte-aligned fragments (MF set on all but the last), each with
+/// its own IP header (fragment offset + recomputed checksum). The mirror of the
+/// inbound reassembly path — needed because a reassembled echo reply is > MTU.
+fn tx_ipv4_fragmented(frame: &[u8]) {
+    let n = frame.len();
+    if n <= virtio_net::MAX_FRAME {
+        virtio_net::tx_frame(frame);
+        return;
+    }
+    let ihl = (frame[14] & 0x0F) as usize * 4;
+    let payload_start = 14 + ihl;
+    let payload = &frame[payload_start..n];
+    // Largest payload per fragment: fill the MTU, rounded down to a multiple of 8
+    // (IP fragment offsets are in 8-byte units).
+    let max_chunk = ((virtio_net::MAX_FRAME - 14 - ihl) / 8) * 8;
+
+    let mut off = 0;
+    while off < payload.len() {
+        let chunk = (payload.len() - off).min(max_chunk);
+        let more = off + chunk < payload.len();
+        let op = &raw mut FRAG_OUT;
+        let out = unsafe { &mut *op };
+        out[..14].copy_from_slice(&frame[..14]); // Ethernet header
+        out[14..payload_start].copy_from_slice(&frame[14..payload_start]); // IP header
+        out[payload_start..payload_start + chunk].copy_from_slice(&payload[off..off + chunk]);
+        // IP header fixups: total length, flags/frag-offset, checksum.
+        let ip_total = (ihl + chunk) as u16;
+        out[16..18].copy_from_slice(&ip_total.to_be_bytes());
+        let frag_field = (if more { 0x2000u16 } else { 0 }) | ((off / 8) as u16 & 0x1FFF);
+        out[20..22].copy_from_slice(&frag_field.to_be_bytes());
+        out[24..26].copy_from_slice(&[0, 0]);
+        let csum = checksum(&out[14..14 + ihl]);
+        out[24..26].copy_from_slice(&csum.to_be_bytes());
+        virtio_net::tx_frame(&out[..payload_start + chunk]);
+        off += chunk;
+    }
+}
+
+/// Entry point for a reassembled IPv4 datagram (called by `ip_reasm` once all
+/// fragments arrive). The datagram is whole again; if it's an ICMP echo request
+/// to us, reply to it (the reply is re-fragmented on TX).
+pub fn on_reassembled_ipv4(frame: &[u8]) {
+    if is_icmp_echo_request_to_us(frame) {
+        reply_to_echo_request(frame);
+    }
 }
 
 // --- RX pipeline dispatch (B5 Step 3) --------------------------------------
@@ -254,8 +316,14 @@ pub fn on_arp(_pkt: RxDescriptor) {
 /// answers `ping`); if it's our own ping's echo *reply*, flag it (client path).
 pub fn on_icmp(_pkt: RxDescriptor) {
     let frame = rx_frame();
+    // Fragmented? Feed it to reassembly; the responder runs on the whole
+    // datagram once `ip_reasm` stitches it back together (→ on_reassembled_ipv4).
+    if crate::ip_reasm::parse_fragment(frame).is_some() {
+        crate::ip_reasm::on_fragment(frame);
+        return;
+    }
     if is_icmp_echo_request_to_us(frame) {
-        send_icmp_echo_reply(frame);
+        reply_to_echo_request(frame);
         return;
     }
     let seq = unsafe { (&raw const EXPECTED_PING_SEQ).read() };
@@ -494,6 +562,9 @@ fn serve_inbound() {
         if !pump() {
             interrupts::wait_for_interrupt();
         }
+        // Fire the reassembly timeout if a partial datagram went stale (a lost
+        // fragment shouldn't wedge reassembly until the serve window closes).
+        crate::ip_reasm::drain_timer();
     }
     interrupts::disable();
 }

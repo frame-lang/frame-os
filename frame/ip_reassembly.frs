@@ -1,0 +1,88 @@
+// frame/ip_reassembly.frs
+//
+// IpReassembly — reassemble one fragmented IPv4 datagram (B5 Step 6 / B5-5).
+//
+// A datagram larger than the link MTU arrives as several IP fragments; this
+// system owns the *lifecycle* of stitching them back together, while native
+// (`crate::ip_reasm`) owns the buffer, the per-byte coverage map, and the final
+// datagram reconstruction. It is the second "thread a parsed descriptor via
+// enter params" pipeline (after RxPipeline): each fragment's summary
+// (`Fragment` = offset/len/more/ident) rides the transition into
+// `$Reassembling`, whose enter handler stores it and asks native whether the
+// datagram is now whole.
+//
+// The self-transition is the interesting shape: every additional fragment
+// re-enters `$Reassembling` with fresh enter-param data (`-> (frag)
+// $Reassembling`), so the "store this fragment, am I done yet?" step is the
+// state-entry action and runs once per fragment — data flow that's visible in
+// the diagram rather than buried in a loop.
+//
+// State graph:
+//
+//   $Idle ─ fragment(frag) ─► $Reassembling ─┬─ (complete) ──► $Complete
+//                                ▲  │         └─ timeout ─────► $Expired
+//                                └──┘ fragment(frag)  [self, re-store]
+//
+// (The initial state is `$Idle`, not `$Empty`: framec currently synthesizes a
+// reserved "Empty" context-enum variant, which collides with a user state
+// literally named `$Empty` — a codegen bug worth fixing. `$Idle` is the
+// idiomatic name anyway, matching RxPipeline's "waiting for input" state.)
+//
+//   $Complete → native reconstructs the datagram + dispatches it (e.g. the ICMP
+//   echo responder runs on the whole, reassembled request).
+//   $Expired   → native drops the partial buffer (a fragment was lost / too slow).
+//
+// Native owns the bytes + coverage + reconstruction; Frame owns "have we seen a
+// first fragment, are all the holes filled, did we time out." Guards are native
+// `if` (crate::ip_reasm::is_complete) around the transition.
+
+@@[target("rust")]
+
+@@system IpReassembly {
+    interface:
+        fragment(frag: crate::ip_reasm::Fragment)
+        timeout()
+        state(): String = "Idle".to_string()
+        is_complete(): bool = false
+        is_expired(): bool = false
+
+    machine:
+        $Idle {
+            fragment(frag: crate::ip_reasm::Fragment) {
+                -> (frag) $Reassembling
+            }
+            state(): String { @@:("Idle".to_string()) }
+        }
+
+        $Reassembling {
+            $>(frag: crate::ip_reasm::Fragment) {
+                crate::ip_reasm::store(frag);
+                if crate::ip_reasm::is_complete() {
+                    -> $Complete
+                }
+            }
+            fragment(frag: crate::ip_reasm::Fragment) {
+                -> (frag) $Reassembling
+            }
+            timeout() {
+                -> $Expired
+            }
+            state(): String { @@:("Reassembling".to_string()) }
+        }
+
+        $Complete {
+            $>() {
+                crate::ip_reasm::on_complete();
+            }
+            state(): String { @@:("Complete".to_string()) }
+            is_complete(): bool { @@:(true) }
+        }
+
+        $Expired {
+            $>() {
+                crate::ip_reasm::on_expired();
+            }
+            state(): String { @@:("Expired".to_string()) }
+            is_expired(): bool { @@:(true) }
+        }
+}
