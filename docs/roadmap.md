@@ -603,11 +603,31 @@ connections?
 ### R3 — multi-port USB / orthogonal regions (Frame-relevant)
 
 B6 was single-port/single-device. The roadmap flagged **orthogonal regions
-(multiple ports concurrently)** as a framec gate that B6 didn't exercise. Add hub
-support / multiple `HubPort` + `UsbEnumeration` instances running concurrently
-(e.g. `usb-kbd` + `usb-mouse` + `usb-storage`), and a mass-storage (bulk/SCSI)
-transfer. **Validates:** many concurrent lifecycle FSMs of the same type; the
-"orthogonal regions" question.
+(multiple ports concurrently)** as a framec gate that B6 didn't exercise.
+**Validates:** many concurrent lifecycle FSMs of the same type; the "orthogonal
+regions" question.
+
+- **R3a (multi-port concurrent enumeration) — done.** Refactored `xhci.rs` from
+  single-flight globals to a per-device table (`Device` slots, `CUR_DEV` ambient
+  index — the `tcp.rs` connection-table pattern), so the *unchanged* `HubPort` /
+  `UsbEnumeration` / `UsbTransfer` FSM actions operate on "the current device."
+  Two HID devices (`usb-kbd` on port 5, `usb-mouse` on port 6) are now brought up
+  **concurrently**: one `HubPort` + one `UsbEnumeration` instance per device
+  coexist, and a single driver loop demuxes each xHCI completion to the right
+  instance **by slot** (`dev_by_slot`), pointing `CUR_DEV` at it for the dispatch.
+  Slot assignment is the one serialized step (Enable Slot carries no port, so an
+  *unbound* returned slot is bound to the requesting device); everything after
+  carries the slot and interleaves. Serial: `slot 1 enabled → addressed → slot 2
+  enabled → addressed → configured (slot 1) → configured (slot 2) → enumerated 2
+  of 2 devices`. This is R2b's connection-table answer applied to USB but driven
+  by **real asynchronous hardware completions** rather than synthetic events.
+  Validated by `usb_multiport_r3a`; the four B6 single-device tests still pass
+  (keyboard stays device 0 / slot 1, so the keypress transfer is unaffected).
+- **R3b (mass-storage bulk/SCSI) — remaining.** Add a `usb-storage` device:
+  configure **bulk** IN/OUT endpoints (a new endpoint type vs the HID interrupt-IN),
+  a new `UsbMsd` FSM modeling the Bulk-Only Transport lifecycle (CBW → data → CSW),
+  and drive a SCSI `INQUIRY` / `READ CAPACITY(10)` / `READ(10)` over bulk transfers.
+  A genuinely new device class + transfer type.
 
 ### R7 — message-passing internals: scheduler-as-actor + a per-core reactor (Frame-relevant, near-term)
 

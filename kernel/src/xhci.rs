@@ -105,11 +105,93 @@ pub struct Xhci {
 }
 
 static mut XHCI: Option<Xhci> = None;
-/// The first port found with a device connected (set during `init`), and the
-/// reset-settle deadline armed by `begin_port_reset`. Single-flight, matching
-/// the rest of the B6 demo (one device on one port).
-static mut CONNECTED_PORT: u8 = 0;
-static mut RESET_DEADLINE: u64 = 0;
+
+// --- per-device table (R3a) -------------------------------------------------
+//
+// B6 was single-flight: one device, one port, a pile of `static mut` globals.
+// R3 runs several devices concurrently, so that per-device state moves into a
+// table (`DEVICES`), one slot per attached device. A `CUR_DEV` ambient index —
+// the `tcp.rs` connection-table pattern — lets the *unchanged* `HubPort` /
+// `UsbEnumeration` / `UsbTransfer` FSM actions operate on "the current device":
+// the driver loop points `CUR_DEV` at the device an event belongs to (resolved
+// by xHCI slot) for the duration of that dispatch. The FSM instances never know
+// the table exists; native owns the demux, Frame owns each lifecycle.
+
+/// Max devices we enumerate concurrently (qemu-xhci exposes 8 USB2 + 8 USB3
+/// root-hub ports; a handful of attached devices is plenty for the demo).
+const MAX_DEVICES: usize = 4;
+
+/// One attached device's full enumeration + transfer state (was the B6 globals).
+#[derive(Clone, Copy)]
+struct Device {
+    in_use: bool,
+    port: u8,            // 1-based root-hub port this device sits on
+    slot: u8,            // xHCI slot id (0 until Enable Slot completes)
+    reset_deadline: u64, // HubPort reset-settle deadline (PIT ticks)
+    configured: bool,    // reached UsbEnumeration.$Configured
+    // Enumeration DMA structures.
+    device_ctx_phys: u64,
+    input_ctx_phys: u64,
+    ep0_ring_phys: u64,
+    ep0_enqueue: usize,
+    ep0_pcs: u32,
+    desc_buf_phys: u64,
+    // Interrupt-IN transfer (HID) structures.
+    ep1_ring_phys: u64,
+    ep1_enqueue: usize,
+    ep1_pcs: u32,
+    report_buf_phys: u64,
+}
+
+const DEVICE_INIT: Device = Device {
+    in_use: false,
+    port: 0,
+    slot: 0,
+    reset_deadline: 0,
+    configured: false,
+    device_ctx_phys: 0,
+    input_ctx_phys: 0,
+    ep0_ring_phys: 0,
+    ep0_enqueue: 0,
+    ep0_pcs: 1,
+    desc_buf_phys: 0,
+    ep1_ring_phys: 0,
+    ep1_enqueue: 0,
+    ep1_pcs: 1,
+    report_buf_phys: 0,
+};
+
+static mut DEVICES: [Device; MAX_DEVICES] = [DEVICE_INIT; MAX_DEVICES];
+/// The device the current FSM dispatch operates on (set by the driver loop).
+static mut CUR_DEV: usize = 0;
+
+fn cur_dev() -> usize {
+    unsafe { (&raw const CUR_DEV).read() }
+}
+fn set_cur_dev(i: usize) {
+    unsafe { (&raw mut CUR_DEV).write(i) };
+}
+fn dslot(i: usize) -> *mut Device {
+    let base = &raw mut DEVICES as *mut Device;
+    unsafe { base.add(i) }
+}
+/// The current device (the one the executing FSM action belongs to).
+fn curdev() -> *mut Device {
+    dslot(cur_dev())
+}
+/// Find the device-table index whose assigned xHCI slot is `slot`, if any.
+fn dev_by_slot(slot: u8) -> Option<usize> {
+    (0..MAX_DEVICES).find(|&i| {
+        let d = dslot(i);
+        unsafe { (*d).in_use && (*d).slot == slot }
+    })
+}
+/// Number of attached devices seeded into the table by `init` (contiguous 0..n).
+fn device_count() -> usize {
+    (0..MAX_DEVICES)
+        .filter(|&i| unsafe { (*dslot(i)).in_use })
+        .count()
+}
 
 /// The initialized controller, if `init()` succeeded.
 #[allow(dead_code)]
@@ -287,15 +369,21 @@ pub fn init() -> bool {
         event_ccs: 1,
     };
 
-    // 7. Report connected ports (the usb-kbd attaches to one of them).
+    // 7. Report connected ports and seed the device table — one slot per attached
+    // device, up to MAX_DEVICES (R3a). Each becomes an independent enumeration
+    // lifecycle. (B6 had a single CONNECTED_PORT; the table generalizes it.)
     let mut connected = 0u32;
     for port in 1..=max_ports {
         let sc = xhci.portsc(port);
         if sc & PORTSC_CCS != 0 {
-            connected += 1;
-            if unsafe { (&raw const CONNECTED_PORT).read() } == 0 {
-                unsafe { (&raw mut CONNECTED_PORT).write(port) }; // first connected port
+            if (connected as usize) < MAX_DEVICES {
+                let d = dslot(connected as usize);
+                unsafe {
+                    (*d).in_use = true;
+                    (*d).port = port;
+                }
             }
+            connected += 1;
             serial::write_str("[usb] device connected on port ");
             serial::write_u32_decimal(port as u32);
             serial::write_str(" (PORTSC ");
@@ -485,7 +573,7 @@ pub fn begin_port_reset(port: u8) {
     if let Some(x) = controller() {
         x.begin_reset(port);
     }
-    unsafe { (&raw mut RESET_DEADLINE).write(interrupts::ticks() + RESET_SETTLE_TICKS) };
+    unsafe { (*curdev()).reset_deadline = interrupts::ticks() + RESET_SETTLE_TICKS };
     serial::write_str("[usb] resetting port ");
     serial::write_u32_decimal(port as u32);
     serial::writeln("");
@@ -508,27 +596,55 @@ fn port_reset_done(port: u8) -> bool {
 /// (enabled | timeout). Called from kmain after `init()`. Single-flight (the one
 /// device detected at bring-up).
 pub fn run_port_lifecycle() {
-    let port = unsafe { (&raw const CONNECTED_PORT).read() };
-    if port == 0 {
-        return; // no device connected
+    let n = device_count();
+    if n == 0 {
+        return; // no devices connected
     }
 
     interrupts::enable();
-    let mut hp = HubPort::__create();
-    hp.connect(port); // -> $Connected
-    hp.reset(); // -> $Resetting ($> asserts PR + arms the settle deadline)
+
+    // Bring every attached port up *concurrently*: N HubPort instances coexist,
+    // each pinned to its device via CUR_DEV. We assert reset on all ports first
+    // (each $Resetting.$> arms that device's own settle deadline), then poll the
+    // controller until every port is enabled or its deadline passes. (R3a — the
+    // orthogonal-regions question: many concurrent lifecycle FSMs of one type.)
+    let mut hp: [Option<HubPort>; MAX_DEVICES] = [None, None, None, None];
+    let mut done = [false; MAX_DEVICES];
+    for (d, cell) in hp.iter_mut().enumerate().take(n) {
+        set_cur_dev(d);
+        let port = unsafe { (*dslot(d)).port };
+        let mut h = HubPort::__create();
+        h.connect(port); // -> $Connected
+        h.reset(); // -> $Resetting ($> asserts PR + arms this device's deadline)
+        *cell = Some(h);
+    }
 
     loop {
-        if port_reset_done(port) {
-            hp.reset_complete(); // -> $Enabled ($> logs)
-            if let Some(x) = controller() {
-                x.clear_port_changes(port); // ack the reset-change bits
+        let mut all_done = true;
+        for d in 0..n {
+            if done[d] {
+                continue;
             }
-            break;
+            set_cur_dev(d);
+            let port = unsafe { (*dslot(d)).port };
+            let h = hp[d].as_mut().unwrap();
+            if port_reset_done(port) {
+                h.reset_complete(); // -> $Enabled ($> logs)
+                if let Some(x) = controller() {
+                    x.clear_port_changes(port); // ack the reset-change bits
+                }
+                done[d] = true;
+            } else if interrupts::ticks() >= unsafe { (*dslot(d)).reset_deadline } {
+                h.timeout(); // -> $Connected
+                serial::write_str("[usb] port ");
+                serial::write_u32_decimal(port as u32);
+                serial::writeln(" reset timed out");
+                done[d] = true;
+            } else {
+                all_done = false;
+            }
         }
-        if interrupts::ticks() >= unsafe { (&raw const RESET_DEADLINE).read() } {
-            hp.timeout(); // -> $Connected
-            serial::writeln("[usb] port reset timed out");
+        if all_done {
             break;
         }
         interrupts::wait_for_interrupt();
@@ -567,22 +683,8 @@ const TRT_IN: u32 = 3 << 16; // Setup Stage transfer type = IN data stage
 
 const EP0_DCI: u32 = 1; // Endpoint 0 Device Context Index (the control endpoint)
 
-// Enumeration state (single-flight).
-static mut ENUM_SLOT: u8 = 0;
-static mut DEVICE_CTX_PHYS: u64 = 0;
-static mut INPUT_CTX_PHYS: u64 = 0;
-static mut EP0_RING_PHYS: u64 = 0;
-// EP0 transfer-ring producer cursor + a DMA buffer for descriptor data.
-static mut EP0_ENQUEUE: usize = 0;
-static mut EP0_PCS: u32 = 1;
-static mut DESC_BUF_PHYS: u64 = 0;
-// Transfer state (B6 Step 4): the configured device's slot, the interrupt
-// endpoint's (EP1-IN) transfer ring + cursor, and a DMA buffer for the report.
-static mut CONFIGURED_SLOT: u8 = 0;
-static mut EP1_RING_PHYS: u64 = 0;
-static mut EP1_ENQUEUE: usize = 0;
-static mut EP1_PCS: u32 = 1;
-static mut REPORT_BUF_PHYS: u64 = 0;
+// Enumeration + transfer state is now per-device in the `DEVICES` table (R3a);
+// each action reads/writes `(*curdev())`, the device the current dispatch is for.
 
 fn trb_type(d3: u32) -> u32 {
     (d3 >> 10) & 0x3F
@@ -620,7 +722,7 @@ pub fn address_device(slot: u8) {
     serial::write_u32_decimal(slot as u32);
     serial::writeln(" enabled");
 
-    let port = unsafe { (&raw const CONNECTED_PORT).read() };
+    let port = unsafe { (*curdev()).port };
     let Some(x) = controller() else { return };
     let speed = (x.portsc(port) >> 10) & 0xF;
     let mps = ep0_mps(speed);
@@ -657,10 +759,13 @@ pub fn address_device(slot: u8) {
     }
 
     unsafe {
-        (&raw mut ENUM_SLOT).write(slot);
-        (&raw mut DEVICE_CTX_PHYS).write(devctx);
-        (&raw mut INPUT_CTX_PHYS).write(ictx);
-        (&raw mut EP0_RING_PHYS).write(ep0);
+        let d = curdev();
+        (*d).slot = slot;
+        (*d).device_ctx_phys = devctx;
+        (*d).input_ctx_phys = ictx;
+        (*d).ep0_ring_phys = ep0;
+        (*d).ep0_enqueue = 0;
+        (*d).ep0_pcs = 1;
     }
 
     // Address Device command: input context pointer + slot id.
@@ -676,9 +781,10 @@ pub fn address_device(slot: u8) {
 /// Enqueue a TRB on the EP0 control transfer ring (cycle bit stamped from our
 /// EP0 producer cycle state), following the Link TRB at the end of the ring.
 fn enqueue_ep0(d0: u32, d1: u32, d2: u32, ctrl: u32) {
-    let ring_phys = unsafe { (&raw const EP0_RING_PHYS).read() };
-    let mut enq = unsafe { (&raw const EP0_ENQUEUE).read() };
-    let mut pcs = unsafe { (&raw const EP0_PCS).read() };
+    let d = curdev();
+    let ring_phys = unsafe { (*d).ep0_ring_phys };
+    let mut enq = unsafe { (*d).ep0_enqueue };
+    let mut pcs = unsafe { (*d).ep0_pcs };
     let ring = frames::phys_to_virt(ring_phys);
     if enq >= RING_TRBS - 1 {
         let link = unsafe { ring.add((RING_TRBS - 1) * TRB_SIZE) };
@@ -694,8 +800,8 @@ fn enqueue_ep0(d0: u32, d1: u32, d2: u32, ctrl: u32) {
         write_volatile(slot.add(12) as *mut u32, ctrl | pcs);
     }
     unsafe {
-        (&raw mut EP0_ENQUEUE).write(enq + 1);
-        (&raw mut EP0_PCS).write(pcs);
+        (*d).ep0_enqueue = enq + 1;
+        (*d).ep0_pcs = pcs;
     }
 }
 
@@ -707,15 +813,15 @@ pub fn get_device_descriptor(slot: u8) {
     serial::write_u32_decimal(slot as u32);
     serial::writeln(")");
 
-    // Allocate the descriptor DMA buffer once.
-    if unsafe { (&raw const DESC_BUF_PHYS).read() } == 0 {
+    // Allocate the descriptor DMA buffer once (per device).
+    if unsafe { (*curdev()).desc_buf_phys } == 0 {
         if let Some(b) = alloc_zeroed_page() {
-            unsafe { (&raw mut DESC_BUF_PHYS).write(b) };
+            unsafe { (*curdev()).desc_buf_phys = b };
         } else {
             return;
         }
     }
-    let buf = unsafe { (&raw const DESC_BUF_PHYS).read() };
+    let buf = unsafe { (*curdev()).desc_buf_phys };
 
     // Setup packet: bmRequestType=0x80 (IN, standard, device), bRequest=6
     // (GET_DESCRIPTOR), wValue=0x0100 (Device descriptor, index 0), wLength=18.
@@ -735,7 +841,7 @@ pub fn get_device_descriptor(slot: u8) {
 /// Parse + log the device descriptor read by the GET_DESCRIPTOR transfer
 /// (idVendor @ offset 8, idProduct @ 10 — little-endian).
 pub fn read_device_descriptor() {
-    let buf = unsafe { (&raw const DESC_BUF_PHYS).read() };
+    let buf = unsafe { (*curdev()).desc_buf_phys };
     if buf == 0 {
         return;
     }
@@ -767,7 +873,7 @@ pub fn set_configuration(slot: u8) {
 /// `UsbEnumeration.$Configured.$>`: the device is configured and usable. Latch
 /// the slot so the transfer step (B6 Step 4) can address the device.
 pub fn on_configured(slot: u8) {
-    unsafe { (&raw mut CONFIGURED_SLOT).write(slot) };
+    unsafe { (*curdev()).configured = true };
     serial::write_str("[usb] device configured (slot ");
     serial::write_u32_decimal(slot as u32);
     serial::writeln(")");
@@ -783,7 +889,7 @@ pub fn on_configured(slot: u8) {
 /// endpoint), allocate its transfer ring, and issue a Configure Endpoint command
 /// so the controller will service interrupt transfers on it. Non-blocking.
 fn configure_endpoint(slot: u8) {
-    let port = unsafe { (&raw const CONNECTED_PORT).read() };
+    let port = unsafe { (*curdev()).port };
     let Some(x) = controller() else { return };
     let speed = (x.portsc(port) >> 10) & 0xF;
     let cs = if x.ctx_64 { 64usize } else { 32 };
@@ -791,9 +897,10 @@ fn configure_endpoint(slot: u8) {
     let Some(ep1) = alloc_zeroed_page() else { return };
     write_link_trb(ep1, ep1);
     unsafe {
-        (&raw mut EP1_RING_PHYS).write(ep1);
-        (&raw mut EP1_ENQUEUE).write(0);
-        (&raw mut EP1_PCS).write(1);
+        let d = curdev();
+        (*d).ep1_ring_phys = ep1;
+        (*d).ep1_enqueue = 0;
+        (*d).ep1_pcs = 1;
     }
 
     let Some(ictx) = alloc_zeroed_page() else { return };
@@ -832,21 +939,22 @@ fn configure_endpoint(slot: u8) {
 /// the EP1 doorbell. The keyboard completes it with a Transfer Event when a key
 /// report arrives (driven by the harness's injected keypress).
 pub fn queue_interrupt_in() {
-    // Report DMA buffer (allocate once).
-    if unsafe { (&raw const REPORT_BUF_PHYS).read() } == 0 {
+    // Report DMA buffer (allocate once, per device).
+    if unsafe { (*curdev()).report_buf_phys } == 0 {
         if let Some(b) = alloc_zeroed_page() {
-            unsafe { (&raw mut REPORT_BUF_PHYS).write(b) };
+            unsafe { (*curdev()).report_buf_phys = b };
         } else {
             return;
         }
     }
-    let buf = unsafe { (&raw const REPORT_BUF_PHYS).read() };
-    let slot = unsafe { (&raw const CONFIGURED_SLOT).read() };
+    let buf = unsafe { (*curdev()).report_buf_phys };
+    let slot = unsafe { (*curdev()).slot };
 
     // Normal TRB on the EP1 ring: 8-byte boot report, IOC + ISP.
-    let ring_phys = unsafe { (&raw const EP1_RING_PHYS).read() };
-    let mut enq = unsafe { (&raw const EP1_ENQUEUE).read() };
-    let mut pcs = unsafe { (&raw const EP1_PCS).read() };
+    let d = curdev();
+    let ring_phys = unsafe { (*d).ep1_ring_phys };
+    let mut enq = unsafe { (*d).ep1_enqueue };
+    let mut pcs = unsafe { (*d).ep1_pcs };
     let ring = frames::phys_to_virt(ring_phys);
     if enq >= RING_TRBS - 1 {
         let link = unsafe { ring.add((RING_TRBS - 1) * TRB_SIZE) };
@@ -863,8 +971,8 @@ pub fn queue_interrupt_in() {
         write_volatile(trb.add(12) as *mut u32, (TRB_NORMAL << 10) | (1 << 5) | (1 << 2) | pcs);
     }
     unsafe {
-        (&raw mut EP1_ENQUEUE).write(enq + 1);
-        (&raw mut EP1_PCS).write(pcs);
+        (*d).ep1_enqueue = enq + 1;
+        (*d).ep1_pcs = pcs;
     }
 
     if let Some(x) = controller() {
@@ -876,7 +984,7 @@ pub fn queue_interrupt_in() {
 /// `UsbTransfer.$Complete.$>`: the interrupt transfer completed — read + log the
 /// 8-byte HID boot keyboard report (byte 0 = modifiers, byte 2 = first keycode).
 pub fn on_report() {
-    let buf = unsafe { (&raw const REPORT_BUF_PHYS).read() };
+    let buf = unsafe { (*curdev()).report_buf_phys };
     if buf == 0 {
         return;
     }
@@ -909,8 +1017,9 @@ fn wait_cmd_completion(deadline: u64) -> bool {
 /// endpoint, then complete one interrupt-IN transfer through the `UsbTransfer`
 /// Frame system. Called from kmain after enumeration reaches `$Configured`.
 pub fn run_transfer() {
-    let slot = unsafe { (&raw const CONFIGURED_SLOT).read() };
-    if slot == 0 {
+    set_cur_dev(0);
+    let slot = unsafe { (*dslot(0)).slot };
+    if !unsafe { (*dslot(0)).configured } || slot == 0 {
         return; // device not configured
     }
     interrupts::enable();
@@ -951,54 +1060,124 @@ pub fn run_transfer() {
     interrupts::disable();
 }
 
-/// Drive the connected, enabled device through enumeration. Creates the
-/// `UsbEnumeration` FSM (which kicks Enable Slot in `$Powered`'s enter handler),
-/// then dequeues command-completion events and dispatches the matching FSM event
-/// until the device is addressed (or a command fails / the deadline passes).
+/// Advance one device's `UsbEnumeration` FSM on a completion event, given the
+/// event's TRB type + completion code. `CUR_DEV` must already point at this
+/// device (so the FSM's enter-handler actions touch the right device's state).
+/// This is the B6 single-device milestone dispatch, now keyed per device.
+fn advance_enum(e: &mut UsbEnumeration, ty: u32, code: u32, slot: u8) {
+    if ty == TRB_CMD_COMPLETION {
+        if code != COMPLETION_SUCCESS {
+            e.fail();
+            return;
+        }
+        match e.state().as_str() {
+            "Powered" => e.slot_enabled(slot), // → $SlotEnabled (issues Address Device)
+            "SlotEnabled" => e.addressed(),    // → $AddressAssigned (issues GET_DESCRIPTOR)
+            _ => {}
+        }
+    } else if ty == TRB_TRANSFER_EVENT {
+        // A short packet on an IN transfer (fewer bytes than requested) is a
+        // normal completion, not a failure.
+        if code != COMPLETION_SUCCESS && code != COMPLETION_SHORT_PACKET {
+            e.fail();
+            return;
+        }
+        match e.state().as_str() {
+            "AddressAssigned" => e.device_described(), // → $DeviceDescribed (SET_CONFIG)
+            "DeviceDescribed" => e.configured(),       // → $Configured
+            _ => {}
+        }
+    }
+}
+
+/// Enumerate every attached device **concurrently** (R3a). One `UsbEnumeration`
+/// instance per device coexists in the `e` table; the single driver loop demuxes
+/// each xHCI completion to the right instance by slot (`dev_by_slot`), pointing
+/// `CUR_DEV` at it for the dispatch. This is the connection-table pattern (R2b)
+/// applied to USB — but driven by *real asynchronous hardware completions* rather
+/// than synthetic events: the "many concurrent lifecycle FSMs of one type" /
+/// orthogonal-regions question, on hardware.
+///
+/// Slot assignment is the one serialized step: Enable Slot's completion carries
+/// no port, so only one is outstanding at a time and an *unbound* returned slot
+/// is bound to the requesting device. Everything after (Address Device, the EP0
+/// descriptor + SET_CONFIG transfers) carries the slot, so it interleaves freely.
 pub fn run_enumeration() {
-    if unsafe { (&raw const CONNECTED_PORT).read() } == 0 {
+    let n = device_count();
+    if n == 0 {
         return;
     }
     interrupts::enable();
-    let mut e = UsbEnumeration::__create(); // $Powered.$> → Enable Slot
-    let deadline = interrupts::ticks() + 200;
+    let mut e: [Option<UsbEnumeration>; MAX_DEVICES] = [None, None, None, None];
 
-    while interrupts::ticks() < deadline {
+    // Phase A — assign a slot to each device (one Enable Slot outstanding).
+    for d in 0..n {
+        set_cur_dev(d);
+        e[d] = Some(UsbEnumeration::__create()); // $Powered.$> → Enable Slot
+        let deadline = interrupts::ticks() + 200;
+        let mut assigned = false;
+        while !assigned && interrupts::ticks() < deadline {
+            if let Some(ev) = controller().and_then(|x| x.poll_event()) {
+                let ty = trb_type(ev[3]);
+                let code = completion_code(ev[2]);
+                let slot = event_slot(ev[3]);
+                if ty == TRB_CMD_COMPLETION
+                    && code == COMPLETION_SUCCESS
+                    && dev_by_slot(slot).is_none()
+                {
+                    // An unbound slot → this device's Enable Slot result.
+                    set_cur_dev(d);
+                    e[d].as_mut().unwrap().slot_enabled(slot); // → Address Device
+                    unsafe { (*dslot(d)).slot = slot };
+                    assigned = true;
+                } else if let Some(other) = dev_by_slot(slot) {
+                    // A bound slot → another device's later completion; advance it.
+                    set_cur_dev(other);
+                    advance_enum(e[other].as_mut().unwrap(), ty, code, slot);
+                }
+            } else {
+                interrupts::wait_for_interrupt();
+            }
+        }
+        if !assigned {
+            serial::writeln("[usb] enable slot timed out");
+            set_cur_dev(d);
+            e[d].as_mut().unwrap().fail();
+        }
+    }
+
+    // Phase B — interleave the remaining stages until every device is done.
+    let deadline = interrupts::ticks() + 400;
+    loop {
+        let all_done = (0..n).all(|d| {
+            let inst = e[d].as_mut().unwrap();
+            inst.is_configured() || inst.is_failed()
+        });
+        if all_done || interrupts::ticks() >= deadline {
+            break;
+        }
         if let Some(ev) = controller().and_then(|x| x.poll_event()) {
             let ty = trb_type(ev[3]);
             let code = completion_code(ev[2]);
-            if ty == TRB_CMD_COMPLETION {
-                if code != COMPLETION_SUCCESS {
-                    serial::writeln("[usb] command failed during enumeration");
-                    e.fail();
-                    break;
-                }
-                let slot = event_slot(ev[3]);
-                match e.state().as_str() {
-                    "Powered" => e.slot_enabled(slot), // → $SlotEnabled (issues Address Device)
-                    "SlotEnabled" => e.addressed(),    // → $AddressAssigned (issues GET_DESCRIPTOR)
-                    _ => {}
-                }
-            } else if ty == TRB_TRANSFER_EVENT {
-                // A short packet on an IN transfer (fewer bytes than requested)
-                // is a normal completion, not a failure.
-                if code != COMPLETION_SUCCESS && code != COMPLETION_SHORT_PACKET {
-                    serial::writeln("[usb] control transfer failed during enumeration");
-                    e.fail();
-                    break;
-                }
-                match e.state().as_str() {
-                    "AddressAssigned" => e.device_described(), // → $DeviceDescribed (SET_CONFIG)
-                    "DeviceDescribed" => e.configured(),       // → $Configured
-                    _ => {}
-                }
+            let slot = event_slot(ev[3]);
+            if let Some(d) = dev_by_slot(slot) {
+                set_cur_dev(d);
+                advance_enum(e[d].as_mut().unwrap(), ty, code, slot);
             }
+        } else {
+            interrupts::wait_for_interrupt();
         }
-        if e.is_configured() || e.is_failed() {
-            break;
-        }
-        interrupts::wait_for_interrupt();
     }
+
+    // Report the outcome.
+    let configured = (0..n)
+        .filter(|&d| e[d].as_mut().unwrap().is_configured())
+        .count();
+    serial::write_str("[usb] enumerated ");
+    serial::write_u32_decimal(configured as u32);
+    serial::write_str(" of ");
+    serial::write_u32_decimal(n as u32);
+    serial::writeln(" devices");
     interrupts::disable();
 }
 

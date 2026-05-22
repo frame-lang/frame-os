@@ -606,7 +606,14 @@ fn qemu_base_command(
         // brings it up, and detects the keyboard connected on a port. Harmless
         // for B0–B5 (nothing touches USB there).
         .args(["-device", "qemu-xhci,id=xhci"])
+        // Two HID devices on the controller (R3): a keyboard and a mouse on
+        // separate root-hub ports. The kernel enumerates both *concurrently*
+        // (one HubPort + UsbEnumeration instance per device, demuxed by slot).
+        // The keyboard lands on the lower USB2 port (5), so it is device 0 — the
+        // target of the interrupt-IN keypress transfer (B6-4). Harmless for
+        // B0–B5 (nothing touches USB there).
         .args(["-device", "usb-kbd,bus=xhci.0"])
+        .args(["-device", "usb-mouse,bus=xhci.0"])
         .args(["-display", "none"])
         // isa-debug-exit: the kernel's halt path writes port 0xf4, which
         // makes QEMU exit cleanly (code (val<<1)|1) once the boot/demos are
@@ -1447,6 +1454,32 @@ const SMOKE_TESTS: &[SmokeTest] = &[
             "triple fault",
             "[usb] configure endpoint failed",
             "[usb] key report not received (no transfer)",
+        ],
+        timeout_secs: 30,
+    },
+    SmokeTest {
+        // R3a: multi-port concurrent enumeration. Two HID devices (usb-kbd on
+        // port 5, usb-mouse on port 6) are brought up *concurrently* — a HubPort
+        // + UsbEnumeration instance per device coexist in the device table, and a
+        // single driver loop demuxes each xHCI completion to the right instance by
+        // slot (the connection-table pattern, now on real async hardware events).
+        // Both reach $Configured (slots 1 and 2). The "orthogonal regions" /
+        // many-concurrent-same-type-lifecycle-FSMs question, answered on hardware.
+        name: "usb_multiport_r3a",
+        expect_contains: &[
+            "[usb] device connected on port 5",
+            "[usb] device connected on port 6",
+            "[usb] device configured (slot 1)",
+            "[usb] device configured (slot 2)",
+            "[usb] enumerated 2 of 2 devices",
+        ],
+        expect_absent: &[
+            "KERNEL EXCEPTION",
+            "KERNEL PANIC",
+            "triple fault",
+            "[usb] command failed during enumeration",
+            "[usb] control transfer failed during enumeration",
+            "[usb] enable slot timed out",
         ],
         timeout_secs: 30,
     },
