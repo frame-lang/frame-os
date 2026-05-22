@@ -25,6 +25,14 @@
 // and perform_syscall (the actual work). `$Validating`/`$Executing` are thin
 // at B3 but the structure + the `=> $^` funnel scale to multi-phase syscalls
 // at B4.
+//
+// Data pipeline (B5): the syscall arguments flow `$Validating → $Executing` as
+// **enter parameters** (`-> (num, a0, a1) $Executing` → `$>(num, a0, a1)`),
+// not via domain fields. The args belong to one in-flight call, so they ride
+// the transition into the stage that consumes them rather than living on the
+// system. Only the *result* (read back by the caller after the dispatcher
+// returns to $Validating) stays in the domain. This is the cookbook
+// "validate-then-execute" pipeline recipe.
 
 @@[target("rust")]
 
@@ -38,11 +46,9 @@
     machine:
         $Validating => $Active {
             request(num: u64, a0: u64, a1: u64) {
-                self.num = num;
-                self.a0 = a0;
-                self.a1 = a1;
                 if crate::usermode::is_known_syscall(num) {
-                    -> $Executing
+                    // Thread the args forward to the stage that runs them.
+                    -> (num, a0, a1) $Executing
                 } else {
                     // Unknown syscall → forward to the parent's error
                     // handler (reject is unhandled here → `=> $^`). ENOSYS=38.
@@ -53,10 +59,11 @@
         }
 
         $Executing => $Active {
-            $>() {
-                // Run the syscall natively, record the return value, and
-                // return to $Validating ready for the next request.
-                self.result = crate::usermode::perform_syscall(self.num, self.a0, self.a1);
+            $>(num: u64, a0: u64, a1: u64) {
+                // Run the syscall natively (args arrived as enter params),
+                // record the return value, and return to $Validating ready for
+                // the next request.
+                self.result = crate::usermode::perform_syscall(num, a0, a1);
                 self.is_err = false;
                 -> $Validating
             }
@@ -73,9 +80,6 @@
         }
 
     domain:
-        num: u64 = 0
-        a0: u64 = 0
-        a1: u64 = 0
         result: u64 = 0
         is_err: bool = false
 }
