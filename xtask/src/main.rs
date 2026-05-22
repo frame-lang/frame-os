@@ -1494,6 +1494,20 @@ const SMOKE_TESTS: &[SmokeTest] = &[
         expect_absent: &["KERNEL EXCEPTION", "KERNEL PANIC", "triple fault"],
         timeout_secs: 30,
     },
+    SmokeTest {
+        // B7 Step 5: TLB shootdown. The BSP unmaps a test page (flushing its own
+        // TLB) and IPIs the other cores (the APs, idling interrupt-enabled) to
+        // flush theirs; each core's shootdown ISR invlpg's the VA + acks. The BSP
+        // waits for every core to ack — the barrier that makes it safe to reuse
+        // the page. "ack barrier: ok" means all APs flushed.
+        name: "smp_tlb_shootdown_b7",
+        expect_contains: &[
+            "[smp] TLB shootdown: 3 of 3 cores flushed",
+            "[smp] TLB shootdown ack barrier: ok (safe to reuse page)",
+        ],
+        expect_absent: &["KERNEL EXCEPTION", "KERNEL PANIC", "triple fault"],
+        timeout_secs: 30,
+    },
 ];
 
 fn run_qemu_test() -> Result<()> {

@@ -146,13 +146,14 @@ unsafe extern "C" fn ap_entry(cpu: &limine::mp::Cpu) -> ! {
         work += 1;
         core::hint::spin_loop();
     }
-    unsafe { core::arch::asm!("cli", options(nomem, nostack)) };
     percpu::set_this_cpu_work(work);
     AP_PREEMPTED.fetch_add(1, Ordering::SeqCst);
 
-    // Park.
+    // B7 Step 5: stay *interrupt-enabled* and idle, so this core can service the
+    // BSP's TLB-shootdown IPI (and its own timer). `hlt` with IF=1 wakes on each
+    // interrupt and loops back — the AP's resting state for the rest of the boot.
     loop {
-        unsafe { core::arch::asm!("cli; hlt", options(nomem, nostack)) };
+        unsafe { core::arch::asm!("hlt", options(nomem, nostack)) };
     }
 }
 
@@ -288,6 +289,38 @@ unsafe extern "C" fn kmain() -> ! {
             }
             if all_preempted && ap_count > 0 {
                 serial::writeln("[smp] per-core preemption: ok (each AP timer-sliced)");
+            }
+
+            // B7 Step 5: TLB shootdown. Map a test page, then unmap it on the BSP
+            // (flushing the BSP's own TLB via `invlpg`) and IPI the other cores to
+            // flush theirs. Wait for every core to ack the flush — the barrier
+            // that lets the page be safely reused/freed. (The APs are idling
+            // interrupt-enabled, so they service the shootdown IPI.)
+            if ap_count > 0 {
+                const SHOOT_VA: u64 = 0x0000_7000_0000_0000;
+                if let Some(frame) = frames::alloc_frame() {
+                    unsafe {
+                        paging::map(SHOOT_VA, frame, paging::WRITABLE);
+                        (SHOOT_VA as *mut u64).write_volatile(0xDEAD_BEEF);
+                        paging::unmap(SHOOT_VA); // flushes the BSP's own TLB entry
+                    }
+                    interrupts::shootdown(SHOOT_VA); // IPI the other cores to flush theirs
+                    let mut spins = 0u64;
+                    while interrupts::shootdown_acks() < ap_count && spins < 1_000_000_000 {
+                        spins += 1;
+                        core::hint::spin_loop();
+                    }
+                    let acks = interrupts::shootdown_acks();
+                    serial::write_str("[smp] TLB shootdown: ");
+                    serial::write_u32_decimal(acks as u32);
+                    serial::write_str(" of ");
+                    serial::write_u32_decimal(ap_count as u32);
+                    serial::writeln(" cores flushed");
+                    if acks == ap_count {
+                        serial::writeln("[smp] TLB shootdown ack barrier: ok (safe to reuse page)");
+                    }
+                    frames::free_frame(frame); // safe now — every core has flushed
+                }
             }
         } else {
             serial::writeln("[smp] no MP response (single core)");

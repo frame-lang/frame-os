@@ -16,7 +16,7 @@
 // the gate descriptors, and `iretq` all work before we wire real IRQs.
 
 use core::arch::{asm, global_asm};
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use crate::serial;
 
@@ -30,6 +30,8 @@ const LAPIC_TIMER_VECTOR: usize = 0x40;
 /// LAPIC spurious-interrupt vector — a present no-op gate (must match the
 /// spurious vector programmed into the LAPIC SVR).
 const SPURIOUS_VECTOR: usize = 0xFF;
+/// TLB-shootdown IPI vector (B7 Step 5).
+const TLB_SHOOTDOWN_VECTOR: usize = 0x41;
 
 /// Monotonic timer tick count, incremented by the timer ISR.
 static TICKS: AtomicU64 = AtomicU64::new(0);
@@ -211,6 +213,31 @@ global_asm!(
     ".global isr_spurious",
     "isr_spurious:",
     "  iretq",
+    // TLB shootdown IPI (B7 Step 5, vector 0x41). Same minimal save shape; the
+    // Rust half invalidates the shootdown VA on this core, acks, and EOIs the
+    // LAPIC. This is how the initiator flushes other cores' stale translations.
+    ".global isr_tlb_shootdown",
+    "isr_tlb_shootdown:",
+    "  push rax",
+    "  push rcx",
+    "  push rdx",
+    "  push rsi",
+    "  push rdi",
+    "  push r8",
+    "  push r9",
+    "  push r10",
+    "  push r11",
+    "  call tlb_shootdown_irq",
+    "  pop r11",
+    "  pop r10",
+    "  pop r9",
+    "  pop r8",
+    "  pop rdi",
+    "  pop rsi",
+    "  pop rdx",
+    "  pop rcx",
+    "  pop rax",
+    "  iretq",
     // Page fault (#PF, vector 14). Unlike most exceptions, #PF pushes an
     // error code (below the iretq frame), and the faulting address is in
     // CR2. Pass both to the Rust handler; it returns (recovered → retry) or
@@ -304,6 +331,7 @@ extern "C" {
     fn isr_virtio_net();
     fn isr_lapic_timer();
     fn isr_spurious();
+    fn isr_tlb_shootdown();
 }
 
 /// Rust half of the LAPIC-timer ISR (B7 Step 4). Records a per-CPU tick (proof
@@ -311,6 +339,38 @@ extern "C" {
 #[no_mangle]
 extern "C" fn lapic_timer_irq() {
     crate::percpu::record_tick();
+    crate::lapic::eoi();
+}
+
+// B7 Step 5: TLB shootdown state. The initiator stores the VA to flush, resets
+// the ack count, and IPIs the other cores; each core's shootdown ISR invalidates
+// the VA in its own TLB and acks. The initiator waits for all acks (the barrier)
+// before reusing the page.
+static SHOOTDOWN_VA: AtomicU64 = AtomicU64::new(0);
+static SHOOTDOWN_ACKS: AtomicUsize = AtomicUsize::new(0);
+
+/// Initiator side (B7 Step 5): flush `va` from every *other* core's TLB. Sets the
+/// VA, resets the ack count, and sends the shootdown IPI to all-but-self. The
+/// caller then polls `shootdown_acks()` until it equals the number of other
+/// cores (the barrier) before reusing the page. The initiator must flush its own
+/// TLB separately (e.g. via `paging::unmap`, which `invlpg`s).
+pub fn shootdown(va: u64) {
+    SHOOTDOWN_VA.store(va, Ordering::SeqCst);
+    SHOOTDOWN_ACKS.store(0, Ordering::SeqCst);
+    crate::lapic::send_ipi_all_but_self(TLB_SHOOTDOWN_VECTOR as u32);
+}
+/// How many cores have acked the current shootdown.
+pub fn shootdown_acks() -> usize {
+    SHOOTDOWN_ACKS.load(Ordering::SeqCst)
+}
+
+/// Rust half of the TLB-shootdown ISR (B7 Step 5). Invalidates the shootdown VA
+/// on this core, acks, and EOIs the LAPIC.
+#[no_mangle]
+extern "C" fn tlb_shootdown_irq() {
+    let va = SHOOTDOWN_VA.load(Ordering::SeqCst);
+    unsafe { asm!("invlpg [{}]", in(reg) va, options(nostack, preserves_flags)) };
+    SHOOTDOWN_ACKS.fetch_add(1, Ordering::SeqCst);
     crate::lapic::eoi();
 }
 
@@ -400,6 +460,8 @@ pub fn init() {
         // gets a present (no-op) gate so a withdrawn IRQ can't fault.
         (*idt)[LAPIC_TIMER_VECTOR].set(isr_lapic_timer as *const () as usize as u64, cs);
         (*idt)[SPURIOUS_VECTOR].set(isr_spurious as *const () as usize as u64, cs);
+        // TLB-shootdown IPI (B7 Step 5).
+        (*idt)[TLB_SHOOTDOWN_VECTOR].set(isr_tlb_shootdown as *const () as usize as u64, cs);
 
         let idtr = Idtr {
             limit: (core::mem::size_of::<[IdtEntry; 256]>() - 1) as u16,

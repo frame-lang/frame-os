@@ -78,3 +78,19 @@ pub fn init_this_cpu() {
 pub fn eoi() {
     write(EOI, 0);
 }
+
+// Interrupt Command Register (the IPI send registers).
+const ICR_LOW: usize = 0x300;
+const ICR_HIGH: usize = 0x310;
+const ICR_ASSERT: u32 = 1 << 14; // level = assert
+const ICR_ALL_BUT_SELF: u32 = 0b11 << 18; // destination shorthand
+
+/// Send a fixed inter-processor interrupt on `vector` to **all cores except this
+/// one** (the "all excluding self" destination shorthand). Used for TLB
+/// shootdown (B7 Step 5): the initiator IPIs the other cores to flush a stale
+/// translation. The high (destination) word is ignored for the shorthand; we
+/// write it first, then the low word, which triggers the send.
+pub fn send_ipi_all_but_self(vector: u32) {
+    write(ICR_HIGH, 0);
+    write(ICR_LOW, vector | ICR_ASSERT | ICR_ALL_BUT_SELF);
+}
