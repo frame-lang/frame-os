@@ -574,11 +574,18 @@ connections?
   control-plane lifecycles (a connection is ~7 events) but confirms, numerically,
   why a per-*segment* data path is the wrong place for Frame (→ the no-alloc path,
   R4). Recorded in `frame_assessment.md` (sharpens finding #3).
-- **R2b (live multi-connection server) — remaining.** A real connection *table*
-  keyed by 4-tuple, accepting several simultaneous connections from the harness
-  (per-connection seq state + dispatch-by-peer). Adds network realism over R2a's
-  direct-drive stress; the allocation number won't change, but it exercises the
-  full receive→dispatch path at N connections.
+- **R2b (live multi-connection server) — done.** Refactored `tcp.rs` from a single
+  global connection to a real connection *table* (`Conn` slots, 4 listening server
+  ports :7–:10 plus one client slot). Inbound segments are resolved by 4-tuple to a
+  slot; a `CURRENT` ambient indirection lets the **unchanged** `TcpConnection` FSM's
+  actions operate on the resolved slot, so N concurrent FSM instances each carry
+  their own seq state and dispatch independently. The harness opens **4 simultaneous
+  connections** (`TcpProbe::Multi`, hostfwd :8/:9/:10), echoes on each, and the
+  kernel reports `[tcp] served 4 connections`. Per the R2a prediction, the
+  allocation number is unchanged — this exercised the full receive→resolve→dispatch
+  path at N live connections rather than direct-drive. Validated by
+  `tcp_multi_conn_b5`; the four B5 single-connection TCP tests still pass after the
+  table refactor (**40/40** QEMU). Recorded in `frame_assessment.md`.
 
 ### R3 — multi-port USB / orthogonal regions (Frame-relevant)
 

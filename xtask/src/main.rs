@@ -588,10 +588,10 @@ fn qemu_base_command(
         .args(["-netdev"])
         .arg(match net {
             NetMode::Slirp { guestfwd: true } => format!(
-                "user,id=net0,hostfwd=tcp::{TCP_PROBE_PORT}-:7,guestfwd=tcp:10.0.2.100:9-tcp:127.0.0.1:{TCP_ACTIVE_PORT}"
+                "user,id=net0,hostfwd=tcp::{TCP_PROBE_PORT}-:7,{MULTI_HOSTFWD},guestfwd=tcp:10.0.2.100:9-tcp:127.0.0.1:{TCP_ACTIVE_PORT}"
             ),
             NetMode::Slirp { guestfwd: false } => {
-                format!("user,id=net0,hostfwd=tcp::{TCP_PROBE_PORT}-:7")
+                format!("user,id=net0,hostfwd=tcp::{TCP_PROBE_PORT}-:7,{MULTI_HOSTFWD}")
             }
             NetMode::Tap { ifname } => {
                 format!("tap,id=net0,ifname={ifname},script=no,downscript=no")
@@ -1369,6 +1369,18 @@ const SMOKE_TESTS: &[SmokeTest] = &[
         timeout_secs: 30,
     },
     SmokeTest {
+        // R2b: live multi-connection TCP server. The kernel listens on :7–:10
+        // (a connection table — one TcpConnection instance per port); the harness
+        // opens all four simultaneously and echoes on each. All four must
+        // handshake, echo, and close — four live FSM instances with independent
+        // sequence state, validated by the harness reading each echo back AND the
+        // kernel reporting "served 4 connections".
+        name: "tcp_multi_conn_b5",
+        expect_contains: &["[tcp] served 4 connections"],
+        expect_absent: &["KERNEL EXCEPTION", "KERNEL PANIC", "triple fault"],
+        timeout_secs: 30,
+    },
+    SmokeTest {
         // B6 Step 1: xHCI USB host-controller bring-up. The kernel discovers the
         // qemu-xhci controller (PCI class 0C0330), maps its MMIO window, resets
         // it, stands up the DCBAA/command-ring/event-ring, sets Run, and detects
@@ -1610,6 +1622,12 @@ const TCP_ECHO_REQUEST: &[u8] = b"frame-os tcp echo\n";
 /// Host port for the QEMU HMP monitor (the B6 usb-transfer test connects here to
 /// `sendkey` a keypress, completing the keyboard's interrupt-IN transfer).
 const MONITOR_PORT: u16 = 15582;
+/// R2b: the slirp `hostfwd` rules for the multi-connection server's extra ports
+/// (:8/:9/:10 — :7 is `TCP_PROBE_PORT`). The kernel listens on :7–:10; the
+/// multi-connection test opens one connection to each.
+const MULTI_HOSTFWD: &str = "hostfwd=tcp::15585-:8,hostfwd=tcp::15586-:9,hostfwd=tcp::15587-:10";
+/// The four host ports the multi-connection probe connects to → guest :7–:10.
+const MULTI_HOST_PORTS: [u16; 4] = [TCP_PROBE_PORT, 15585, 15586, 15587];
 
 /// What (if anything) the harness drives over the forwarded TCP port.
 #[derive(Clone, Copy, PartialEq)]
@@ -1624,6 +1642,10 @@ enum TcpProbe {
     /// (the serial oracle "[tcp] connected (active open)" confirms `$SynSent` →
     /// `$Established`).
     Active,
+    /// R2b: open four *simultaneous* connections (to guest :7–:10) and echo on
+    /// each, exercising the kernel's connection table — four `TcpConnection`
+    /// instances live at once, each with its own sequence state.
+    Multi,
 }
 
 fn run_qemu_once(
@@ -1732,7 +1754,48 @@ fn run_qemu_once(
                                     eprintln!("    (echo attempt: read {buf:?})");
                                 }
                             }
-                            TcpProbe::None | TcpProbe::Active => {}
+                            TcpProbe::None | TcpProbe::Active | TcpProbe::Multi => {}
+                        }
+                    }
+                }
+                // R2b: open four *simultaneous* connections to guest :7–:10 and
+                // echo on each, once all four listeners are up (the kernel logs
+                // ":10" last). Connecting all four before reading exercises the
+                // connection table with four live `TcpConnection` instances.
+                if tcp_probe == TcpProbe::Multi && !probed {
+                    let up = std::fs::read_to_string(serial_path)
+                        .map(|s| s.contains("[tcp] listening on :10"))
+                        .unwrap_or(false);
+                    if up {
+                        use std::io::{Read, Write};
+                        let mut streams: Vec<std::net::TcpStream> = Vec::new();
+                        for &port in &MULTI_HOST_PORTS {
+                            let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+                            if let Ok(s) =
+                                std::net::TcpStream::connect_timeout(&addr, Duration::from_millis(500))
+                            {
+                                streams.push(s);
+                            }
+                        }
+                        if streams.len() == MULTI_HOST_PORTS.len() {
+                            // All four open simultaneously — now echo on each.
+                            let mut ok = 0;
+                            for mut s in streams {
+                                s.set_read_timeout(Some(Duration::from_millis(2500))).ok();
+                                let mut buf = vec![0u8; TCP_ECHO_REQUEST.len()];
+                                if s.write_all(TCP_ECHO_REQUEST).is_ok()
+                                    && s.read_exact(&mut buf).is_ok()
+                                    && buf == TCP_ECHO_REQUEST
+                                {
+                                    ok += 1;
+                                }
+                            }
+                            if ok == MULTI_HOST_PORTS.len() {
+                                echo_ok = true;
+                            } else {
+                                eprintln!("    (multi: only {ok}/4 connections echoed)");
+                            }
+                            probed = true;
                         }
                     }
                 }
@@ -1759,9 +1822,10 @@ fn run_qemu_once(
         }
     }
 
-    // The echo probe gates the test: the harness must have read its request
-    // back (proving the kernel's outbound data segment was well-formed).
-    if tcp_probe == TcpProbe::Echo && !echo_ok {
+    // The echo / multi probes gate the test: the harness must have read its
+    // request back on each connection (proving each connection's outbound data
+    // segment — its own sequence + checksum — was well-formed).
+    if matches!(tcp_probe, TcpProbe::Echo | TcpProbe::Multi) && !echo_ok {
         bail!("TCP echo not verified: the harness never read the echoed request back");
     }
     Ok(())
@@ -1800,6 +1864,7 @@ fn run_smoke_test(
         "tcp_handshake_b5" => TcpProbe::Handshake,
         "tcp_echo_b5" => TcpProbe::Echo,
         "tcp_active_open_b5" => TcpProbe::Active,
+        "tcp_multi_conn_b5" => TcpProbe::Multi,
         _ => TcpProbe::None,
     };
     // The B6 transfer test injects a keypress via the QEMU monitor.

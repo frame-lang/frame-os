@@ -587,7 +587,7 @@ fn tcp_connect() {
         }
         crate::tcp::drain_timers(); // retransmit the SYN if it's lost
         let now = interrupts::ticks();
-        if crate::tcp::is_established() && !announced {
+        if crate::tcp::client_established() && !announced {
             serial::writeln("[tcp] connected (active open)");
             announced = true;
         }
@@ -595,7 +595,7 @@ fn tcp_connect() {
             if now - start > 100 {
                 break; // linger ~1s after connecting
             }
-        } else if crate::tcp::is_closed() {
+        } else if crate::tcp::client_closed() {
             break; // RST'd (no listener / no guestfwd) — nothing to wait for
         } else if now - start > 150 {
             break; // cap (~1.5s): no guestfwd on this boot (every non-active test)
@@ -612,61 +612,65 @@ fn tcp_connect() {
 /// ~0.5s, we recycle it (rst → re-listen) to accept the live one. We bail ~1s
 /// after the echo, or ~1s after seeing no TCP at all (every non-TCP boot).
 fn tcp_serve() {
-    crate::tcp::listen(7);
+    // R2b: a connection table — listen on a small range of ports (one connection
+    // per port, robust over slirp where each forwarded port is its own
+    // connection). The B5 single-connection tests connect to :7 only (slot 0
+    // serves; the rest stay idle listeners); the multi-connection test connects
+    // to all of them, exercising several `TcpConnection` instances at once.
+    const N: usize = crate::tcp::SERVER_SLOTS;
+    for i in 0..N as u16 {
+        crate::tcp::listen(crate::tcp::BASE_PORT + i);
+    }
     interrupts::enable();
     let start = interrupts::ticks();
-    let mut announced = false;
-    let mut conn_at: u64 = 0; // when the current connection established (0 = none)
-    let mut done_at: u64 = 0; // when our echo went out (0 = not yet)
-    let mut closing = false; // we've actively closed after the echo
-    let mut closed_logged = false;
+    let mut announced = [false; N];
+    let mut closing = [false; N];
+    let mut closed_logged = [false; N];
+    let mut last_event = 0u64; // when a connection most recently established
+    let mut served = 0u32; // connections that completed a clean close
     loop {
         if !pump() {
             interrupts::wait_for_interrupt();
         }
-        crate::tcp::drain_timers(); // fire retransmit / TIME_WAIT timeouts
+        crate::tcp::drain_timers(); // fire retransmit / TIME_WAIT timeouts (all slots)
         let now = interrupts::ticks();
 
-        if crate::tcp::is_established() {
-            if conn_at == 0 {
-                conn_at = now;
-                if !announced {
+        for s in 0..N {
+            if crate::tcp::is_established(s) {
+                if !announced[s] {
                     serial::writeln("[tcp] established");
-                    announced = true;
+                    announced[s] = true;
+                    last_event = now;
+                }
+                if crate::tcp::echoes(s) > 0 && !closing[s] {
+                    // Actively close after the echo — $FinWait1 → … → $TimeWait
+                    // → (2·MSL timer) → $Closed, exercising the timer wheel.
+                    crate::tcp::close(s);
+                    closing[s] = true;
                 }
             }
-            if done_at == 0 && crate::tcp::echoes() > 0 {
-                done_at = now;
-                // Actively close after the echo — drives $FinWait1 → … →
-                // $TimeWait → (2·MSL timer) → $Closed, exercising the timer wheel.
-                crate::tcp::close();
-                closing = true;
-            } else if done_at == 0 && now - conn_at > 50 {
-                crate::tcp::relisten(); // idle/dead connection → accept the next
-                conn_at = 0;
+            if closing[s] && !closed_logged[s] && crate::tcp::is_closed(s) {
+                serial::writeln("[tcp] closed");
+                closed_logged[s] = true;
+                served += 1;
             }
         }
 
-        if closing && !closed_logged && crate::tcp::is_closed() {
-            serial::writeln("[tcp] closed");
-            closed_logged = true;
-        }
-
-        if closed_logged {
-            break; // clean close complete (handshake + echo + close)
-        } else if done_at != 0 {
-            if now - done_at > 200 {
-                break; // safety: close didn't settle within ~2s
-            }
-        } else if !crate::tcp::saw_tcp() {
-            if now - start > 100 {
-                break; // no client knocked within ~1s → not a TCP test
-            }
-        } else if now - start > 400 {
-            break; // overall cap (~4s): handshake-only client, or recycling window
+        let established = announced.iter().filter(|&&a| a).count() as u32;
+        if established > 0 && served == established && now - last_event > 150 {
+            break; // every established connection closed; none new in the grace
+        } else if established > 0 && served == 0 && now - last_event > 200 {
+            break; // established but idle (handshake-only client, no data)
+        } else if !crate::tcp::saw_tcp() && now - start > 100 {
+            break; // no client knocked within ~1s → not a TCP test
+        } else if now - start > 600 {
+            break; // overall cap
         }
     }
     interrupts::disable();
+    serial::write_str("[tcp] served ");
+    serial::write_u32_decimal(served);
+    serial::writeln(" connections");
 }
 
 /// B5 Step 2b: send an ICMP echo request to the gateway and wait for the reply
