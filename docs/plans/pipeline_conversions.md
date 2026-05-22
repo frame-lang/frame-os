@@ -1,6 +1,6 @@
 # Plan — convert the data pipelines to enter-param FSMs
 
-> **Status:** In progress. `SyscallDispatcher` done (`aca1b78`). The rest planned here. No rush — each conversion is a careful refactor of a load-bearing system, validated and committed one at a time.
+> **Status:** In progress. `SyscallDispatcher` (`aca1b78`) and `ElfLoader` (`7f7e1e8`) done. `PageFaultHandler` reviewed and **deliberately left as-is** (not a data pipeline — see below). Remaining: the RX packet pipeline (B5). Validating against the new local framec only (the published 4.2.0 is set aside).
 
 ## Goal
 Where a Frame system is a *data pipeline* — a datum flows down a sequence/fan-out of states — carry that data **on the transitions, as enter parameters** (`-> (data) $Next` → `$>(data)`), instead of stashing it in domain fields or native globals. This maximizes Frame's expressiveness (the data flow is visible in the state graph) and exercises framec's typed enter-param codegen. It also produces the cookbook "data pipeline" recipes.
@@ -28,14 +28,17 @@ Two more gotchas, both already verified harmless:
 ### 1. `SyscallDispatcher` — DONE (`aca1b78`)
 `$Validating → $Executing` threading `(num, a0, a1)`. Scalars → CI-safe on the published framec. The minimal recipe; zero behavior change.
 
-### 2. `PageFaultHandler` — classifier; **CI-safe now** (scalars)
-*Current:* `$Classifying.fault(addr, error_code)` stashes `fault_addr` + `is_user` in the **domain**; `$LazyFault`/`$Fatal`/`$Killing` read them for logging, and `fault_addr()` is an interface query *after* disposition.
-*Plan:* thread the fault descriptor forward as **scalar enter params** — `addr: u64` (and the derived `is_user: bool`) — from `$Classifying` into `$LazyFault` and (via the `unrecoverable()` funnel) the disposition sinks, so each state receives the fault it's acting on rather than reading a shared field.
-*Keep in domain:* `fault_addr` must stay (the `fault_addr()` interface query is read by the native #PF handler *after* the machine settles, and the funnel `unrecoverable()` is a self-sent event that carries no args). So this is a **partial** thread: `$Classifying → $LazyFault` carries `addr`; the disposition decision still reads `self.fault_addr`/`self.is_user` because `unrecoverable()` fans in from multiple children.
-*Honesty note:* because the disposition is reached via a no-arg funnel event (`unrecoverable()`), and the address is queried post-settle, the domain field is partly load-bearing here. The clean win is `$Classifying → $LazyFault` carrying `addr`; forcing the rest through enter params would fight the funnel design. **Recommend: thread `addr` into `$LazyFault` only; leave the funnel + query on the domain.** Small, honest, CI-safe.
-*Validation:* PFH behavioral suite (9 tests) + `page_fault_handler_state_graph_snapshot` + QEMU `page_fault_demand_b2`, `page_fault_fatal_b2`, `user_fault_does_not_crash_kernel_b3`.
+### 2. `PageFaultHandler` — **reviewed; deliberately NOT converted** (decided 2026-05-21)
+A classifier whose fault data is genuinely *shared state*, not forward-flowing pipeline data:
+- `fault_addr` is **logged in `$Fatal`/`$Killing`** (reached via the `unrecoverable()` funnel) **and queried post-settle** by `fault_addr()`, which two behavioral tests assert (even though the kernel doesn't call it).
+- `unrecoverable()` is an argless "give up" signal that **fans in** from both `$Classifying` and `$LazyFault`.
 
-### 3. `ElfLoader` — phase pipeline; **needs the new framec** (descriptor struct)
+A full enter-param conversion would either drop the `fault_addr()` query (losing a public method + test coverage) or duplicate the address into a domain latch — both *worse* than capturing the fault once in the domain and letting the disposition states read it. This is the architecture doc's "the invariant is shared state → domain field" case. **Decision: leave as-is.** PFH is a classifier, not a data pipeline; domain is the right tool.
+
+### 3. `ElfLoader` — phase pipeline — **DONE** (`7f7e1e8`)
+Threads an `ElfHeader` descriptor (`phoff/phentsize/phnum`) `$ReadingHeader → $ValidatingHeader → $MappingSegments` via enter params; the ELF bytes / pml4 / mapped-pages rollback list stay native, and `entry` stays in the global for the `entry_va()` query. The "thread the parsed descriptor, keep the payload native" recipe. Requires the new typed-context framec (struct enter param). Validated: 6/6 behavioral, snapshot unchanged, 24/24 QEMU.
+
+*Original plan (for reference):* introduce `ElfHeader`, return it from `read_header() -> Option<ElfHeader>`, thread it; keep the payload native.
 *Current:* every phase calls `crate::elf::*` which reads/writes a single native `ELF` global; the Frame system threads nothing.
 *Plan:* introduce `crate::elf::ElfHeader { entry, phoff, phentsize, phnum }` (`#[derive(Clone, Copy, Default)]`). `read_header() -> Option<ElfHeader>`; thread it `$ReadingHeader → $ValidatingHeader → $MappingSegments` as an enter param (`$>(hdr: crate::elf::ElfHeader)`); `validate_header(hdr)` / `map_segments(hdr)` take it by value. `$BuildingStack` needs no header.
 *Keep native:* the ELF **bytes**, target **pml4**, and the **mapped-pages rollback list** stay in the `elf` module (genuinely shared, accumulating native state — the "payload"); `entry_va()`/`stack_top()` interface queries still read it post-load. So the recipe is exactly *"thread the parsed descriptor, keep the payload native."*
@@ -52,8 +55,11 @@ The genuine showcase: `$Classifying → $Arp | $Ipv4 → $Icmp | $Udp | $Tcp →
 - Lifecycle/manager/mode machines (`Process`, `ProcessTable`, `BlockRequest`, `Mount`, `OpenFile`, `ArpResolver`, `Scheduler`, `SerialDriver`) — state encodes "where in a lifecycle," not "what stage of processing this datum is at." Not pipelines.
 
 ## Sequencing
-1. **Now (published-framec-safe):** `PageFaultHandler` (thread `addr` into `$LazyFault`; scalars). Commit independently, full revalidation.
-2. **After the new framec ships to crates.io:** `ElfLoader` (header descriptor) and the RX packet pipeline (B5 3–4). Build locally + hold until then, or land once CI's framec has typed contexts.
+- **Done:** `SyscallDispatcher` (`aca1b78`), `ElfLoader` (`7f7e1e8`).
+- **Decided not to convert:** `PageFaultHandler` (classifier with shared/queried state).
+- **Remaining:** the RX packet pipeline — built as part of B5 Steps 3 (UDP) / 4 (TCP), the genuine showcase of threading a parsed packet descriptor (and/or `[u8; N]`) via enter params.
+
+Validation target is the new local framec build; the published 4.2.0 is set aside (it will catch up when the new framec is released — `ElfLoader`'s struct enter param and the RX pipeline require it; `SyscallDispatcher`'s `u64` args happen to work on both).
 
 ## Per-conversion checklist
 - [ ] Update the `.frs`; thread the data via enter params; trim the domain/native field it replaces (only where not also needed post-pipeline or by a fan-in funnel).
