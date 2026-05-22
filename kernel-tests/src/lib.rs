@@ -439,6 +439,45 @@ pub mod ip_reasm {
     }
 }
 
+/// Host test-double for the kernel's `xhci` module. The generated `HubPort`
+/// actions call `crate::xhci::{begin_port_reset, on_port_enabled}` (both take the
+/// 1-based port). Here they record the call + port so a behavioral test can
+/// assert "the reset was begun on port 5" and "the enabled action fired." The
+/// real PORTSC pokes live in the kernel; these tests pin the FSM transitions.
+pub mod xhci {
+    use core::cell::Cell;
+
+    thread_local! {
+        static RESET_PORT: Cell<u8> = const { Cell::new(0) };
+        static RESETS: Cell<u32> = const { Cell::new(0) };
+        static ENABLED_PORT: Cell<u8> = const { Cell::new(0) };
+    }
+
+    pub fn begin_port_reset(port: u8) {
+        RESET_PORT.with(|c| c.set(port));
+        RESETS.with(|c| c.set(c.get() + 1));
+    }
+    pub fn on_port_enabled(port: u8) {
+        ENABLED_PORT.with(|c| c.set(port));
+    }
+
+    /// Test inspectors.
+    pub fn reset_port() -> u8 {
+        RESET_PORT.with(|c| c.get())
+    }
+    pub fn resets() -> u32 {
+        RESETS.with(|c| c.get())
+    }
+    pub fn enabled_port() -> u8 {
+        ENABLED_PORT.with(|c| c.get())
+    }
+    pub fn reset() {
+        RESET_PORT.with(|c| c.set(0));
+        RESETS.with(|c| c.set(0));
+        ENABLED_PORT.with(|c| c.set(0));
+    }
+}
+
 // Pull in the framec-generated systems. Each generated file ends with
 // `pub use _<name>_framec::*;`, re-exporting the system type at this crate's
 // root. SerialDriver first (Kernel holds one in its domain). Task and
@@ -478,3 +517,7 @@ include!(concat!(env!("OUT_DIR"), "/tcp_connection.rs"));
 // crate::ip_reasm::* (the host double above counts/controls them); fragment()
 // threads a Fragment via enter params (self-transition re-store).
 include!(concat!(env!("OUT_DIR"), "/ip_reassembly.rs"));
+// HubPort (B6 Step 2): one xHCI port's connect/reset/enable lifecycle. Actions
+// call crate::xhci::{begin_port_reset,on_port_enabled} (the host double above
+// records them); disconnect funnels to $Disconnected via the $Attached parent.
+include!(concat!(env!("OUT_DIR"), "/hub_port.rs"));

@@ -176,6 +176,7 @@ const DIAGRAMS: &[(&str, &str)] = &[
     ("udp_socket.frs", "udp_socket.svg"),
     ("tcp_connection.frs", "tcp_connection.svg"),
     ("ip_reassembly.frs", "ip_reassembly.svg"),
+    ("hub_port.frs", "hub_port.svg"),
 ];
 
 fn diagrams(mode: DiagramMode) -> Result<()> {
@@ -1348,12 +1349,23 @@ const SMOKE_TESTS: &[SmokeTest] = &[
         // B6 Step 1: xHCI USB host-controller bring-up. The kernel discovers the
         // qemu-xhci controller (PCI class 0C0330), maps its MMIO window, resets
         // it, stands up the DCBAA/command-ring/event-ring, sets Run, and detects
-        // the attached usb-kbd connected on a port. (Enumeration + transfers land
-        // in later B6 steps; this proves the controller comes up + sees a device.)
+        // the attached usb-kbd connected on a port.
         name: "usb_controller_b6",
         expect_contains: &[
             "[usb] xHCI running",
             "[usb] device connected on port",
+        ],
+        expect_absent: &["KERNEL EXCEPTION", "KERNEL PANIC", "triple fault"],
+        timeout_secs: 30,
+    },
+    SmokeTest {
+        // B6 Step 2: the HubPort Frame system drives the connected port through
+        // connect → reset (a timed transition: PORTSC.PR + a settle deadline) →
+        // enabled. The keyboard lands on port 5 in this qemu-xhci/q35 config.
+        name: "usb_port_reset_b6",
+        expect_contains: &[
+            "[usb] resetting port 5",
+            "[usb] port 5 enabled",
         ],
         expect_absent: &["KERNEL EXCEPTION", "KERNEL PANIC", "triple fault"],
         timeout_secs: 30,

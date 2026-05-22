@@ -30,6 +30,7 @@ const FRAME_SYSTEMS: &[(&str, &str)] = &[
     ("udp_socket", "udp_socket.frs"),
     ("tcp_connection", "tcp_connection.frs"),
     ("ip_reassembly", "ip_reassembly.frs"),
+    ("hub_port", "hub_port.frs"),
 ];
 
 fn main() -> Result<()> {

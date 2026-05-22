@@ -1,0 +1,88 @@
+// frame/hub_port.frs
+//
+// HubPort — one xHCI root-hub port's connect/reset/enable lifecycle (B6 Step 2).
+// A USB2 device (e.g. the QEMU usb-kbd) appears on a port, but the port isn't
+// usable until software *resets* it: the reset puts the device in its Default
+// state and the controller enables the port. This system owns that lifecycle;
+// native (`crate::xhci`) owns the PORTSC register pokes (set Port Reset, read
+// Port Enabled) and the reset-settle timer.
+//
+// The reset is a *timed transition*: `$Resetting` arms a settle deadline in its
+// enter handler (the B5 ArpResolver/TCP idiom — "armed on entry, fired by a
+// native deadline through the driver loop"), and the loop dispatches
+// `reset_complete()` once the controller reports the port enabled, or
+// `timeout()` at the cap.
+//
+// State graph:
+//
+//   $Disconnected ─ connect(port) ─► $Connected ─ reset ─► $Resetting ─┬─ reset_complete ─► $Enabled
+//        ▲                                                              └─ timeout ─► $Connected
+//        └───────────────── disconnect ◄── $Attached (parent: $Connected/$Resetting/$Enabled) ──┘
+//
+// `disconnect()` from any attached state funnels to `$Disconnected` through the
+// `$Attached` parent via `=> $^` (the Process.$Alive / TcpConnection.$Open
+// pattern): the disposition is written once on the parent.
+
+@@[target("rust")]
+
+@@system HubPort {
+    interface:
+        connect(port: u8)
+        reset()
+        reset_complete()
+        timeout()
+        disconnect()
+        state(): String = "Disconnected".to_string()
+        is_enabled(): bool = false
+
+    machine:
+        $Disconnected {
+            connect(port: u8) {
+                self.port = port;
+                -> $Connected
+            }
+            state(): String { @@:("Disconnected".to_string()) }
+        }
+
+        $Connected => $Attached {
+            reset() {
+                -> $Resetting
+            }
+            state(): String { @@:("Connected".to_string()) }
+            => $^
+        }
+
+        $Resetting => $Attached {
+            $>() {
+                crate::xhci::begin_port_reset(self.port);
+            }
+            reset_complete() {
+                -> $Enabled
+            }
+            timeout() {
+                -> $Connected
+            }
+            state(): String { @@:("Resetting".to_string()) }
+            => $^
+        }
+
+        $Enabled => $Attached {
+            $>() {
+                crate::xhci::on_port_enabled(self.port);
+            }
+            is_enabled(): bool { @@:(true) }
+            state(): String { @@:("Enabled".to_string()) }
+            => $^
+        }
+
+        // Parent: a disconnect from any attached state tears the port back down
+        // to $Disconnected. The children forward `disconnect()` here via `=> $^`.
+        $Attached {
+            disconnect() {
+                -> $Disconnected
+            }
+        }
+
+    domain:
+        port: u8 = 0
+}

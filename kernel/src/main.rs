@@ -274,9 +274,13 @@ unsafe extern "C" fn kmain() -> ! {
 
     // B6 Step 1: bring up the xHCI USB host controller (PCI discovery + MMIO +
     // reset + DCBAA/command-ring/event-ring setup + Run), then report any device
-    // connected on a port. The USB lifecycle (port reset, enumeration, transfers)
-    // is driven by Frame systems in later B6 steps.
-    xhci::init();
+    // connected on a port.
+    if xhci::init() {
+        // B6 Step 2: drive the connected port through the HubPort Frame system —
+        // connect → reset (a timed transition) → enabled, readying the device
+        // for enumeration (Step 3).
+        xhci::run_port_lifecycle();
+    }
 
     // B2 Step 3 (fatal path): deliberately fault on an unmapped, non-lazy
     // address. The PageFaultHandler classifies it $Fatal, reports it, and

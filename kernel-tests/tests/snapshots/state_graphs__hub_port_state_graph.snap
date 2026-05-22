@@ -1,0 +1,69 @@
+---
+source: kernel-tests/tests/state_graphs.rs
+expression: dot
+---
+digraph HubPort {
+    compound=true
+    node [color="deepskyblue4" style="rounded, filled" fillcolor="azure"]
+    edge[color="red"]
+
+    Entry[width=0.2 shape="circle" style="filled" fillcolor="black" label=""]
+    Entry -> Disconnected
+
+    Disconnected [label = <
+        <table CELLBORDER="0" CELLPADDING="5" style="rounded">
+            <tr><td><b>Disconnected</b></td></tr>
+            <hr/>
+            <tr><td align="left"><font point-size="10">
+connect(port: u8)<br ALIGN="LEFT"/>state()<br ALIGN="LEFT"/>
+            </font></td></tr>
+        </table>
+    > margin=0 shape=none]
+    subgraph cluster_Attached {
+        label = <
+            <table cellborder="0" border="0">
+                <tr><td>Attached</td></tr>
+                <hr/>
+                <tr><td align="left"><font point-size="10">
+disconnect()<br ALIGN="LEFT"/>
+                </font></td></tr>
+            </table>
+        >
+        style = rounded
+        Attached [shape="point" width="0"]
+
+        Connected [label = <
+            <table CELLBORDER="0" CELLPADDING="5" style="rounded">
+                <tr><td><b>Connected</b></td></tr>
+                <hr/>
+                <tr><td align="left"><font point-size="10">
+reset()<br ALIGN="LEFT"/>state()<br ALIGN="LEFT"/>
+                </font></td></tr>
+            </table>
+        > margin=0 shape=none]
+        Resetting [label = <
+            <table CELLBORDER="0" CELLPADDING="5" style="rounded">
+                <tr><td><b>Resetting</b></td></tr>
+                <hr/>
+                <tr><td align="left"><font point-size="10">
+$&gt;()<br ALIGN="LEFT"/>reset_complete()<br ALIGN="LEFT"/>timeout()<br ALIGN="LEFT"/>state()<br ALIGN="LEFT"/>
+                </font></td></tr>
+            </table>
+        > margin=0 shape=none]
+        Enabled [label = <
+            <table CELLBORDER="0" CELLPADDING="5" style="rounded">
+                <tr><td><b>Enabled</b></td></tr>
+                <hr/>
+                <tr><td align="left"><font point-size="10">
+$&gt;()<br ALIGN="LEFT"/>is_enabled()<br ALIGN="LEFT"/>state()<br ALIGN="LEFT"/>
+                </font></td></tr>
+            </table>
+        > margin=0 shape=none]
+    }
+
+    Disconnected -> Connected [label=" connect "]
+    Connected -> Resetting [label=" reset "]
+    Resetting -> Enabled [label=" reset_complete "]
+    Resetting -> Connected [label=" timeout "]
+    Attached -> Disconnected [label=" disconnect " ltail="cluster_Attached"]
+}

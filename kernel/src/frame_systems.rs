@@ -81,3 +81,8 @@ include!(concat!(env!("OUT_DIR"), "/tcp_connection.rs"));
 // Actions call crate::ip_reasm::{store,is_complete,on_complete,on_expired};
 // ip_reasm.rs holds the instance + buffer + coverage map.
 include!(concat!(env!("OUT_DIR"), "/ip_reassembly.rs"));
+// HubPort (B6 Step 2): one xHCI root-hub port's connect/reset/enable lifecycle,
+// with disconnect funneled to $Disconnected via the $Attached parent (=> $^).
+// Actions call crate::xhci::{begin_port_reset,on_port_enabled}; the reset is a
+// timed transition (settle timer armed in $Resetting's enter handler).
+include!(concat!(env!("OUT_DIR"), "/hub_port.rs"));

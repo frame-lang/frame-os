@@ -19,7 +19,8 @@
 // physical address space — so the BAR's physical base is directly addressable.
 // All register access is volatile.
 
-use crate::{frames, paging, pci, serial};
+use crate::frame_systems::HubPort;
+use crate::{frames, interrupts, paging, pci, serial};
 use core::ptr::{read_volatile, write_volatile};
 
 /// MMIO mapping flags: writable + cache-disable (PCD, bit 4) + write-through
@@ -54,6 +55,15 @@ const USBSTS_CNR: u32 = 1 << 11; // Controller Not Ready
 const PORTSC_CCS: u32 = 1 << 0; // Current Connect Status
 const PORTSC_PED: u32 = 1 << 1; // Port Enabled/Disabled
 const PORTSC_PR: u32 = 1 << 4; // Port Reset
+// PORTSC change bits (17–23: CSC, PEC, WRC, OCC, PRC, PLC, CEC) are write-1-to-
+// clear. They must be written as 0 when we want to *preserve* them, and PED
+// (also write-1-to-disable) written as 0 so a register write doesn't disable the
+// port. This mask is the set we steer around / clear explicitly.
+const PORTSC_CHANGES: u32 = 0x00FE_0000;
+
+/// Reset-settle cap, in PIT ticks (100 Hz). QEMU completes a port reset in a
+/// tick or two; this is a generous bound before `HubPort` gives up (→ timeout).
+const RESET_SETTLE_TICKS: u64 = 50;
 
 // --- Runtime / interrupter register offsets --------------------------------
 const RT_IR0: usize = 0x20; // interrupter 0 register set
@@ -88,6 +98,11 @@ pub struct Xhci {
 }
 
 static mut XHCI: Option<Xhci> = None;
+/// The first port found with a device connected (set during `init`), and the
+/// reset-settle deadline armed by `begin_port_reset`. Single-flight, matching
+/// the rest of the B6 demo (one device on one port).
+static mut CONNECTED_PORT: u8 = 0;
+static mut RESET_DEADLINE: u64 = 0;
 
 /// The initialized controller, if `init()` succeeded.
 #[allow(dead_code)]
@@ -265,6 +280,9 @@ pub fn init() -> bool {
         let sc = xhci.portsc(port);
         if sc & PORTSC_CCS != 0 {
             connected += 1;
+            if unsafe { (&raw const CONNECTED_PORT).read() } == 0 {
+                unsafe { (&raw mut CONNECTED_PORT).write(port) }; // first connected port
+            }
             serial::write_str("[usb] device connected on port ");
             serial::write_u32_decimal(port as u32);
             serial::write_str(" (PORTSC ");
@@ -328,6 +346,29 @@ impl Xhci {
         unsafe { rd32(self.op, off) }
     }
 
+    fn write_portsc(&self, port: u8, val: u32) {
+        let off = OP_PORTS_BASE + (port as usize - 1) * 0x10;
+        unsafe { wr32(self.op, off, val) };
+    }
+
+    /// Begin a port reset on 1-based `port`: set PORTSC.PR while preserving the
+    /// RW bits and writing 0 to PED + the write-1-to-clear change bits (so the
+    /// write neither disables the port nor clears a pending change).
+    pub fn begin_reset(&self, port: u8) {
+        let v = self.portsc(port);
+        let v = (v & !(PORTSC_PED | PORTSC_CHANGES)) | PORTSC_PR;
+        self.write_portsc(port, v);
+    }
+
+    /// Acknowledge (clear) the write-1-to-clear change bits on `port` after a
+    /// reset completes — write back the currently-set change bits (clearing
+    /// them) with PED written 0 so we don't disable the port.
+    pub fn clear_port_changes(&self, port: u8) {
+        let v = self.portsc(port);
+        let v = (v & !PORTSC_PED) | (v & PORTSC_CHANGES);
+        self.write_portsc(port, v);
+    }
+
     /// Whether a device is currently connected on 1-based `port` (PORTSC.CCS).
     pub fn port_connected(&self, port: u8) -> bool {
         self.portsc(port) & PORTSC_CCS != 0
@@ -351,6 +392,71 @@ impl Xhci {
     pub fn connected_count(&self) -> u32 {
         (1..=self.max_ports).filter(|&p| self.port_connected(p)).count() as u32
     }
+}
+
+// --- HubPort driver (B6 Step 2) --------------------------------------------
+//
+// These are the native actions the `HubPort` Frame system calls, plus the loop
+// that drives one port from connect → reset → enabled. Frame owns the lifecycle
+// (which state, the timed reset transition); this owns the PORTSC pokes + the
+// settle deadline.
+
+/// `HubPort.$Resetting.$>`: assert Port Reset on `port` and arm the settle
+/// deadline (fired as `timeout()` by the driver loop if the controller doesn't
+/// report the port enabled in time).
+pub fn begin_port_reset(port: u8) {
+    if let Some(x) = controller() {
+        x.begin_reset(port);
+    }
+    unsafe { (&raw mut RESET_DEADLINE).write(interrupts::ticks() + RESET_SETTLE_TICKS) };
+    serial::write_str("[usb] resetting port ");
+    serial::write_u32_decimal(port as u32);
+    serial::writeln("");
+}
+
+/// `HubPort.$Enabled.$>`: the port reset completed and the controller enabled
+/// the port — the device is now in its Default state, ready for enumeration.
+pub fn on_port_enabled(port: u8) {
+    serial::write_str("[usb] port ");
+    serial::write_u32_decimal(port as u32);
+    serial::writeln(" enabled");
+}
+
+/// Whether the controller reports `port` enabled (reset completed).
+fn port_reset_done(port: u8) -> bool {
+    controller().map(|x| x.port_enabled(port)).unwrap_or(false)
+}
+
+/// Drive the connected port through its `HubPort` lifecycle: connect → reset →
+/// (enabled | timeout). Called from kmain after `init()`. Single-flight (the one
+/// device detected at bring-up).
+pub fn run_port_lifecycle() {
+    let port = unsafe { (&raw const CONNECTED_PORT).read() };
+    if port == 0 {
+        return; // no device connected
+    }
+
+    interrupts::enable();
+    let mut hp = HubPort::__create();
+    hp.connect(port); // -> $Connected
+    hp.reset(); // -> $Resetting ($> asserts PR + arms the settle deadline)
+
+    loop {
+        if port_reset_done(port) {
+            hp.reset_complete(); // -> $Enabled ($> logs)
+            if let Some(x) = controller() {
+                x.clear_port_changes(port); // ack the reset-change bits
+            }
+            break;
+        }
+        if interrupts::ticks() >= unsafe { (&raw const RESET_DEADLINE).read() } {
+            hp.timeout(); // -> $Connected
+            serial::writeln("[usb] port reset timed out");
+            break;
+        }
+        interrupts::wait_for_interrupt();
+    }
+    interrupts::disable();
 }
 
 // --- bounded register polling ----------------------------------------------

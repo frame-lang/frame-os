@@ -186,3 +186,11 @@ fn ip_reassembly_state_graph_snapshot() {
     };
     insta::assert_snapshot!("ip_reassembly_state_graph", dot);
 }
+
+#[test]
+fn hub_port_state_graph_snapshot() {
+    let Some(dot) = frame_to_dot("hub_port.frs") else {
+        return; // framec unavailable; test skipped
+    };
+    insta::assert_snapshot!("hub_port_state_graph", dot);
+}
