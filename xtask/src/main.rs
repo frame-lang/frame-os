@@ -166,6 +166,7 @@ const DIAGRAMS: &[(&str, &str)] = &[
     ("open_file.frs", "open_file.svg"),
     ("arp_resolver.frs", "arp_resolver.svg"),
     ("rx_pipeline.frs", "rx_pipeline.svg"),
+    ("udp_socket.frs", "udp_socket.svg"),
 ];
 
 fn diagrams(mode: DiagramMode) -> Result<()> {
@@ -1033,6 +1034,29 @@ const SMOKE_TESTS: &[SmokeTest] = &[
             "KERNEL PANIC",
             "triple fault",
             "[icmp] no reply (timeout)",
+        ],
+        timeout_secs: 20,
+    },
+    SmokeTest {
+        // B5 Step 3b: UDP + UdpSocket. The kernel binds a UDP socket on :68 and
+        // sends a DHCP DISCOVER; slirp's DHCP server answers with an OFFER,
+        // which the RxPipeline classifies (IPv4 → UDP) and delivers to the bound
+        // socket (on_udp → UdpSocket.recv()). Proves UDP encode/parse + the
+        // bind lifecycle + the pipeline's $Udp leaf on a real inbound datagram.
+        // slirp always runs its DHCP server, so the OFFER is deterministic.
+        name: "dhcp_offer_b5",
+        expect_contains: &[
+            "[udp] socket bound on :68",
+            "[dhcp] DISCOVER",
+            "[dhcp] OFFER: 10.0.2.",
+            "[udp] datagram delivered to socket :68 (count 1)",
+            "[net] DHCP offer via UdpSocket: ok",
+        ],
+        expect_absent: &[
+            "KERNEL EXCEPTION",
+            "KERNEL PANIC",
+            "triple fault",
+            "[dhcp] no OFFER (timeout)",
         ],
         timeout_secs: 20,
     },

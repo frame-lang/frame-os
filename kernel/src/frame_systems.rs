@@ -69,3 +69,6 @@ include!(concat!(env!("OUT_DIR"), "/arp_resolver.rs"));
 // handler, threading an RxDescriptor down the classify→dispatch graph via enter
 // params. Actions call crate::net::{on_arp,on_icmp,on_udp}.
 include!(concat!(env!("OUT_DIR"), "/rx_pipeline.rs"));
+// UdpSocket (B5 Step 3b): one UDP socket's bind lifecycle ($Unbound → $Bound).
+// Pure (no native deps); net.rs holds one and the $Udp leaf delivers to it.
+include!(concat!(env!("OUT_DIR"), "/udp_socket.rs"));

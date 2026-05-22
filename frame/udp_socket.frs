@@ -1,0 +1,50 @@
+// frame/udp_socket.frs
+//
+// UdpSocket — one UDP socket's bind lifecycle (B5 Step 3b): `$Unbound → $Bound`.
+// The bind state IS the invariant: a datagram is only delivered (`recv()`) to a
+// socket that is `$Bound`, so a stray datagram for an unbound socket is dropped
+// structurally rather than checked with a flag. (Same "the invariant is the
+// state" call as `OpenFile`'s access mode and `Mount.is_mounted`.)
+//
+// Per-instance lifecycle, not a pipeline: the `RxPipeline`'s `$Udp` leaf
+// delivers an inbound datagram to the socket bound on its destination port.
+// Native (`crate::net`) owns the datagram bytes + the port match; this owns
+// "is this socket bound, on which port, how many datagrams has it received."
+//
+//   $Unbound ── bind(port) ──► $Bound ── recv (count++) ──┐
+//      ▲                          │  ▲                     │
+//      └──────── close ───────────┘  └─────────────────────┘
+
+@@[target("rust")]
+
+@@system UdpSocket {
+    interface:
+        bind(port: u16)
+        recv()
+        close()
+        is_bound(): bool = false
+        port(): u16 = self.port
+        received(): u32 = self.received
+
+    machine:
+        $Unbound {
+            bind(port: u16) {
+                self.port = port;
+                -> $Bound
+            }
+        }
+
+        $Bound {
+            recv() {
+                self.received = self.received + 1;
+            }
+            close() {
+                -> $Unbound
+            }
+            is_bound(): bool { @@:(true) }
+        }
+
+    domain:
+        port: u16 = 0
+        received: u32 = 0
+}

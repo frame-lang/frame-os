@@ -32,6 +32,7 @@ const FRAME_SYSTEMS: &[(&str, &str)] = &[
     ("open_file", "open_file.frs"),
     ("arp_resolver", "arp_resolver.frs"),
     ("rx_pipeline", "rx_pipeline.frs"),
+    ("udp_socket", "udp_socket.frs"),
     ("kernel", "kernel.frs"),
 ];
 

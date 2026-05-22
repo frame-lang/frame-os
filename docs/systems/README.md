@@ -48,6 +48,7 @@ These run inside the bare-metal kernel image. They do not appear in the hosted-m
 | [`OpenFile`](open_file.md) | B4 | Documented | One open file descriptor's lifecycle, access mode as state: `$Open → $Reading \| $Writing → $Closed`. The VFS holds one per fd; wrong-mode ops are gated out. |
 | [`ArpResolver`](arp_resolver.md) | B5 | Documented | One IPv4→MAC resolution's lifecycle: `$Incomplete → $Resolved`, with a retransmit timer armed in the enter handler and `-> $Failed` at the retry cap. The first networking Frame system; the timer-via-enter-handler pattern. |
 | [`RxPipeline`](rx_pipeline.md) | B5 | Documented | Classify a received frame and dispatch it: `$Idle → $Classifying → ($Arp \| $Ipv4 → $Icmp \| $Udp)`, threading a parsed `RxDescriptor` down the graph via enter params. The marquee data-pipeline recipe. |
+| [`UdpSocket`](udp_socket.md) | B5 | Documented | One UDP socket's bind lifecycle: `$Unbound → $Bound`. `recv()` is gated to `$Bound` (bind state as the invariant). The `RxPipeline` `$Udp` leaf delivers to it; drives the DHCP exchange. |
 
 ## Shared systems
 

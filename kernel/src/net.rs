@@ -12,7 +12,7 @@
 // timers, rehearsed small here. ARP/timer state is single-flight (one
 // resolution at a time at Step 2a), so plain statics suffice.
 
-use crate::frame_systems::{ArpResolver, RxPipeline};
+use crate::frame_systems::{ArpResolver, RxPipeline, UdpSocket};
 use crate::{interrupts, serial, virtio_net};
 
 /// The small parsed summary of a received frame that flows down the
@@ -57,9 +57,21 @@ static mut ICMP_REPLY_SEEN: bool = false; // on_icmp saw our ping's reply
 static mut EXPECTED_PING_SEQ: u16 = 0;
 static mut PIPELINE: Option<RxPipeline> = None;
 
+// UDP socket state (B5 Step 3b). One socket, single-flight, like the rest of
+// the demo. DHCP uses xid to match its own reply; the offered IP is latched.
+static mut UDP_SOCK: Option<UdpSocket> = None;
+static mut DHCP_XID: [u8; 4] = [0x39, 0x03, 0xF3, 0x26];
+static mut DHCP_OFFER_SEEN: bool = false;
+static mut OFFERED_IP: [u8; 4] = [0; 4];
+
 fn pipeline() -> &'static mut RxPipeline {
     let p = &raw mut PIPELINE;
     unsafe { (*p).get_or_insert_with(RxPipeline::__create) }
+}
+
+fn udp_sock() -> &'static mut UdpSocket {
+    let p = &raw mut UDP_SOCK;
+    unsafe { (*p).get_or_insert_with(UdpSocket::__create) }
 }
 
 // --- helpers called by the ArpResolver Frame system ------------------------
@@ -165,9 +177,40 @@ pub fn on_icmp(_pkt: RxDescriptor) {
     }
 }
 
-/// Pipeline leaf (`$Udp`): a UDP datagram arrived. (Delivered to a `UdpSocket`
-/// at B5 Step 3b; a no-op for now.)
-pub fn on_udp(_pkt: RxDescriptor) {}
+/// Pipeline leaf (`$Udp`): deliver an inbound UDP datagram to the socket bound
+/// on its destination port. If it's our DHCP OFFER (port 68, BOOTREPLY, our
+/// xid), latch the offered IP. The bound-socket check is the `UdpSocket`'s job
+/// — `recv()` is only handled in `$Bound`.
+pub fn on_udp(_pkt: RxDescriptor) {
+    let frame = rx_frame();
+    let ihl = (frame[14] & 0x0F) as usize * 4;
+    let udp = 14 + ihl;
+    if frame.len() < udp + 8 {
+        return;
+    }
+    let dst_port = u16::from_be_bytes([frame[udp + 2], frame[udp + 3]]);
+
+    let sock = udp_sock();
+    if !sock.is_bound() || sock.port() != dst_port {
+        return; // no socket bound on this port → dropped
+    }
+
+    // DHCP OFFER? (UDP :68, BOOTREPLY op=2, magic cookie, our xid.)
+    let dhcp = udp + 8;
+    let xid = unsafe { (&raw const DHCP_XID).read() };
+    if dst_port == 68
+        && frame.len() >= dhcp + 240
+        && frame[dhcp] == 2
+        && frame[dhcp + 4..dhcp + 8] == xid
+        && frame[dhcp + 236..dhcp + 240] == [0x63, 0x82, 0x53, 0x63]
+    {
+        let p = &raw mut OFFERED_IP;
+        unsafe { (*p).copy_from_slice(&frame[dhcp + 16..dhcp + 20]) }; // yiaddr
+        unsafe { (&raw mut DHCP_OFFER_SEEN).write(true) };
+    }
+
+    sock.recv(); // gated: only $Bound counts it
+}
 
 /// Pump one received frame through the `RxPipeline`: copy it into the native
 /// RX buffer, parse its descriptor, and `deliver` it to the Frame classifier
@@ -313,6 +356,11 @@ pub fn run_demo() {
 
     // B5 Step 2b: ICMP echo (ping) the gateway, now that we have its MAC.
     ping_gateway();
+
+    // B5 Step 3b: bind a UDP socket and do a DHCP DISCOVER → OFFER round-trip
+    // (slirp always answers its DHCP server), exercising UDP + the UdpSocket
+    // lifecycle + the RxPipeline's $Udp leaf on a real inbound datagram.
+    dhcp_exchange();
 }
 
 /// B5 Step 2b: send an ICMP echo request to the gateway and wait for the reply
@@ -348,6 +396,97 @@ fn ping_gateway() {
         serial::writeln("[net] ping ok");
     } else {
         serial::writeln("[icmp] no reply (timeout)");
+    }
+}
+
+// --- UDP + DHCP (B5 Step 3b) -----------------------------------------------
+
+/// Send a broadcast DHCP DISCOVER (Ethernet → IPv4 → UDP :68→:67 → BOOTP). The
+/// UDP checksum is left 0 (optional for IPv4); the broadcast flag asks slirp to
+/// broadcast its reply (we have no IP yet).
+fn send_dhcp_discover() {
+    let mac = virtio_net::mac();
+    let xid = unsafe { (&raw const DHCP_XID).read() };
+    // 14 eth + 20 ip + 8 udp + 244 dhcp (236 BOOTP + 4 cookie + 3 opt53 + 1 end).
+    let mut f = [0u8; 14 + 20 + 8 + 244];
+
+    // Ethernet: broadcast.
+    f[0..6].copy_from_slice(&[0xFF; 6]);
+    f[6..12].copy_from_slice(&mac);
+    f[12..14].copy_from_slice(&[0x08, 0x00]); // IPv4
+
+    // IPv4: 0.0.0.0 → 255.255.255.255, proto UDP.
+    let total_len = (20 + 8 + 244) as u16;
+    f[14] = 0x45;
+    f[16..18].copy_from_slice(&total_len.to_be_bytes());
+    f[22] = 64; // TTL
+    f[23] = 17; // UDP
+    f[30..34].copy_from_slice(&[255, 255, 255, 255]); // dst
+    let ip_csum = checksum(&f[14..34]);
+    f[24..26].copy_from_slice(&ip_csum.to_be_bytes());
+
+    // UDP: 68 → 67, checksum 0 (optional for IPv4).
+    let udp = 34;
+    f[udp..udp + 2].copy_from_slice(&68u16.to_be_bytes());
+    f[udp + 2..udp + 4].copy_from_slice(&67u16.to_be_bytes());
+    f[udp + 4..udp + 6].copy_from_slice(&((8 + 244) as u16).to_be_bytes());
+
+    // BOOTP/DHCP.
+    let d = udp + 8;
+    f[d] = 1; // op = BOOTREQUEST
+    f[d + 1] = 1; // htype = Ethernet
+    f[d + 2] = 6; // hlen
+    f[d + 4..d + 8].copy_from_slice(&xid);
+    f[d + 10..d + 12].copy_from_slice(&0x8000u16.to_be_bytes()); // broadcast flag
+    f[d + 28..d + 34].copy_from_slice(&mac); // chaddr
+    f[d + 236..d + 240].copy_from_slice(&[0x63, 0x82, 0x53, 0x63]); // magic cookie
+    f[d + 240..d + 243].copy_from_slice(&[53, 1, 1]); // option 53: DHCP DISCOVER
+    f[d + 243] = 0xFF; // option 255: end
+
+    virtio_net::tx_frame(&f);
+}
+
+/// B5 Step 3b: bind a UDP socket on the DHCP client port and DISCOVER. slirp's
+/// DHCP server answers with an OFFER, which the RxPipeline classifies (IPv4 →
+/// UDP) and delivers to the bound socket (`on_udp` → `recv()`); we latch + log
+/// the offered IP.
+fn dhcp_exchange() {
+    udp_sock().bind(68); // $Unbound → $Bound
+    serial::writeln("[udp] socket bound on :68");
+    unsafe { (&raw mut DHCP_OFFER_SEEN).write(false) };
+    serial::writeln("[dhcp] DISCOVER");
+    send_dhcp_discover();
+
+    interrupts::enable();
+    let deadline = interrupts::ticks() + 300;
+    while interrupts::ticks() < deadline {
+        if pump() {
+            if unsafe { (&raw const DHCP_OFFER_SEEN).read() } {
+                break;
+            }
+        } else {
+            interrupts::wait_for_interrupt();
+        }
+    }
+    interrupts::disable();
+
+    if unsafe { (&raw const DHCP_OFFER_SEEN).read() } {
+        let ip = unsafe { (&raw const OFFERED_IP).read() };
+        serial::write_str("[dhcp] OFFER: ");
+        serial::write_u32_decimal(ip[0] as u32);
+        serial::write_byte(b'.');
+        serial::write_u32_decimal(ip[1] as u32);
+        serial::write_byte(b'.');
+        serial::write_u32_decimal(ip[2] as u32);
+        serial::write_byte(b'.');
+        serial::write_u32_decimal(ip[3] as u32);
+        serial::writeln("");
+        serial::write_str("[udp] datagram delivered to socket :68 (count ");
+        serial::write_u32_decimal(udp_sock().received());
+        serial::writeln(")");
+        serial::writeln("[net] DHCP offer via UdpSocket: ok");
+    } else {
+        serial::writeln("[dhcp] no OFFER (timeout)");
     }
 }
 
