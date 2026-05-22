@@ -1437,6 +1437,25 @@ const SMOKE_TESTS: &[SmokeTest] = &[
         ],
         timeout_secs: 30,
     },
+    SmokeTest {
+        // B7 Step 2: cross-core locking. All 4 cores hammer a shared counter
+        // 50000 times each through the IRQ-safe SpinLock, concurrently; the exact
+        // total (200000, no lost updates) proves the lock serialized every
+        // increment under true parallelism.
+        name: "smp_concurrent_b7",
+        expect_contains: &[
+            "[smp] cores online: 4 of 4",
+            "[smp] shared counter: 200000 (expected 200000)",
+            "[smp] cross-core lock: ok (no lost updates)",
+        ],
+        expect_absent: &[
+            "KERNEL EXCEPTION",
+            "KERNEL PANIC",
+            "triple fault",
+            "[smp] cross-core lock: FAILED",
+        ],
+        timeout_secs: 30,
+    },
 ];
 
 fn run_qemu_test() -> Result<()> {

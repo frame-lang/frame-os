@@ -46,6 +46,7 @@ mod pit;
 mod sched;
 mod sched_demo;
 mod serial;
+mod spin;
 mod tcp;
 mod usermode;
 mod vfs;
@@ -90,6 +91,22 @@ static MP_REQUEST: limine::request::MpRequest = limine::request::MpRequest::new(
 /// per-CPU state. The BSP waits on this during SMP bringup.
 static AP_ONLINE: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
 
+// B7 Step 2: a cross-core, lock-protected shared counter. Every core (BSP + APs)
+// hammers it concurrently; if the `SpinLock` is correct, the final total is
+// exactly cores × `HAMMER_ITERS` with no lost updates. `AP_HAMMERED` lets the
+// BSP wait for the APs to finish their share.
+static SHARED_COUNTER: spin::SpinLock<u64> = spin::SpinLock::new(0);
+static AP_HAMMERED: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+const HAMMER_ITERS: u64 = 50_000;
+
+/// Increment the shared counter `HAMMER_ITERS` times, taking the lock each time —
+/// the cross-core critical-section stress. Run concurrently by every core.
+fn hammer_counter() {
+    for _ in 0..HAMMER_ITERS {
+        *SHARED_COUNTER.lock() += 1;
+    }
+}
+
 /// Application-processor entry point. Limine jumps here (in our address space,
 /// on a Limine-provided stack) once the BSP writes the CPU's `goto_address`. The
 /// CPU's index was stashed in `extra` by the BSP. B7 Step 1: set up per-CPU state
@@ -99,8 +116,12 @@ unsafe extern "C" fn ap_entry(cpu: &limine::mp::Cpu) -> ! {
     let index = cpu.extra.load(Ordering::SeqCst) as usize;
     percpu::init_this_cpu(index, cpu.lapic_id);
     AP_ONLINE.fetch_add(1, Ordering::SeqCst);
+    // B7 Step 2: hammer the shared counter concurrently with the other cores
+    // (the SpinLock cross-core stress), then signal done.
+    hammer_counter();
+    AP_HAMMERED.fetch_add(1, Ordering::SeqCst);
     // Park: interrupts off (the timer/PIC route to the BSP; APs run the
-    // scheduler from B7 Step 2 onward), low-power halt.
+    // scheduler from a later B7 step), low-power halt.
     loop {
         unsafe { core::arch::asm!("cli; hlt", options(nomem, nostack)) };
     }
@@ -181,6 +202,29 @@ unsafe extern "C" fn kmain() -> ! {
             serial::write_str(", this cpu ");
             serial::write_u32_decimal(percpu::this_cpu_index());
             serial::writeln(")");
+
+            // B7 Step 2: the BSP joins the APs in hammering the shared counter
+            // (they started as soon as they came online), then waits for all APs
+            // to finish and checks the total — exactly cores × HAMMER_ITERS iff
+            // the SpinLock serialized every increment with no lost update.
+            hammer_counter();
+            let mut spins = 0u64;
+            while AP_HAMMERED.load(Ordering::SeqCst) < ap_count && spins < 1_000_000_000 {
+                spins += 1;
+                core::hint::spin_loop();
+            }
+            let total = *SHARED_COUNTER.lock();
+            let expected = (ap_count as u64 + 1) * HAMMER_ITERS;
+            serial::write_str("[smp] shared counter: ");
+            serial::write_u32_decimal(total as u32);
+            serial::write_str(" (expected ");
+            serial::write_u32_decimal(expected as u32);
+            serial::writeln(")");
+            if total == expected {
+                serial::writeln("[smp] cross-core lock: ok (no lost updates)");
+            } else {
+                serial::writeln("[smp] cross-core lock: FAILED (lost updates)");
+            }
         } else {
             serial::writeln("[smp] no MP response (single core)");
         }
