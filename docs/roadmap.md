@@ -470,6 +470,10 @@ H3 is the H-track's final committed milestone. Further H-track work (a configura
 
 **Estimated effort:** Very large.
 
+#### Steps
+
+- **Step 1 (native xHCI controller bring-up) — done.** The native foundation, no Frame system yet. `kernel/src/xhci.rs`: discover the controller by PCI class (`0C/03/30`, via the new `pci::find_by_class` + `bar_mem` 64-bit-BAR helpers), **map its MMIO window** (the BAR sits in QEMU's high PCIe hole, which Limine's HHDM does *not* map — so `paging::map` the register window uncached, the first explicit MMIO mapping in the kernel), reset the controller (`USBCMD.HCRST`), stand up the structures the spec requires before Run — DCBAA (+ scratchpad buffers if requested), command ring (with a Link TRB), event ring + a one-entry ERST wired into interrupter 0 — set `USBCMD.R/S`, and report any device on a port (`PORTSC.CCS`). QEMU now boots with `-device qemu-xhci -device usb-kbd`; the kernel logs `xHCI running` + `device connected on port 5`. Validated by `usb_controller_b6` (**29/29** QEMU smoke; no regression). The USB *lifecycle* (port reset, enumeration, transfers) is driven by Frame systems in Steps 2–4.
+
 ### B7 — SMP
 
 **Scope:** B6 plus symmetric multiprocessing. Bring up the application processors, run the scheduler across all cores, and make the kernel safe under true concurrency. The hardest milestone, and the one that most tests the deferred-event queue's concurrency story.

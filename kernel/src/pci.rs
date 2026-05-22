@@ -62,6 +62,21 @@ impl PciDevice {
         (bar & 0xFFFF_FFFC) as u16
     }
 
+    /// Physical base address of memory BAR `n` (the xHCI MMIO window). Memory
+    /// BARs have bit 0 clear; bits 2:1 encode the type — `0b10` means a 64-bit
+    /// BAR whose high dword lives in BAR `n+1`. The low 4 flag bits are masked.
+    pub fn bar_mem(&self, n: u8) -> u64 {
+        let lo = self.read_u32(0x10 + n * 4);
+        let is_64bit = (lo >> 1) & 0b11 == 0b10;
+        let base_lo = (lo & 0xFFFF_FFF0) as u64;
+        if is_64bit {
+            let hi = self.read_u32(0x10 + (n + 1) * 4) as u64;
+            (hi << 32) | base_lo
+        } else {
+            base_lo
+        }
+    }
+
     /// The interrupt line (legacy PIC IRQ number) from config offset 0x3C.
     pub fn interrupt_line(&self) -> u8 {
         (self.read_u32(0x3C) & 0xFF) as u8
@@ -72,6 +87,20 @@ impl PciDevice {
     pub fn enable_io_and_bus_master(&self) {
         let cmd = self.read_u32(0x04);
         self.write_u32(0x04, cmd | 0b101);
+    }
+
+    /// Enable memory-space decoding (bit 1) and bus-mastering/DMA (bit 2) in the
+    /// command register (offset 0x04). The xHCI driver speaks MMIO, not I/O.
+    pub fn enable_mem_and_bus_master(&self) {
+        let cmd = self.read_u32(0x04);
+        self.write_u32(0x04, cmd | 0b110);
+    }
+
+    /// The (class, subclass, prog-if) triple from config offset 0x08 (the high
+    /// 3 bytes of the class-code dword).
+    pub fn class_code(&self) -> (u8, u8, u8) {
+        let v = self.read_u32(0x08);
+        (((v >> 24) & 0xFF) as u8, ((v >> 16) & 0xFF) as u8, ((v >> 8) & 0xFF) as u8)
     }
 }
 
@@ -91,6 +120,28 @@ pub fn find(vendor: u16, device: u16) -> Option<PciDevice> {
                 continue; // no device/function here
             }
             if ven == vendor && did == device {
+                return Some(d);
+            }
+        }
+    }
+    None
+}
+
+/// Scan bus 0 for the first device matching a (class, subclass, prog-if) triple.
+/// xHCI controllers are class 0x0C (serial bus), subclass 0x03 (USB), prog-if
+/// 0x30 — discovering by class avoids hardcoding a controller vendor/device id.
+pub fn find_by_class(class: u8, subclass: u8, prog_if: u8) -> Option<PciDevice> {
+    for dev in 0..32u8 {
+        for func in 0..8u8 {
+            let d = PciDevice {
+                bus: 0,
+                device: dev,
+                function: func,
+            };
+            if (d.read_u32(0x00) & 0xFFFF) as u16 == 0xFFFF {
+                continue; // no device/function here
+            }
+            if d.class_code() == (class, subclass, prog_if) {
                 return Some(d);
             }
         }

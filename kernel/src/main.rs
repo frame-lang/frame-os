@@ -51,6 +51,7 @@ mod vfs;
 mod virtio_blk;
 mod virtio_net;
 mod vm;
+mod xhci;
 
 use frame_systems::Kernel;
 
@@ -270,6 +271,12 @@ unsafe extern "C" fn kmain() -> ! {
     // the first networking Frame system + the retransmit-timer-via-enter-handler
     // pattern.
     net::run_demo();
+
+    // B6 Step 1: bring up the xHCI USB host controller (PCI discovery + MMIO +
+    // reset + DCBAA/command-ring/event-ring setup + Run), then report any device
+    // connected on a port. The USB lifecycle (port reset, enumeration, transfers)
+    // is driven by Frame systems in later B6 steps.
+    xhci::init();
 
     // B2 Step 3 (fatal path): deliberately fault on an unmapped, non-lazy
     // address. The PageFaultHandler classifies it $Fatal, reports it, and

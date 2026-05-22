@@ -593,6 +593,12 @@ fn qemu_base_command(
             "-device",
             "virtio-net-pci,netdev=net0,disable-modern=on,disable-legacy=off",
         ])
+        // B6: an xHCI USB host controller with a HID keyboard attached. The
+        // kernel's xhci::init() discovers the controller (PCI class 0C0330),
+        // brings it up, and detects the keyboard connected on a port. Harmless
+        // for B0–B5 (nothing touches USB there).
+        .args(["-device", "qemu-xhci,id=xhci"])
+        .args(["-device", "usb-kbd,bus=xhci.0"])
         .args(["-display", "none"])
         // isa-debug-exit: the kernel's halt path writes port 0xf4, which
         // makes QEMU exit cleanly (code (val<<1)|1) once the boot/demos are
@@ -1334,6 +1340,20 @@ const SMOKE_TESTS: &[SmokeTest] = &[
         expect_contains: &[
             "[tcp] connecting to 10.0.2.100:9 (active open)",
             "[tcp] connected (active open)",
+        ],
+        expect_absent: &["KERNEL EXCEPTION", "KERNEL PANIC", "triple fault"],
+        timeout_secs: 30,
+    },
+    SmokeTest {
+        // B6 Step 1: xHCI USB host-controller bring-up. The kernel discovers the
+        // qemu-xhci controller (PCI class 0C0330), maps its MMIO window, resets
+        // it, stands up the DCBAA/command-ring/event-ring, sets Run, and detects
+        // the attached usb-kbd connected on a port. (Enumeration + transfers land
+        // in later B6 steps; this proves the controller comes up + sees a device.)
+        name: "usb_controller_b6",
+        expect_contains: &[
+            "[usb] xHCI running",
+            "[usb] device connected on port",
         ],
         expect_absent: &["KERNEL EXCEPTION", "KERNEL PANIC", "triple fault"],
         timeout_secs: 30,
