@@ -57,6 +57,8 @@
             $>(pkt: crate::net::RxDescriptor) {
                 if pkt.ip_proto == 1 {
                     -> (pkt) $Icmp
+                } else if pkt.ip_proto == 6 {
+                    -> (pkt) $Tcp
                 } else if pkt.ip_proto == 17 {
                     -> (pkt) $Udp
                 } else {
@@ -75,6 +77,13 @@
         $Udp {
             $>(pkt: crate::net::RxDescriptor) {
                 crate::net::on_udp(pkt);
+                -> $Idle
+            }
+        }
+
+        $Tcp {
+            $>(pkt: crate::net::RxDescriptor) {
+                crate::net::on_tcp(pkt);
                 -> $Idle
             }
         }

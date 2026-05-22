@@ -44,6 +44,7 @@ mod pit;
 mod sched;
 mod sched_demo;
 mod serial;
+mod tcp;
 mod usermode;
 mod vfs;
 mod virtio_blk;

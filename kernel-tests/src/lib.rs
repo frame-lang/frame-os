@@ -280,6 +280,9 @@ pub mod net {
     pub fn on_udp(_pkt: RxDescriptor) {
         DISPATCH.with(|c| c.set("udp"));
     }
+    pub fn on_tcp(_pkt: RxDescriptor) {
+        DISPATCH.with(|c| c.set("tcp"));
+    }
 
     // Test inspectors.
     pub fn requests_sent() -> u32 {
@@ -299,6 +302,76 @@ pub mod net {
         ARMS.with(|c| c.set(0));
         FAILED.with(|c| c.set(false));
         DISPATCH.with(|c| c.set(""));
+    }
+}
+
+/// Host test-double for the kernel's `tcp` module. The generated
+/// `TcpConnection` actions call `crate::tcp::{send_syn, send_syn_ack, send_ack,
+/// send_fin, deliver_data, arm_retransmit, cancel_retransmit, arm_timewait,
+/// on_reset}`, and its `segment(seg)` handlers read `seg.{syn,ack,fin,
+/// payload_len}`. Here the segment is a plain struct the tests build, and the
+/// actions push their names onto a thread-local log so a test can assert "the
+/// SYN-ACK was sent on this transition."
+pub mod tcp {
+    use std::cell::RefCell;
+
+    /// Mirror of the kernel's `crate::tcp::TcpSegment` — the parsed segment the
+    /// FSM routes on. (The kernel's carries more fields for actually building
+    /// replies; the FSM only reads these.)
+    #[derive(Clone, Copy, Default, Debug)]
+    pub struct TcpSegment {
+        pub syn: bool,
+        pub ack: bool,
+        pub fin: bool,
+        pub rst: bool,
+        pub payload_len: usize,
+    }
+
+    thread_local! {
+        static ACTIONS: RefCell<Vec<&'static str>> = const { RefCell::new(Vec::new()) };
+    }
+    fn rec(a: &'static str) {
+        ACTIONS.with(|c| c.borrow_mut().push(a));
+    }
+
+    pub fn send_syn() {
+        rec("send_syn");
+    }
+    pub fn send_syn_ack() {
+        rec("send_syn_ack");
+    }
+    pub fn send_ack() {
+        rec("send_ack");
+    }
+    pub fn send_fin() {
+        rec("send_fin");
+    }
+    pub fn deliver_data() {
+        rec("deliver_data");
+    }
+    pub fn arm_retransmit() {
+        rec("arm_retransmit");
+    }
+    pub fn cancel_retransmit() {
+        rec("cancel_retransmit");
+    }
+    pub fn arm_timewait() {
+        rec("arm_timewait");
+    }
+    pub fn on_reset() {
+        rec("on_reset");
+    }
+
+    /// The actions fired since the last `reset()`.
+    pub fn actions() -> Vec<&'static str> {
+        ACTIONS.with(|c| c.borrow().clone())
+    }
+    /// Whether `a` was among the fired actions.
+    pub fn fired(a: &'static str) -> bool {
+        ACTIONS.with(|c| c.borrow().contains(&a))
+    }
+    pub fn reset() {
+        ACTIONS.with(|c| c.borrow_mut().clear());
     }
 }
 
@@ -334,3 +407,6 @@ include!(concat!(env!("OUT_DIR"), "/arp_resolver.rs"));
 include!(concat!(env!("OUT_DIR"), "/rx_pipeline.rs"));
 // UdpSocket (B5 Step 3b): one UDP socket's bind lifecycle. Pure (no native deps).
 include!(concat!(env!("OUT_DIR"), "/udp_socket.rs"));
+// TcpConnection (B5 Step 4): the RFC-793 state machine. Actions call
+// crate::tcp::* (the host double above records them); segment() reads seg fields.
+include!(concat!(env!("OUT_DIR"), "/tcp_connection.rs"));

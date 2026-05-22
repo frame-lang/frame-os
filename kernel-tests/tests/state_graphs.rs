@@ -170,3 +170,11 @@ fn udp_socket_state_graph_snapshot() {
     };
     insta::assert_snapshot!("udp_socket_state_graph", dot);
 }
+
+#[test]
+fn tcp_connection_state_graph_snapshot() {
+    let Some(dot) = frame_to_dot("tcp_connection.frs") else {
+        return; // framec unavailable; test skipped
+    };
+    insta::assert_snapshot!("tcp_connection_state_graph", dot);
+}

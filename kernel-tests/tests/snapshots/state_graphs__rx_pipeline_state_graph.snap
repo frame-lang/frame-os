@@ -64,6 +64,15 @@ $&gt;()<br ALIGN="LEFT"/>
             </font></td></tr>
         </table>
     > margin=0 shape=none]
+    Tcp [label = <
+        <table CELLBORDER="0" CELLPADDING="5" style="rounded">
+            <tr><td><b>Tcp</b></td></tr>
+            <hr/>
+            <tr><td align="left"><font point-size="10">
+$&gt;()<br ALIGN="LEFT"/>
+            </font></td></tr>
+        </table>
+    > margin=0 shape=none]
 
     Idle -> Classifying [label=" deliver "]
     Classifying -> Arp [label=" $> "]
@@ -71,8 +80,10 @@ $&gt;()<br ALIGN="LEFT"/>
     Classifying -> Idle [label=" $> "]
     Arp -> Idle [label=" $> "]
     Ipv4 -> Icmp [label=" $> "]
+    Ipv4 -> Tcp [label=" $> "]
     Ipv4 -> Udp [label=" $> "]
     Ipv4 -> Idle [label=" $> "]
     Icmp -> Idle [label=" $> "]
     Udp -> Idle [label=" $> "]
+    Tcp -> Idle [label=" $> "]
 }

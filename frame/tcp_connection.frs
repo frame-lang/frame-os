@@ -1,0 +1,205 @@
+// frame/tcp_connection.frs
+//
+// TcpConnection — one TCP connection's lifecycle, the full RFC-793 state
+// machine (B5 Step 4). The milestone the project's "stress-test Frame" thesis
+// is pointed at: TCP *is* a state machine, top to bottom, and this is the
+// deepest Frame system in the tree — 11 states under an `$Open` parent that
+// funnels RST/abort to a single `-> $Closed` disposition.
+//
+// Segments are the event, processed per state. The RxPipeline's $Tcp leaf
+// parses a `TcpSegment` and fires `segment(seg)` (or `rst()` on a RST); each
+// state inspects the segment's flags with native `if` guards (Frame guards =
+// native conditionals around transitions) and transitions. Native (crate::tcp)
+// owns the bytes, seq/window arithmetic, send/recv buffers, and the timer
+// wheel; this owns *which state, and what each segment/timeout means in it*.
+//
+// State graph (RFC-793; $Closed is the initial + terminal state; every other
+// state is a child of the $Open parent, which holds the RST funnel):
+//
+//   $Closed ─open_active─► $SynSent ─SYN+ACK─► $Established ─FIN─► $CloseWait
+//      │                      │ (SYN)              │ close            │ close
+//      └─open_passive─► $Listen ─SYN─► $SynReceived─ACK┘              ▼
+//                                          ▲ (ACK)   │ close      $LastAck ─ACK─► $Closed
+//                                                    ▼
+//   $FinWait1 ─ACK─► $FinWait2 ─FIN─► $TimeWait ─timeout─► $Closed
+//      │ FIN (simultaneous close) ─► $Closing ─ACK─► $TimeWait
+//
+// Timers (retransmit in $SynSent/$SynReceived/$LastAck; 2·MSL in $TimeWait) are
+// armed in enter handlers and fired by the native wheel via post/drain — the
+// same pattern as ArpResolver, now with the connection's multiple timers.
+
+@@[target("rust")]
+
+@@system TcpConnection {
+    interface:
+        open_passive()
+        open_active()
+        segment(seg: crate::tcp::TcpSegment)
+        close()
+        timeout()
+        rst()
+        // The current state name, for tests + the kernel's progress logging.
+        state(): String = "Closed".to_string()
+
+    machine:
+        $Closed {
+            open_passive() {
+                -> $Listen
+            }
+            open_active() {
+                crate::tcp::send_syn();
+                -> $SynSent
+            }
+        }
+
+        $Listen => $Open {
+            segment(seg: crate::tcp::TcpSegment) {
+                if seg.syn {
+                    crate::tcp::send_syn_ack();
+                    -> $SynReceived
+                }
+            }
+            state(): String { @@:("Listen".to_string()) }
+            => $^
+        }
+
+        $SynSent => $Open {
+            $>() {
+                crate::tcp::arm_retransmit();
+            }
+            <$() {
+                crate::tcp::cancel_retransmit();
+            }
+            segment(seg: crate::tcp::TcpSegment) {
+                if seg.syn && seg.ack {
+                    crate::tcp::send_ack();
+                    -> $Established
+                } else if seg.syn {
+                    // Simultaneous open: peer also did an active open.
+                    crate::tcp::send_syn_ack();
+                    -> $SynReceived
+                }
+            }
+            timeout() {
+                crate::tcp::send_syn(); // retransmit the SYN
+            }
+            state(): String { @@:("SynSent".to_string()) }
+            => $^
+        }
+
+        $SynReceived => $Open {
+            $>() {
+                crate::tcp::arm_retransmit();
+            }
+            <$() {
+                crate::tcp::cancel_retransmit();
+            }
+            segment(seg: crate::tcp::TcpSegment) {
+                if seg.ack {
+                    -> $Established
+                }
+            }
+            timeout() {
+                crate::tcp::send_syn_ack(); // retransmit the SYN-ACK
+            }
+            state(): String { @@:("SynReceived".to_string()) }
+            => $^
+        }
+
+        $Established => $Open {
+            segment(seg: crate::tcp::TcpSegment) {
+                if seg.fin {
+                    crate::tcp::send_ack();
+                    -> $CloseWait
+                } else if seg.payload_len > 0 {
+                    crate::tcp::deliver_data();
+                    crate::tcp::send_ack();
+                }
+                // a pure ACK (no data, no FIN) advances send state only — no reply
+            }
+            close() {
+                crate::tcp::send_fin();
+                -> $FinWait1
+            }
+            state(): String { @@:("Established".to_string()) }
+            => $^
+        }
+
+        $FinWait1 => $Open {
+            segment(seg: crate::tcp::TcpSegment) {
+                if seg.fin && seg.ack {
+                    crate::tcp::send_ack();
+                    -> $TimeWait
+                } else if seg.fin {
+                    // Simultaneous close: peer's FIN before our FIN was ACKed.
+                    crate::tcp::send_ack();
+                    -> $Closing
+                } else if seg.ack {
+                    -> $FinWait2
+                }
+            }
+            state(): String { @@:("FinWait1".to_string()) }
+            => $^
+        }
+
+        $FinWait2 => $Open {
+            segment(seg: crate::tcp::TcpSegment) {
+                if seg.fin {
+                    crate::tcp::send_ack();
+                    -> $TimeWait
+                }
+            }
+            state(): String { @@:("FinWait2".to_string()) }
+            => $^
+        }
+
+        $Closing => $Open {
+            segment(seg: crate::tcp::TcpSegment) {
+                if seg.ack {
+                    -> $TimeWait
+                }
+            }
+            state(): String { @@:("Closing".to_string()) }
+            => $^
+        }
+
+        $TimeWait => $Open {
+            $>() {
+                crate::tcp::arm_timewait();
+            }
+            timeout() {
+                -> $Closed
+            }
+            state(): String { @@:("TimeWait".to_string()) }
+            => $^
+        }
+
+        $CloseWait => $Open {
+            close() {
+                crate::tcp::send_fin();
+                -> $LastAck
+            }
+            state(): String { @@:("CloseWait".to_string()) }
+            => $^
+        }
+
+        $LastAck => $Open {
+            segment(seg: crate::tcp::TcpSegment) {
+                if seg.ack {
+                    -> $Closed
+                }
+            }
+            state(): String { @@:("LastAck".to_string()) }
+            => $^
+        }
+
+        // Parent: an RST (or local abort) from any active state tears the
+        // connection down to $Closed. The children forward `rst()` here via
+        // `=> $^` (the Process.$Alive / PageFaultHandler.$FaultActive pattern).
+        $Open {
+            rst() {
+                crate::tcp::on_reset();
+                -> $Closed
+            }
+        }
+}

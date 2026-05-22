@@ -212,6 +212,12 @@ pub fn on_udp(_pkt: RxDescriptor) {
     sock.recv(); // gated: only $Bound counts it
 }
 
+/// Pipeline leaf (`$Tcp`): hand the segment to the TCP layer, which parses it
+/// and drives the `TcpConnection` FSM.
+pub fn on_tcp(_pkt: RxDescriptor) {
+    crate::tcp::on_segment(rx_frame());
+}
+
 /// Pump one received frame through the `RxPipeline`: copy it into the native
 /// RX buffer, parse its descriptor, and `deliver` it to the Frame classifier
 /// (which dispatches to `on_arp`/`on_icmp`/`on_udp`). Returns false if no frame
@@ -361,6 +367,12 @@ pub fn run_demo() {
     // (slirp always answers its DHCP server), exercising UDP + the UdpSocket
     // lifecycle + the RxPipeline's $Udp leaf on a real inbound datagram.
     dhcp_exchange();
+
+    // B5 Step 4a: passive-open a TcpConnection on :7. No client connects yet
+    // (the live handshake is Step 4b, which adds slirp hostfwd + the harness
+    // TCP probe); the connection rests in $Listen, and any inbound TCP segment
+    // would flow through the RxPipeline's $Tcp leaf into the FSM.
+    crate::tcp::listen(7);
 }
 
 /// B5 Step 2b: send an ICMP echo request to the gateway and wait for the reply

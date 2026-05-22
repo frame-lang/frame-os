@@ -167,6 +167,7 @@ const DIAGRAMS: &[(&str, &str)] = &[
     ("arp_resolver.frs", "arp_resolver.svg"),
     ("rx_pipeline.frs", "rx_pipeline.svg"),
     ("udp_socket.frs", "udp_socket.svg"),
+    ("tcp_connection.frs", "tcp_connection.svg"),
 ];
 
 fn diagrams(mode: DiagramMode) -> Result<()> {
@@ -1058,6 +1059,16 @@ const SMOKE_TESTS: &[SmokeTest] = &[
             "triple fault",
             "[dhcp] no OFFER (timeout)",
         ],
+        timeout_secs: 20,
+    },
+    SmokeTest {
+        // B5 Step 4a: the TcpConnection FSM is wired live in $Listen. No client
+        // connects yet (the handshake is Step 4b); this just proves the
+        // RFC-793 machine is instantiated and passive-opened on real hardware
+        // (the FSM's transitions are validated by host behavioral tests).
+        name: "tcp_listen_b5",
+        expect_contains: &["[tcp] listening on :7", "Listen"],
+        expect_absent: &["KERNEL EXCEPTION", "KERNEL PANIC", "triple fault"],
         timeout_secs: 20,
     },
 ];

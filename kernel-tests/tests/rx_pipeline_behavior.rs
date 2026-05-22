@@ -51,10 +51,18 @@ fn unknown_ethertype_dispatches_to_nothing() {
 }
 
 #[test]
+fn ipv4_tcp_dispatches_to_tcp() {
+    net::reset();
+    let mut p = RxPipeline::__create();
+    p.deliver(desc(0x0800, 6)); // IPv4, proto TCP
+    assert_eq!(net::last_dispatch(), "tcp");
+}
+
+#[test]
 fn ipv4_unknown_proto_dispatches_to_nothing() {
     net::reset();
     let mut p = RxPipeline::__create();
-    p.deliver(desc(0x0800, 6)); // IPv4, proto TCP — no leaf yet
+    p.deliver(desc(0x0800, 99)); // IPv4, unassigned protocol
     assert_eq!(net::last_dispatch(), "");
 }
 

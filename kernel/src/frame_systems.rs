@@ -72,3 +72,7 @@ include!(concat!(env!("OUT_DIR"), "/rx_pipeline.rs"));
 // UdpSocket (B5 Step 3b): one UDP socket's bind lifecycle ($Unbound → $Bound).
 // Pure (no native deps); net.rs holds one and the $Udp leaf delivers to it.
 include!(concat!(env!("OUT_DIR"), "/udp_socket.rs"));
+// TcpConnection (B5 Step 4): the RFC-793 state machine. Actions call crate::tcp::*
+// (segment encode/parse + the connection's seq state + timers). tcp.rs holds the
+// instance; the RxPipeline $Tcp leaf delivers segments to it.
+include!(concat!(env!("OUT_DIR"), "/tcp_connection.rs"));
