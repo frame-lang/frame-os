@@ -594,3 +594,5 @@ include!(concat!(env!("OUT_DIR"), "/usb_enumeration.rs"));
 // UsbTransfer (B6 Step 4): one transfer's lifecycle. Actions call
 // crate::xhci::{queue_interrupt_in,on_report} (the host double above counts them).
 include!(concat!(env!("OUT_DIR"), "/usb_transfer.rs"));
+// EventCounter (B7): the cross-core-post demo system. Pure (no native deps).
+include!(concat!(env!("OUT_DIR"), "/event_counter.rs"));

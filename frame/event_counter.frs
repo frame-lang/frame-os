@@ -1,0 +1,51 @@
+// frame/event_counter.frs
+//
+// EventCounter — a tiny Frame system used to demonstrate the **cross-core post**
+// (B7). Its events (`tick(n)`) are posted from *other* cores into a thread-safe
+// MPSC queue, and the owning core drains that queue and dispatches them to *its*
+// instance. The point isn't the FSM's complexity (it's deliberately minimal) —
+// it's that a Frame system can be driven safely by events originating on other
+// cores, with the instance pinned to one core and only plain `Send` event data
+// crossing the boundary (see `kernel/src/crosscore.rs`).
+//
+// The two states also show that the FSM still *gates* posted events by state: in
+// `$Counting` a `tick` accumulates; after `close()` the system is `$Closed` and
+// further `tick`s are dropped (unhandled) — so a post that races in after close
+// is correctly ignored, not mis-applied.
+//
+//   $Counting ── tick(n): total += n ──┐
+//      │  ▲────────────────────────────┘
+//      │ close
+//      ▼
+//   $Closed  (tick dropped)
+
+@@[target("rust")]
+
+@@system EventCounter {
+    interface:
+        tick(n: u32)
+        close()
+        count(): u32 = self.total
+        is_open(): bool = false
+
+    machine:
+        $Counting {
+            tick(n: u32) {
+                self.total = self.total + n;
+            }
+            close() {
+                -> $Closed
+            }
+            is_open(): bool { @@:(true) }
+        }
+
+        $Closed {
+            // No `tick` handler: events posted after close are dropped — the FSM
+            // gates them by state, so a late cross-core post can't mutate a
+            // closed counter.
+            is_open(): bool { @@:(false) }
+        }
+
+    domain:
+        total: u32 = 0
+}

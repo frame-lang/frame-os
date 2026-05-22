@@ -210,3 +210,11 @@ fn usb_transfer_state_graph_snapshot() {
     };
     insta::assert_snapshot!("usb_transfer_state_graph", dot);
 }
+
+#[test]
+fn event_counter_state_graph_snapshot() {
+    let Some(dot) = frame_to_dot("event_counter.frs") else {
+        return; // framec unavailable; test skipped
+    };
+    insta::assert_snapshot!("event_counter_state_graph", dot);
+}

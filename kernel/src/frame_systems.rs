@@ -96,3 +96,7 @@ include!(concat!(env!("OUT_DIR"), "/usb_enumeration.rs"));
 // (crate::xhci::queue_interrupt_in); the driver dispatches complete()/fail() on
 // the Transfer Event; $Complete reads the result (crate::xhci::on_report).
 include!(concat!(env!("OUT_DIR"), "/usb_transfer.rs"));
+// EventCounter (B7): a tiny system driven by cross-core posts. Pure (no native
+// deps). Its instance is pinned to one core; other cores post tick(n) events
+// into an MPSC queue (crosscore.rs) that the owning core drains + dispatches.
+include!(concat!(env!("OUT_DIR"), "/event_counter.rs"));

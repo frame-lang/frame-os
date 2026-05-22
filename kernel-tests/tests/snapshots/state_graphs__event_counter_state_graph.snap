@@ -1,0 +1,33 @@
+---
+source: kernel-tests/tests/state_graphs.rs
+expression: dot
+---
+digraph EventCounter {
+    compound=true
+    node [color="deepskyblue4" style="rounded, filled" fillcolor="azure"]
+    edge[color="red"]
+
+    Entry[width=0.2 shape="circle" style="filled" fillcolor="black" label=""]
+    Entry -> Counting
+
+    Counting [label = <
+        <table CELLBORDER="0" CELLPADDING="5" style="rounded">
+            <tr><td><b>Counting</b></td></tr>
+            <hr/>
+            <tr><td align="left"><font point-size="10">
+tick(n: u32)<br ALIGN="LEFT"/>close()<br ALIGN="LEFT"/>is_open()<br ALIGN="LEFT"/>
+            </font></td></tr>
+        </table>
+    > margin=0 shape=none]
+    Closed [label = <
+        <table CELLBORDER="0" CELLPADDING="5" style="rounded">
+            <tr><td><b>Closed</b></td></tr>
+            <hr/>
+            <tr><td align="left"><font point-size="10">
+is_open()<br ALIGN="LEFT"/>
+            </font></td></tr>
+        </table>
+    > margin=0 shape=none]
+
+    Counting -> Closed [label=" close "]
+}

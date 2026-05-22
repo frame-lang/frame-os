@@ -29,6 +29,7 @@ use core::panic::PanicInfo;
 
 mod allocator;
 mod context;
+mod crosscore;
 mod elf;
 mod frame_systems;
 mod frames;
@@ -120,6 +121,9 @@ unsafe extern "C" fn ap_entry(cpu: &limine::mp::Cpu) -> ! {
     // (the SpinLock cross-core stress), then signal done.
     hammer_counter();
     AP_HAMMERED.fetch_add(1, Ordering::SeqCst);
+    // B7 cross-core post: contribute this AP's events into the MPSC queue that
+    // the BSP drains into its EventCounter Frame system instance.
+    crosscore::ap_post_phase();
     // Park: interrupts off (the timer/PIC route to the BSP; APs run the
     // scheduler from a later B7 step), low-power halt.
     loop {
@@ -225,6 +229,13 @@ unsafe extern "C" fn kmain() -> ! {
             } else {
                 serial::writeln("[smp] cross-core lock: FAILED (lost updates)");
             }
+
+            // B7 cross-core post: drive a Frame system (EventCounter) from the
+            // other cores. The APs posted tick events into the MPSC queue (in
+            // their post phase); the BSP owns the instance and drains the queue
+            // into it — the instance never leaves this core, so framec's
+            // non-Send codegen is fine.
+            crosscore::run_drain_demo(ap_count);
         } else {
             serial::writeln("[smp] no MP response (single core)");
         }

@@ -179,6 +179,7 @@ const DIAGRAMS: &[(&str, &str)] = &[
     ("hub_port.frs", "hub_port.svg"),
     ("usb_enumeration.frs", "usb_enumeration.svg"),
     ("usb_transfer.frs", "usb_transfer.svg"),
+    ("event_counter.frs", "event_counter.svg"),
 ];
 
 fn diagrams(mode: DiagramMode) -> Result<()> {
@@ -1453,6 +1454,29 @@ const SMOKE_TESTS: &[SmokeTest] = &[
             "KERNEL PANIC",
             "triple fault",
             "[smp] cross-core lock: FAILED",
+        ],
+        timeout_secs: 30,
+    },
+    SmokeTest {
+        // B7 cross-core post: a Frame system (EventCounter) driven from other
+        // cores. The 3 APs each post 200 tick events into a SpinLock MPSC queue;
+        // the BSP owns the EventCounter instance (a local — never shared) and
+        // drains the queue into it. The exact count (4 cores × 200 = 800) proves
+        // every cross-core-posted event was dispatched once; the post-close tick
+        // being dropped proves the FSM still gates posts by state. Confirms the
+        // post/drain architecture gives cross-core safety with no framec
+        // Send/Sync change (the instance never leaves the BSP).
+        name: "smp_cross_core_post_b7",
+        expect_contains: &[
+            "[smp] cross-core post: counter 800 (expected 800)",
+            "[smp] cross-core post -> Frame dispatch: ok",
+            "[smp] post-close tick ignored ($Closed gates it): ok",
+        ],
+        expect_absent: &[
+            "KERNEL EXCEPTION",
+            "KERNEL PANIC",
+            "triple fault",
+            "[smp] cross-core post: FAILED",
         ],
         timeout_secs: 30,
     },

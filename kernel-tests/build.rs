@@ -33,6 +33,7 @@ const FRAME_SYSTEMS: &[(&str, &str)] = &[
     ("hub_port", "hub_port.frs"),
     ("usb_enumeration", "usb_enumeration.frs"),
     ("usb_transfer", "usb_transfer.frs"),
+    ("event_counter", "event_counter.frs"),
 ];
 
 fn main() -> Result<()> {
