@@ -30,43 +30,9 @@ pub enum SchedPost {
     Unready,
 }
 
-const QUEUE_CAP: usize = 64;
-
-/// A per-core MPSC ring of scheduling posts (BSP produces, the owner core drains).
-struct SchedQueue {
-    buf: [SchedPost; QUEUE_CAP],
-    head: usize,
-    tail: usize,
-    len: usize,
-}
-impl SchedQueue {
-    const fn new() -> Self {
-        Self {
-            buf: [SchedPost::Ready; QUEUE_CAP],
-            head: 0,
-            tail: 0,
-            len: 0,
-        }
-    }
-    fn push(&mut self, e: SchedPost) -> bool {
-        if self.len == QUEUE_CAP {
-            return false;
-        }
-        self.buf[self.tail] = e;
-        self.tail = (self.tail + 1) % QUEUE_CAP;
-        self.len += 1;
-        true
-    }
-    fn pop(&mut self) -> Option<SchedPost> {
-        if self.len == 0 {
-            return None;
-        }
-        let e = self.buf[self.head];
-        self.head = (self.head + 1) % QUEUE_CAP;
-        self.len -= 1;
-        Some(e)
-    }
-}
+/// A per-core MPSC ring of scheduling posts (BSP produces, the owner core
+/// drains), on the shared `reactor::Mailbox` primitive.
+type SchedQueue = crate::reactor::Mailbox<SchedPost, 64>;
 
 // Per-core state. The Scheduler instances are pinned to their owner cores; the
 // queues + result atomics are the only cross-core-shared data.

@@ -36,46 +36,11 @@ pub enum PostedEvent {
     Tick(u32),
 }
 
-const QUEUE_CAP: usize = 1024;
-
-/// A fixed-size MPSC ring: many producer cores `push`, the owner core `pop`s.
-/// Wrapped in a `SpinLock` for cross-core mutual exclusion (no allocation on the
-/// post path — bounded, interrupt-safe).
-struct PostQueue {
-    buf: [PostedEvent; QUEUE_CAP],
-    head: usize,
-    tail: usize,
-    len: usize,
-}
-
-impl PostQueue {
-    const fn new() -> Self {
-        Self {
-            buf: [PostedEvent::Tick(0); QUEUE_CAP],
-            head: 0,
-            tail: 0,
-            len: 0,
-        }
-    }
-    fn push(&mut self, e: PostedEvent) -> bool {
-        if self.len == QUEUE_CAP {
-            return false; // full — caller applies backpressure
-        }
-        self.buf[self.tail] = e;
-        self.tail = (self.tail + 1) % QUEUE_CAP;
-        self.len += 1;
-        true
-    }
-    fn pop(&mut self) -> Option<PostedEvent> {
-        if self.len == 0 {
-            return None;
-        }
-        let e = self.buf[self.head];
-        self.head = (self.head + 1) % QUEUE_CAP;
-        self.len -= 1;
-        Some(e)
-    }
-}
+/// A fixed-size MPSC ring on the shared `reactor::Mailbox` primitive: many
+/// producer cores `push`, the owner core `pop`s. Wrapped in a `SpinLock` for
+/// cross-core mutual exclusion (no allocation on the post path — bounded,
+/// interrupt-safe).
+type PostQueue = crate::reactor::Mailbox<PostedEvent, 1024>;
 
 static POST_QUEUE: SpinLock<PostQueue> = SpinLock::new(PostQueue::new());
 

@@ -21,13 +21,17 @@
 //     touches a Frame system (Frame dispatch allocates and is non-reentrant —
 //     dispatching from interrupt context against the spin-locked heap can
 //     deadlock; see `frame_assessment.md` finding #3).
-//   - FRAME (`Scheduler`, $Idle/$Active): the per-core run/halt *mode*. Spawning a
-//     worker fires `task_ready` ($Idle→$Active); a worker exiting fires
-//     `task_unready` (→$Idle at zero). Each core reads its own `is_idle()` to
-//     decide when its run queue has drained. Every dispatch runs in a
-//     `without_interrupts` critical section *on the owning core* — the same
-//     single-core mutual-exclusion discipline as `sched.rs`, just one instance
-//     per core. The instance is pinned to its core; nothing about it crosses.
+//   - FRAME (`Scheduler`, $Idle/$Active): the per-core run/halt *mode*. Admitting a
+//     worker is `task_ready` ($Idle→$Active); a worker exiting is `task_unready`
+//     (→$Idle at zero). **The Scheduler is driven as an actor (R7a):** workers and
+//     the spawn path only *post* a `SchedMsg` into the core's mailbox; the idle
+//     loop is the sole drainer that dispatches those messages to the FSM and reads
+//     `is_idle()`. So exactly one context touches the instance — no lock, no
+//     `without_interrupts` around dispatch (the one remaining critical section, in
+//     `exit_current`, guards the Dead-mark + the mailbox push, not the FSM). This
+//     is the post/drain (actor) pattern — the native hand-rolling of framec's
+//     proposed deferred-send / `@@[cast]` primitive (RFC-0038). The instance is
+//     pinned to its core; only the mailbox's Send data is shared.
 //
 // The Frame-relevant payoff: N cores each run a *real* `Scheduler` instance
 // through a live, time-sliced run queue, every one of them allocating per
@@ -42,6 +46,7 @@ use core::arch::asm;
 use crate::frame_systems::Scheduler;
 use crate::interrupts;
 use crate::percpu::{this_cpu_index, MAX_CPUS};
+use crate::spin::SpinLock;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 
 /// Workers spawned per core (plus the boot/idle context in slot 0).
@@ -86,6 +91,30 @@ static mut PC_STACKS: [[[u8; WORKER_STACK]; WORKERS_PER_CORE]; MAX_CPUS] =
 // Each core's own `Scheduler` Frame instance (created on its core, never shared).
 static mut PC_SCHED: [Option<Scheduler>; MAX_CPUS] = [const { None }; MAX_CPUS];
 
+// --- scheduler-as-actor mailbox (R7a) ---------------------------------------
+//
+// The `Scheduler` instance is driven through a per-core *mailbox* rather than a
+// shared lock: a worker (in a preemptible context) only *posts* a Send message
+// (`SchedMsg`) into the mailbox; the idle loop is the **sole** drainer that
+// dispatches those messages to the `Scheduler` FSM. So exactly one context ever
+// touches the instance — the FSM needs no lock, and the `without_interrupts`
+// dance around dispatch is gone. This is the post/drain (actor) pattern the rest
+// of the OS uses at hard boundaries, now applied to the in-core scheduler; it's
+// the native hand-rolling of framec's proposed deferred-send / `@@[cast]`
+// primitive (RFC-0038). Only the mailbox (plain Copy data) is shared.
+#[derive(Clone, Copy)]
+enum SchedMsg {
+    Ready,   // a task became runnable (admit)
+    Unready, // a task retired (a worker exited)
+}
+
+// One mailbox per core, on the shared `reactor::Mailbox` primitive (IRQ-safe
+// lock: a worker posts from a preemptible context, the idle loop drains from the
+// same core).
+type SchedMailbox = crate::reactor::Mailbox<SchedMsg, 16>;
+static PC_MAILBOX: [SpinLock<SchedMailbox>; MAX_CPUS] =
+    [const { SpinLock::new(SchedMailbox::new()) }; MAX_CPUS];
+
 // BSP "go" gate: each AP waits here before spawning its workers, so the BSP can
 // snapshot the heap-alloc counter *before* any per-core dispatch happens — making
 // the alloc delta a clean measurement of the whole phase rather than a tail.
@@ -125,11 +154,26 @@ fn sched(cpu: usize) -> &'static mut Scheduler {
     slot.get_or_insert_with(Scheduler::__create)
 }
 
-/// Run `f` against this core's Scheduler in an interrupts-off critical section
-/// (the instance is non-reentrant and shared with this core's preemptible
-/// workers — exactly `sched.rs`'s `with_sched`, one instance per core).
-fn with_sched<R>(cpu: usize, f: impl FnOnce(&mut Scheduler) -> R) -> R {
-    interrupts::without_interrupts(|| f(sched(cpu)))
+/// Post a scheduling message into core `cpu`'s mailbox. Called by a worker (or
+/// the spawn path) — it never touches the `Scheduler` FSM, only enqueues Send
+/// data. The mailbox is sized for the whole phase, so a push never blocks here.
+fn post_sched(cpu: usize, m: SchedMsg) {
+    let _ = PC_MAILBOX[cpu].lock().push(m);
+}
+
+/// Drain core `cpu`'s mailbox into its `Scheduler` FSM. **Only the idle loop
+/// calls this** — so the `Scheduler` instance has a single owner and needs no
+/// lock. The mailbox lock is held only for each `pop` (released before the
+/// dispatch, which allocates), never across an FSM dispatch.
+fn drain_mailbox(cpu: usize) {
+    loop {
+        let next = PC_MAILBOX[cpu].lock().pop();
+        match next {
+            Some(SchedMsg::Ready) => sched(cpu).task_ready(),
+            Some(SchedMsg::Unready) => sched(cpu).task_unready(),
+            None => break,
+        }
+    }
 }
 
 // --- thread setup (native) --------------------------------------------------
@@ -221,15 +265,23 @@ extern "C" fn pc_worker() -> ! {
 }
 
 /// Exit the calling worker (runs on its owning core): mark it Dead so the ISR
-/// stops scheduling it, fire this core's `task_unready`, bump the per-core exit
-/// count, then park interrupt-enabled so the next tick switches away. Never
-/// returns — mirrors `sched::exit_current`, scoped to this core.
+/// stops scheduling it, **post** a retire message to this core's mailbox, bump the
+/// exit count, then park interrupt-enabled so the next tick switches away. Never
+/// returns. The worker does **not** touch the `Scheduler` FSM — it only posts Send
+/// data; the idle loop drains it (R7a, scheduler-as-actor).
+///
+/// The mark-dead and the post must happen in **one** critical section: if a timer
+/// tick landed between them, `schedule()` would switch away from a now-dead slot
+/// before the Unready was posted, and — the dead slot never being picked again —
+/// the Scheduler would never see the retire and never reach `$Idle`. (This is the
+/// same atomicity the lock-guarded version needed; here it guards the Dead write
+/// + a mailbox push, not an FSM dispatch.)
 fn exit_current() -> ! {
     let cpu = this_cpu_index() as usize;
     interrupts::without_interrupts(|| unsafe {
         let cur = pc_current(cpu);
         (*tcb(cpu, cur)).state = RunState::Dead;
-        sched(cpu).task_unready();
+        let _ = PC_MAILBOX[cpu].lock().push(SchedMsg::Unready);
     });
     PC_EXITED[cpu].fetch_add(1, Ordering::Relaxed);
     // A dead worker must park with IF=1 so the next LAPIC tick switches away.
@@ -272,7 +324,9 @@ pub fn ap_run(cpu: usize) {
     }
     set_pc_current(cpu, 0);
 
-    // Spawn the workers (Frame `task_ready` per worker, in critical sections).
+    // Spawn the workers. Spawning *posts* an admit message per worker into the
+    // mailbox (preemption is not active yet, so no worker runs during spawn);
+    // the idle loop drains them into the Scheduler below.
     let cs = read_cs();
     let ss = read_ss();
     for w in 0..WORKERS_PER_CORE {
@@ -283,22 +337,29 @@ pub fn ap_run(cpu: usize) {
             (*t).rsp = rsp;
             (*t).state = RunState::Runnable;
         }
-        with_sched(cpu, |s| s.task_ready());
+        post_sched(cpu, SchedMsg::Ready);
     }
 
-    // Activate per-core preemption and idle until the run queue drains. The
-    // LAPIC timer (already firing) now round-robins the workers; when all have
-    // exited, `schedule` falls back to slot 0 and resumes here, and the
-    // Scheduler reads `$Idle`. is_idle() is read in a critical section (it must
-    // not race a worker's `task_unready` on this same core).
+    // Activate per-core preemption and idle until the run queue drains. The LAPIC
+    // timer (already firing) now round-robins the workers; each exiting worker
+    // posts a retire message. This loop is the **sole owner** of the Scheduler
+    // FSM: every iteration it drains the mailbox (dispatching the queued admits
+    // and retires) and then reads `is_idle()` — no lock, because no other context
+    // touches the instance (R7a). The drain runs *before* the check, so the
+    // admits posted during spawn move the Scheduler to `$Active` before the first
+    // `is_idle()` (which would otherwise be vacuously true at start).
     PC_ACTIVE[cpu].store(true, Ordering::Relaxed);
     unsafe { asm!("sti", options(nomem, nostack)) };
-    while !with_sched(cpu, |s| s.is_idle()) {
+    loop {
+        drain_mailbox(cpu);
+        if sched(cpu).is_idle() {
+            break;
+        }
         unsafe { asm!("hlt", options(nomem, nostack)) };
     }
     PC_ACTIVE[cpu].store(false, Ordering::Relaxed);
 
-    PC_IDLE[cpu].store(with_sched(cpu, |s| s.is_idle()), Ordering::SeqCst);
+    PC_IDLE[cpu].store(sched(cpu).is_idle(), Ordering::SeqCst);
     PC_DONE.fetch_add(1, Ordering::SeqCst);
 }
 

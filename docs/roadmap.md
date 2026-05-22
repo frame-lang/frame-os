@@ -649,24 +649,40 @@ honor it at the hard boundaries (ISR→mainline post/drain, core→core MPSC pos
 hardware→software via the event/used rings). This milestone pushes message-passing
 *deeper* where it's a genuine win — ranked by signal:
 
-- **R7a — scheduler-as-actor (the standout).** Today R1a (`ksched.rs`) drives the
-  `Scheduler` through a *mailbox* (drained posts) but R1b (`pcsched.rs`) drives the
-  *same FSM* synchronously inside `with_sched` + `without_interrupts` critical sections —
-  a split personality. The lock exists only because two contexts touch the instance (a
-  worker in `exit_current`, and the boot/idle loop). Make a worker **post** "slot N
-  exiting" to a per-core mailbox and let the idle loop be the *only* drainer/dispatcher:
-  exactly one context touches the `Scheduler`, the lock and the `without_interrupts`
-  dance disappear, and it becomes a true single-owner actor. Same `.frs`, coupling
-  becomes a queue. Unifies R1a and R1b on one model. Small, high-signal.
-- **R7b — one per-core reactor loop.** Converge the several ad-hoc drains (RxPipeline
-  pump, xHCI driver loop, crosscore drain, scheduler critical sections) onto a single
-  per-core loop that owns that core's FSM instances and drains *one* mailbox. The payoff
-  beyond tidiness: the "an ISR must never dispatch a Frame system" rule (finding #3's
-  heap-deadlock hazard) stops being a remembered discipline and becomes **structural** —
-  ISRs can only `post`, the loop is the only `dispatch`er; you can't write the bug.
-- **R7c — align block + USB completion onto the net shape.** Net already does
-  hardware→post→drain via `RxPipeline`; route B4 block and B6/R3 USB completions through
-  the same per-core mailbox so all three subsystems are uniform.
+- **R7a — scheduler-as-actor — done.** `pcsched.rs` no longer drives the `Scheduler`
+  through a shared lock. A per-core **mailbox** (`SchedMailbox`, IRQ-safe `SpinLock`)
+  carries `SchedMsg::{Ready,Unready}`; workers and the spawn path only *post* into it,
+  and the idle loop is the **sole** drainer that dispatches those messages to the FSM
+  and reads `is_idle()`. Exactly one context touches the instance, so the
+  `with_sched` / `without_interrupts`-around-dispatch dance is gone — the one remaining
+  critical section (in `exit_current`) guards the Dead-mark + mailbox push, not an FSM
+  dispatch. Same `.frs`, unchanged; the coupling became a queue. This unifies R1a and
+  R1b on one model (both now post/drain) and is the native hand-rolling of RFC-0038's
+  deferred-send / `@@[cast]` primitive. Behavior-preserving: `smp_pcsched_r1b` still
+  reports 3 threads sliced / ~40 switches / ended idle, deterministically; full suite
+  green. Recorded in `frame_assessment.md`.
+- **R7b — one mailbox primitive — done.** The "converge the ad-hoc drains" goal
+  resolved, on investigation, to a specific duplication: the kernel had **three
+  byte-for-byte-identical hand-rolled FIFO rings** (`crosscore::PostQueue`,
+  `ksched::SchedQueue`, `pcsched::SchedMailbox`) — the *only* software event queues in
+  the OS. R7b extracts one generic primitive, `reactor::Mailbox<T, CAP>` (fixed-capacity,
+  no-alloc, `const`-constructible, `Option`-buffer so any `T` works), and the three sites
+  now share it (each still wraps it in a `SpinLock` for cross-context use). Behavior
+  preserved: `smp_cross_core_post_b7`, `smp_percpu_sched_b7`, `smp_pcsched_r1b` all green.
+  This is the native realization of RFC-0038's standard mailbox. (The grander "single
+  per-core reactor loop owning all instances" is the microkernel rewrite flagged below as
+  out-of-scope; the *primitive* is the valuable, low-risk part and is what landed.)
+- **R7c — align block + USB completion: resolved by investigation, no change.** The
+  premise ("route block/USB completions through the same per-core mailbox as net") does
+  not hold: net's `RxPipeline`, B4 block, and B6/R3 USB do **not** use software event
+  rings — they drain the **hardware** rings directly (virtio used-ring + an `IRQ_PENDING`
+  wakeup flag for block; the virtio RX ring + a staging buffer for net; the xHCI event
+  ring via synchronous poll loops for USB). The hardware ring *is* the queue; layering a
+  software `Mailbox` on top would duplicate it (incorrect) or add indirection with no
+  benefit (a single-pending `AtomicBool` wakeup is the right shape for those paths). So
+  there is nothing correct to converge here — R7b already unified every genuine software
+  mailbox. The `reactor::Mailbox` primitive is available should a future software-event
+  path appear. (Recorded as a finding rather than a forced refactor.)
 
 **Explicitly *not* in scope** (ceremony, not value): query paths (`is_idle()`/`state()`
 are reads, not events), the synchronous syscall fast path (microkernel-only payoff),

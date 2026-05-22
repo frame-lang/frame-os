@@ -45,6 +45,7 @@ mod paging;
 mod pci;
 mod pcsched;
 mod percpu;
+mod reactor;
 mod pic;
 mod pit;
 mod sched;
