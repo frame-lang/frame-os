@@ -9,15 +9,23 @@
 // (non-blocking); the native driver loop dequeues completion events and
 // dispatches the matching milestone event back here.
 //
-// State graph (Step 3a/3b — through addressing; $Configured lands in Step 3c):
+// State graph:
 //
 //   $Powered ─ slot_enabled(slot) ─► $SlotEnabled ─ addressed ─► $AddressAssigned
-//      │                                  │                            │
-//      └──────────────── fail (any stage, via $Enumerating parent) ──► $Failed
+//                                                                      │
+//      ┌── device_described ──────────────────────────────────────────┘
+//      ▼
+//   $DeviceDescribed ─ configured ─► $Configured
+//      │
+//      └─ fail (any stage, via the $Enumerating parent => $^) ─► $Failed
 //
-//   $Powered.$>        issues Enable Slot
-//   $SlotEnabled.$>    issues Address Device (using the slot from the domain)
-//   $AddressAssigned.$> logs the milestone (configuration follows in Step 3c)
+// Each state's enter handler issues the next xHCI command/transfer (non-blocking),
+// and the native driver dispatches the milestone event on its completion:
+//   $Powered.$>          Enable Slot                (command ring)
+//   $SlotEnabled.$>      Address Device             (command ring)
+//   $AddressAssigned.$>  GET_DESCRIPTOR (device)    (EP0 control transfer)
+//   $DeviceDescribed.$>  read descriptor + SET_CONFIGURATION (EP0 control transfer)
+//   $Configured.$>       log the configured device
 //
 // `fail()` from any active stage funnels to `$Failed` through the `$Enumerating`
 // parent (`=> $^` — the TcpConnection.$Open / HubPort.$Attached pattern).
@@ -28,9 +36,12 @@
     interface:
         slot_enabled(slot: u8)
         addressed()
+        device_described()
+        configured()
         fail()
         state(): String = "Powered".to_string()
         is_addressed(): bool = false
+        is_configured(): bool = false
         is_failed(): bool = false
 
     machine:
@@ -59,10 +70,34 @@
 
         $AddressAssigned => $Enumerating {
             $>() {
-                crate::xhci::on_address_assigned(self.slot);
+                crate::xhci::get_device_descriptor(self.slot);
+            }
+            device_described() {
+                -> $DeviceDescribed
             }
             is_addressed(): bool { @@:(true) }
             state(): String { @@:("AddressAssigned".to_string()) }
+            => $^
+        }
+
+        $DeviceDescribed => $Enumerating {
+            $>() {
+                crate::xhci::read_device_descriptor();
+                crate::xhci::set_configuration(self.slot);
+            }
+            configured() {
+                -> $Configured
+            }
+            state(): String { @@:("DeviceDescribed".to_string()) }
+            => $^
+        }
+
+        $Configured => $Enumerating {
+            $>() {
+                crate::xhci::on_configured(self.slot);
+            }
+            is_configured(): bool { @@:(true) }
+            state(): String { @@:("Configured".to_string()) }
             => $^
         }
 

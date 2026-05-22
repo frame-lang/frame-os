@@ -1372,21 +1372,23 @@ const SMOKE_TESTS: &[SmokeTest] = &[
         timeout_secs: 30,
     },
     SmokeTest {
-        // B6 Step 3 (3a/3b): the UsbEnumeration Frame system enumerates the
-        // device through addressing — Enable Slot (→ slot id from a Command
-        // Completion Event) then Address Device (input/slot/EP0 contexts). Each
-        // command's completion drives an FSM milestone event. (Descriptors +
-        // SET_CONFIGURATION → $Configured land in Step 3c.)
+        // B6 Step 3: the UsbEnumeration Frame system enumerates the device to
+        // $Configured — Enable Slot + Address Device (command ring), then
+        // GET_DESCRIPTOR + SET_CONFIGURATION (EP0 control transfers). Each
+        // command/transfer completion drives an FSM milestone event.
         name: "usb_enumerates_b6",
         expect_contains: &[
             "[usb] slot 1 enabled",
             "[usb] device addressed (slot 1)",
+            "[usb] device descriptor: idVendor",
+            "[usb] device configured (slot 1)",
         ],
         expect_absent: &[
             "KERNEL EXCEPTION",
             "KERNEL PANIC",
             "triple fault",
             "[usb] command failed during enumeration",
+            "[usb] control transfer failed during enumeration",
         ],
         timeout_secs: 30,
     },

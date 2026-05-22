@@ -417,8 +417,6 @@ impl Xhci {
     }
 
     /// Ring an endpoint doorbell: DB[slot] = endpoint DCI (e.g. 1 for EP0).
-    /// (Used by the control-transfer path in Step 3c.)
-    #[allow(dead_code)]
     fn ring_doorbell(&self, slot: u8, dci: u32) {
         unsafe { write_volatile(self.doorbells.add(slot as usize), dci) };
     }
@@ -545,16 +543,33 @@ pub fn run_port_lifecycle() {
 // driver loop that dequeues completion events and dispatches the matching FSM
 // event. Frame owns the enumeration *stage*; this owns the TRBs + contexts.
 
-const TRB_ADDRESS_DEVICE: u32 = 11;
 const TRB_ENABLE_SLOT: u32 = 9;
+const TRB_ADDRESS_DEVICE: u32 = 11;
+const TRB_SETUP_STAGE: u32 = 2;
+const TRB_DATA_STAGE: u32 = 3;
+const TRB_STATUS_STAGE: u32 = 4;
+const TRB_TRANSFER_EVENT: u32 = 32;
 const TRB_CMD_COMPLETION: u32 = 33;
 const COMPLETION_SUCCESS: u32 = 1;
+const COMPLETION_SHORT_PACKET: u32 = 13; // an IN transfer returning < requested — fine
+
+// TRB control-dword flags.
+const TRB_IDT: u32 = 1 << 6; // Immediate Data (Setup packet rides in the TRB)
+const TRB_IOC: u32 = 1 << 5; // Interrupt On Completion
+const TRB_DIR_IN: u32 = 1 << 16; // Data/Status Stage direction = device-to-host
+const TRT_IN: u32 = 3 << 16; // Setup Stage transfer type = IN data stage
+
+const EP0_DCI: u32 = 1; // Endpoint 0 Device Context Index (the control endpoint)
 
 // Enumeration state (single-flight).
 static mut ENUM_SLOT: u8 = 0;
 static mut DEVICE_CTX_PHYS: u64 = 0;
 static mut INPUT_CTX_PHYS: u64 = 0;
 static mut EP0_RING_PHYS: u64 = 0;
+// EP0 transfer-ring producer cursor + a DMA buffer for descriptor data.
+static mut EP0_ENQUEUE: usize = 0;
+static mut EP0_PCS: u32 = 1;
+static mut DESC_BUF_PHYS: u64 = 0;
 
 fn trb_type(d3: u32) -> u32 {
     (d3 >> 10) & 0x3F
@@ -645,9 +660,100 @@ pub fn address_device(slot: u8) {
     x.ring_command_doorbell();
 }
 
-/// `UsbEnumeration.$AddressAssigned.$>`: the device has a USB address.
-pub fn on_address_assigned(slot: u8) {
+/// Enqueue a TRB on the EP0 control transfer ring (cycle bit stamped from our
+/// EP0 producer cycle state), following the Link TRB at the end of the ring.
+fn enqueue_ep0(d0: u32, d1: u32, d2: u32, ctrl: u32) {
+    let ring_phys = unsafe { (&raw const EP0_RING_PHYS).read() };
+    let mut enq = unsafe { (&raw const EP0_ENQUEUE).read() };
+    let mut pcs = unsafe { (&raw const EP0_PCS).read() };
+    let ring = frames::phys_to_virt(ring_phys);
+    if enq >= RING_TRBS - 1 {
+        let link = unsafe { ring.add((RING_TRBS - 1) * TRB_SIZE) };
+        unsafe { write_volatile(link.add(12) as *mut u32, (6 << 10) | (1 << 1) | pcs) };
+        enq = 0;
+        pcs ^= 1;
+    }
+    let slot = unsafe { ring.add(enq * TRB_SIZE) };
+    unsafe {
+        write_volatile(slot as *mut u32, d0);
+        write_volatile(slot.add(4) as *mut u32, d1);
+        write_volatile(slot.add(8) as *mut u32, d2);
+        write_volatile(slot.add(12) as *mut u32, ctrl | pcs);
+    }
+    unsafe {
+        (&raw mut EP0_ENQUEUE).write(enq + 1);
+        (&raw mut EP0_PCS).write(pcs);
+    }
+}
+
+/// `UsbEnumeration.$AddressAssigned.$>`: the device has a USB address — issue a
+/// GET_DESCRIPTOR (device) control transfer on EP0 (Setup → Data IN → Status),
+/// reading the 18-byte device descriptor into the DMA buffer.
+pub fn get_device_descriptor(slot: u8) {
     serial::write_str("[usb] device addressed (slot ");
+    serial::write_u32_decimal(slot as u32);
+    serial::writeln(")");
+
+    // Allocate the descriptor DMA buffer once.
+    if unsafe { (&raw const DESC_BUF_PHYS).read() } == 0 {
+        if let Some(b) = alloc_zeroed_page() {
+            unsafe { (&raw mut DESC_BUF_PHYS).write(b) };
+        } else {
+            return;
+        }
+    }
+    let buf = unsafe { (&raw const DESC_BUF_PHYS).read() };
+
+    // Setup packet: bmRequestType=0x80 (IN, standard, device), bRequest=6
+    // (GET_DESCRIPTOR), wValue=0x0100 (Device descriptor, index 0), wLength=18.
+    let d0 = 0x80 | (6 << 8) | (0x0100 << 16);
+    let d1 = 18 << 16; // wIndex=0, wLength=18
+    enqueue_ep0(d0, d1, 8, (TRB_SETUP_STAGE << 10) | TRB_IDT | TRT_IN);
+    // Data Stage (IN): the 18-byte descriptor into `buf`.
+    enqueue_ep0(buf as u32, (buf >> 32) as u32, 18, (TRB_DATA_STAGE << 10) | TRB_DIR_IN);
+    // Status Stage (OUT for an IN data stage), interrupt on completion.
+    enqueue_ep0(0, 0, 0, (TRB_STATUS_STAGE << 10) | TRB_IOC);
+
+    if let Some(x) = controller() {
+        x.ring_doorbell(slot, EP0_DCI);
+    }
+}
+
+/// Parse + log the device descriptor read by the GET_DESCRIPTOR transfer
+/// (idVendor @ offset 8, idProduct @ 10 — little-endian).
+pub fn read_device_descriptor() {
+    let buf = unsafe { (&raw const DESC_BUF_PHYS).read() };
+    if buf == 0 {
+        return;
+    }
+    let v = frames::phys_to_virt(buf);
+    let id_vendor = unsafe { read_volatile(v.add(8) as *const u16) };
+    let id_product = unsafe { read_volatile(v.add(10) as *const u16) };
+    serial::write_str("[usb] device descriptor: idVendor ");
+    serial::write_hex_u64(id_vendor as u64);
+    serial::write_str(" idProduct ");
+    serial::write_hex_u64(id_product as u64);
+    serial::writeln("");
+}
+
+/// `UsbEnumeration.$DeviceDescribed.$>`: issue a SET_CONFIGURATION(1) control
+/// transfer on EP0 (Setup → Status, no data stage).
+pub fn set_configuration(slot: u8) {
+    // Setup packet: bmRequestType=0x00 (OUT, standard, device), bRequest=9
+    // (SET_CONFIGURATION), wValue=1 (configuration value), wLength=0.
+    let d0 = (9 << 8) | (1 << 16);
+    enqueue_ep0(d0, 0, 8, (TRB_SETUP_STAGE << 10) | TRB_IDT); // TRT = No Data
+    // Status Stage (IN when there's no data stage), interrupt on completion.
+    enqueue_ep0(0, 0, 0, (TRB_STATUS_STAGE << 10) | TRB_DIR_IN | TRB_IOC);
+
+    if let Some(x) = controller() {
+        x.ring_doorbell(slot, EP0_DCI);
+    }
+}
+
+/// `UsbEnumeration.$Configured.$>`: the device is configured and usable.
+pub fn on_configured(slot: u8) {
+    serial::write_str("[usb] device configured (slot ");
     serial::write_u32_decimal(slot as u32);
     serial::writeln(")");
 }
@@ -666,8 +772,10 @@ pub fn run_enumeration() {
 
     while interrupts::ticks() < deadline {
         if let Some(ev) = controller().and_then(|x| x.poll_event()) {
-            if trb_type(ev[3]) == TRB_CMD_COMPLETION {
-                if completion_code(ev[2]) != COMPLETION_SUCCESS {
+            let ty = trb_type(ev[3]);
+            let code = completion_code(ev[2]);
+            if ty == TRB_CMD_COMPLETION {
+                if code != COMPLETION_SUCCESS {
                     serial::writeln("[usb] command failed during enumeration");
                     e.fail();
                     break;
@@ -675,12 +783,25 @@ pub fn run_enumeration() {
                 let slot = event_slot(ev[3]);
                 match e.state().as_str() {
                     "Powered" => e.slot_enabled(slot), // → $SlotEnabled (issues Address Device)
-                    "SlotEnabled" => e.addressed(),    // → $AddressAssigned
+                    "SlotEnabled" => e.addressed(),    // → $AddressAssigned (issues GET_DESCRIPTOR)
+                    _ => {}
+                }
+            } else if ty == TRB_TRANSFER_EVENT {
+                // A short packet on an IN transfer (fewer bytes than requested)
+                // is a normal completion, not a failure.
+                if code != COMPLETION_SUCCESS && code != COMPLETION_SHORT_PACKET {
+                    serial::writeln("[usb] control transfer failed during enumeration");
+                    e.fail();
+                    break;
+                }
+                match e.state().as_str() {
+                    "AddressAssigned" => e.device_described(), // → $DeviceDescribed (SET_CONFIG)
+                    "DeviceDescribed" => e.configured(),       // → $Configured
                     _ => {}
                 }
             }
         }
-        if e.is_addressed() || e.is_failed() {
+        if e.is_configured() || e.is_failed() {
             break;
         }
         interrupts::wait_for_interrupt();

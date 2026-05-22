@@ -55,7 +55,25 @@ $&gt;()<br ALIGN="LEFT"/>addressed()<br ALIGN="LEFT"/>state()<br ALIGN="LEFT"/>
                 <tr><td><b>AddressAssigned</b></td></tr>
                 <hr/>
                 <tr><td align="left"><font point-size="10">
-$&gt;()<br ALIGN="LEFT"/>is_addressed()<br ALIGN="LEFT"/>state()<br ALIGN="LEFT"/>
+$&gt;()<br ALIGN="LEFT"/>device_described()<br ALIGN="LEFT"/>is_addressed()<br ALIGN="LEFT"/>state()<br ALIGN="LEFT"/>
+                </font></td></tr>
+            </table>
+        > margin=0 shape=none]
+        DeviceDescribed [label = <
+            <table CELLBORDER="0" CELLPADDING="5" style="rounded">
+                <tr><td><b>DeviceDescribed</b></td></tr>
+                <hr/>
+                <tr><td align="left"><font point-size="10">
+$&gt;()<br ALIGN="LEFT"/>configured()<br ALIGN="LEFT"/>state()<br ALIGN="LEFT"/>
+                </font></td></tr>
+            </table>
+        > margin=0 shape=none]
+        Configured [label = <
+            <table CELLBORDER="0" CELLPADDING="5" style="rounded">
+                <tr><td><b>Configured</b></td></tr>
+                <hr/>
+                <tr><td align="left"><font point-size="10">
+$&gt;()<br ALIGN="LEFT"/>is_configured()<br ALIGN="LEFT"/>state()<br ALIGN="LEFT"/>
                 </font></td></tr>
             </table>
         > margin=0 shape=none]
@@ -63,5 +81,7 @@ $&gt;()<br ALIGN="LEFT"/>is_addressed()<br ALIGN="LEFT"/>state()<br ALIGN="LEFT"
 
     Powered -> SlotEnabled [label=" slot_enabled "]
     SlotEnabled -> AddressAssigned [label=" addressed "]
+    AddressAssigned -> DeviceDescribed [label=" device_described "]
+    DeviceDescribed -> Configured [label=" configured "]
     Enumerating -> Failed [label=" fail " ltail="cluster_Enumerating"]
 }

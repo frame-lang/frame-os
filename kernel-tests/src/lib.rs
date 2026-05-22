@@ -454,7 +454,10 @@ pub mod xhci {
         // Enumeration actions (UsbEnumeration).
         static ENABLE_SLOTS: Cell<u32> = const { Cell::new(0) };
         static ADDR_SLOT: Cell<u8> = const { Cell::new(0) };
-        static ADDRESSED_SLOT: Cell<u8> = const { Cell::new(0) };
+        static GET_DESC_SLOT: Cell<u8> = const { Cell::new(0) };
+        static DESC_READS: Cell<u32> = const { Cell::new(0) };
+        static SET_CONFIG_SLOT: Cell<u8> = const { Cell::new(0) };
+        static CONFIGURED_SLOT: Cell<u8> = const { Cell::new(0) };
     }
 
     pub fn begin_port_reset(port: u8) {
@@ -470,8 +473,17 @@ pub mod xhci {
     pub fn address_device(slot: u8) {
         ADDR_SLOT.with(|c| c.set(slot));
     }
-    pub fn on_address_assigned(slot: u8) {
-        ADDRESSED_SLOT.with(|c| c.set(slot));
+    pub fn get_device_descriptor(slot: u8) {
+        GET_DESC_SLOT.with(|c| c.set(slot));
+    }
+    pub fn read_device_descriptor() {
+        DESC_READS.with(|c| c.set(c.get() + 1));
+    }
+    pub fn set_configuration(slot: u8) {
+        SET_CONFIG_SLOT.with(|c| c.set(slot));
+    }
+    pub fn on_configured(slot: u8) {
+        CONFIGURED_SLOT.with(|c| c.set(slot));
     }
 
     /// Test inspectors.
@@ -490,8 +502,17 @@ pub mod xhci {
     pub fn addr_slot() -> u8 {
         ADDR_SLOT.with(|c| c.get())
     }
-    pub fn addressed_slot() -> u8 {
-        ADDRESSED_SLOT.with(|c| c.get())
+    pub fn get_desc_slot() -> u8 {
+        GET_DESC_SLOT.with(|c| c.get())
+    }
+    pub fn desc_reads() -> u32 {
+        DESC_READS.with(|c| c.get())
+    }
+    pub fn set_config_slot() -> u8 {
+        SET_CONFIG_SLOT.with(|c| c.get())
+    }
+    pub fn configured_slot() -> u8 {
+        CONFIGURED_SLOT.with(|c| c.get())
     }
     pub fn reset() {
         RESET_PORT.with(|c| c.set(0));
@@ -499,7 +520,10 @@ pub mod xhci {
         ENABLED_PORT.with(|c| c.set(0));
         ENABLE_SLOTS.with(|c| c.set(0));
         ADDR_SLOT.with(|c| c.set(0));
-        ADDRESSED_SLOT.with(|c| c.set(0));
+        GET_DESC_SLOT.with(|c| c.set(0));
+        DESC_READS.with(|c| c.set(0));
+        SET_CONFIG_SLOT.with(|c| c.set(0));
+        CONFIGURED_SLOT.with(|c| c.set(0));
     }
 }
 

@@ -34,14 +34,39 @@ fn slot_enabled_addresses_the_device_on_that_slot() {
 }
 
 #[test]
-fn addressed_reaches_address_assigned() {
+fn addressed_reads_the_device_descriptor() {
     xhci::reset();
     let mut e = UsbEnumeration::__create();
     e.slot_enabled(1);
     e.addressed();
     assert_eq!(e.state(), "AddressAssigned");
     assert!(e.is_addressed());
-    assert_eq!(xhci::addressed_slot(), 1);
+    assert_eq!(xhci::get_desc_slot(), 1); // $AddressAssigned.$> issued GET_DESCRIPTOR
+}
+
+#[test]
+fn device_described_reads_descriptor_and_sets_configuration() {
+    xhci::reset();
+    let mut e = UsbEnumeration::__create();
+    e.slot_enabled(1);
+    e.addressed();
+    e.device_described();
+    assert_eq!(e.state(), "DeviceDescribed");
+    assert_eq!(xhci::desc_reads(), 1); // parsed the descriptor
+    assert_eq!(xhci::set_config_slot(), 1); // issued SET_CONFIGURATION
+}
+
+#[test]
+fn configured_reaches_configured() {
+    xhci::reset();
+    let mut e = UsbEnumeration::__create();
+    e.slot_enabled(1);
+    e.addressed();
+    e.device_described();
+    e.configured();
+    assert_eq!(e.state(), "Configured");
+    assert!(e.is_configured());
+    assert_eq!(xhci::configured_slot(), 1);
 }
 
 #[test]
@@ -71,4 +96,16 @@ fn fail_from_address_assigned_funnels_to_failed() {
     e.addressed();
     e.fail();
     assert_eq!(e.state(), "Failed");
+}
+
+#[test]
+fn fail_from_device_described_funnels_to_failed() {
+    xhci::reset();
+    let mut e = UsbEnumeration::__create();
+    e.slot_enabled(1);
+    e.addressed();
+    e.device_described();
+    e.fail();
+    assert_eq!(e.state(), "Failed");
+    assert!(e.is_failed());
 }

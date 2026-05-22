@@ -1,6 +1,6 @@
 # `UsbEnumeration`
 
-> A USB device's enumeration lifecycle: `$Powered → $SlotEnabled → $AddressAssigned → …`, with `fail()` funneled to `$Failed` from any active stage through an `$Enumerating` parent (`=> $^`). Each stage's enter handler issues the next xHCI command (non-blocking); the native driver loop dequeues the command's completion event and dispatches the matching milestone event back to the FSM.
+> A USB device's full enumeration lifecycle: `$Powered → $SlotEnabled → $AddressAssigned → $DeviceDescribed → $Configured`, with `fail()` funneled to `$Failed` from any active stage through an `$Enumerating` parent (`=> $^`). Each stage's enter handler issues the next xHCI command or control transfer (non-blocking); the native driver loop dequeues the completion event and dispatches the matching milestone event back to the FSM.
 
 | Property | Value |
 |---|---|
@@ -9,7 +9,7 @@
 | Source file | [`../../frame/usb_enumeration.frs`](../../frame/usb_enumeration.frs) |
 | State diagram | [`usb_enumeration.svg`](usb_enumeration.svg) |
 | Instances at runtime | One (single-flight: the enumerating device) |
-| Status | Implemented through **addressing** (`$AddressAssigned`); descriptors + `SET_CONFIGURATION` → `$Configured` are Step 3c. Drives the QEMU usb-kbd to a USB address (`cargo xtask qemu-test` `usb_enumerates_b6`). |
+| Status | Implemented to `$Configured` — enumerates the QEMU usb-kbd end to end (Enable Slot → Address Device → GET_DESCRIPTOR → SET_CONFIGURATION), `cargo xtask qemu-test` `usb_enumerates_b6`. The post-config transfer (a HID report) is `UsbTransfer` (B6 Step 4). |
 
 ## State diagram
 
@@ -45,10 +45,17 @@ handlers when they issue commands against the device.
   `crate::xhci::address_device(self.slot)` (build the input/slot/EP0 contexts,
   register the output device context in the DCBAA, issue Address Device).
   `addressed()` → `$AddressAssigned`.
-- **`$AddressAssigned`** (child of `$Enumerating`) — enter handler logs the
-  milestone; `is_addressed()` is true. (Step 3c adds the configuration step from
-  here → `$Configured`.)
-- **`$Failed`** — a command failed; `is_failed()` is true.
+- **`$AddressAssigned`** (child of `$Enumerating`) — enter handler calls
+  `crate::xhci::get_device_descriptor(self.slot)` (issue a GET_DESCRIPTOR control
+  transfer on EP0: Setup → Data IN → Status); `is_addressed()` is true.
+  `device_described()` → `$DeviceDescribed`.
+- **`$DeviceDescribed`** (child of `$Enumerating`) — enter handler reads the
+  fetched descriptor (`read_device_descriptor()`, logs idVendor/idProduct) and
+  issues SET_CONFIGURATION (`set_configuration(self.slot)`). `configured()` →
+  `$Configured`.
+- **`$Configured`** (child of `$Enumerating`) — enter handler logs the configured
+  device; `is_configured()` is true. The device is now usable (transfers — Step 4).
+- **`$Failed`** — a command/transfer failed; `is_failed()` is true.
 - **`$Enumerating`** (parent) — `fail() { -> $Failed }`, inherited by the active
   children via `=> $^`.
 
@@ -58,9 +65,12 @@ handlers when they issue commands against the device.
 |---|---|---|
 | `slot_enabled` | (none) | Enable Slot completed; carries the assigned `slot`. |
 | `addressed` | (none) | Address Device completed. |
-| `fail` | (none) | A command failed (funneled to `$Failed`). |
+| `device_described` | (none) | The GET_DESCRIPTOR transfer completed. |
+| `configured` | (none) | The SET_CONFIGURATION transfer completed. |
+| `fail` | (none) | A command/transfer failed (funneled to `$Failed`). |
 | `state` | `String` | Current state name. |
 | `is_addressed` | `bool` | True in `$AddressAssigned`. |
+| `is_configured` | `bool` | True in `$Configured`. |
 | `is_failed` | `bool` | True in `$Failed`. |
 
 ## Composition
@@ -77,28 +87,34 @@ this owns the stage lifecycle.
 
 The roadmap sketches `$Powered → $Reset → $AddressAssigned → $Configured`. The
 port *reset* is owned by `HubPort` (its `$Resetting → $Enabled`), so enumeration
-begins at `$Powered` (port enabled) and adds `$SlotEnabled` for the xHCI Enable
-Slot step that the generic sketch omits. `$Configured` arrives in Step 3c.
+begins at `$Powered` (port enabled) and adds two states the generic sketch omits:
+`$SlotEnabled` (the xHCI Enable Slot step) and `$DeviceDescribed` (the
+GET_DESCRIPTOR control transfer, before SET_CONFIGURATION).
 
 ## Testing
 
 **State graph snapshot (Level 2):** `kernel-tests/tests/state_graphs.rs::usb_enumeration_state_graph_snapshot`.
 
-**Behavioral (Level 3):** `kernel-tests/tests/usb_enumeration_behavior.rs` — 6
+**Behavioral (Level 3):** `kernel-tests/tests/usb_enumeration_behavior.rs` — 9
 tests: construction issues Enable Slot in `$Powered`; `slot_enabled` →
 `$SlotEnabled` + Address Device on the threaded slot; `addressed` →
-`$AddressAssigned`; and `fail()` reaches `$Failed` from each of
-`$Powered`/`$SlotEnabled`/`$AddressAssigned` (the parent funnel). The `xhci`
-actions are doubled to record the calls + slot.
+`$AddressAssigned` + GET_DESCRIPTOR; `device_described` → `$DeviceDescribed` +
+descriptor read + SET_CONFIGURATION; `configured` → `$Configured`; and `fail()`
+reaches `$Failed` from each active stage (the parent funnel). The `xhci` actions
+are doubled to record the calls + slot.
 
 **QEMU (Level 7):** `usb_enumerates_b6` — the kernel enumerates the real
-qemu-xhci usb-kbd: serial shows `[usb] slot 1 enabled` → `[usb] device addressed
-(slot 1)` (Enable Slot + Address Device against the live controller, exercising
-the command ring, event ring, doorbell, and the slot/EP0 contexts).
+qemu-xhci usb-kbd end to end: serial shows `[usb] slot 1 enabled` → `[usb] device
+addressed (slot 1)` → `[usb] device descriptor: idVendor 0627 idProduct 0001` →
+`[usb] device configured (slot 1)` (Enable Slot + Address Device on the command
+ring, then GET_DESCRIPTOR + SET_CONFIGURATION control transfers on EP0, against
+the live controller — exercising the command/event rings, doorbells, the
+slot/EP0 contexts, and the EP0 transfer ring).
 
 ## Related documents
 - [Roadmap](../roadmap.md) — B6 Step 3
 - [`HubPort`](hub_port.md) — readies the port (`$Enabled`) that enumeration begins from; [`TcpConnection`](tcp_connection.md) — the same "enter handler kicks the next async step, completion event advances the FSM" shape
 
 ## Change log
-- **2026-05-22** — initial doc; B6 Step 3 (3a/3b). Enumeration through addressing: Enable Slot + Address Device driven by command-completion events, slot threaded via the domain, fail funnel via the `$Enumerating` parent. Descriptors + `SET_CONFIGURATION` → `$Configured` follow in Step 3c.
+- **2026-05-22** — initial doc; B6 Step 3 (3a/3b). Enumeration through addressing: Enable Slot + Address Device driven by command-completion events, slot threaded via the domain, fail funnel via the `$Enumerating` parent.
+- **2026-05-22** — B6 Step 3c. Added `$DeviceDescribed` + `$Configured`: GET_DESCRIPTOR + SET_CONFIGURATION EP0 control transfers (Setup/Data/Status TRBs on the EP0 transfer ring, dispatched by Transfer Events). Full enumeration to `$Configured`, validated on the real qemu-xhci usb-kbd.
