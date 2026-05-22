@@ -534,12 +534,27 @@ Today the APs run a single timer-preempted loop (B7-1). The refinement: a real
 driving the *existing* `Scheduler`/`Process` Frame systems **per core**. The
 prediction (from the B7 cross-core-post finding) is that this needs **no framec
 change**: each core owns its scheduler/process instances; cross-core wakeups and
-load-balancing arrive as `post`s into the target core's queue. This is the
-highest-value refinement — it puts the marquee finding under real load and
-exercises *many* Frame instances across cores. Needs: per-CPU TSS (so APs can take
-ring-3 → ring-0 traps and run user processes), per-CPU `CURRENT`/run-queue, an IPI
-"reschedule" vector. **Validates:** the cross-core-post model at scale; whether
-per-event allocation behind the heap spinlock holds up with N cores scheduling.
+load-balancing arrive as `post`s into the target core's queue.
+
+- **R1a (per-core Scheduler FSMs driven cross-core) — done.** Each AP owns its
+  own `Scheduler` Frame instance (`kernel/src/ksched.rs`); the BSP `post`s
+  `task_ready`/`task_unready` events into each core's MPSC queue, and that core
+  drains them into *its* Scheduler — which goes `$Idle → $Active` (peak 3
+  runnable) `→ $Idle`. Each instance stays pinned to its core; only the
+  `SchedPost` data crosses; per-core results come back via atomics (the BSP never
+  touches an AP's instance). Serial: `[smp] core N Frame scheduler: peak 3
+  runnable, ended idle=true` → `per-core Frame schedulers driven cross-core: ok`.
+  Validated by `smp_percpu_sched_b7` (**38/38** QEMU). **Confirms the B7
+  cross-core-post finding holds under N real `Scheduler` instances** — the
+  prediction held: no framec change. This is the scheduling *coordination /
+  run-mode* layer per core.
+- **R1b (per-core context-switched execution) — remaining.** Wire each core's
+  LAPIC timer (B7 Step 4) to a per-core context switch that picks runnable threads
+  from this Scheduler's ready set — so each core actually *time-slices several
+  threads*, not just tracks the count. Needs: per-CPU TSS (for ring-3 → ring-0
+  traps so APs can run user processes), per-CPU `CURRENT`/run-queue, an IPI
+  "reschedule" vector. **Validates:** whether per-event allocation behind the heap
+  spinlock holds up with N cores scheduling under load.
 
 ### R2 — networking at scale: a TCP connection table (Frame-relevant)
 

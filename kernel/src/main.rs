@@ -38,6 +38,7 @@ mod gdt;
 mod interrupts;
 mod io;
 mod ip_reasm;
+mod ksched;
 mod lapic;
 mod net;
 mod paging;
@@ -148,6 +149,11 @@ unsafe extern "C" fn ap_entry(cpu: &limine::mp::Cpu) -> ! {
     }
     percpu::set_this_cpu_work(work);
     AP_PREEMPTED.fetch_add(1, Ordering::SeqCst);
+
+    // R1a: drive this core's own Scheduler Frame instance from the cross-core
+    // posts the BSP staged for it (admit/retire tasks). The instance is pinned
+    // to this core; only Send event data crossed from the BSP.
+    ksched::ap_run(index);
 
     // B7 Step 5: stay *interrupt-enabled* and idle, so this core can service the
     // BSP's TLB-shootdown IPI (and its own timer). `hlt` with IF=1 wakes on each
@@ -320,6 +326,45 @@ unsafe extern "C" fn kmain() -> ! {
                         serial::writeln("[smp] TLB shootdown ack barrier: ok (safe to reuse page)");
                     }
                     frames::free_frame(frame); // safe now — every core has flushed
+                }
+            }
+
+            // R1a: per-core Frame schedulers driven by cross-core posts. Stage
+            // each AP's admit/retire sequence (the BSP scheduling work onto remote
+            // cores), then read back each core's Scheduler trajectory. Each AP
+            // owns its Scheduler instance; only the SchedPost data crossed cores.
+            if ap_count > 0 {
+                const TASKS_PER_CORE: u32 = 3;
+                for cpu in 1..=ap_count {
+                    for _ in 0..TASKS_PER_CORE {
+                        ksched::post_ready(cpu);
+                    }
+                    for _ in 0..TASKS_PER_CORE {
+                        ksched::post_unready(cpu);
+                    }
+                    ksched::set_expected(cpu, (TASKS_PER_CORE as usize) * 2);
+                }
+                let mut spins = 0u64;
+                while ksched::done_count() < ap_count && spins < 2_000_000_000 {
+                    spins += 1;
+                    core::hint::spin_loop();
+                }
+                let mut all_ok = true;
+                for cpu in 1..=ap_count {
+                    let pk = ksched::peak(cpu);
+                    let idle = ksched::ended_idle(cpu);
+                    serial::write_str("[smp] core ");
+                    serial::write_u32_decimal(cpu as u32);
+                    serial::write_str(" Frame scheduler: peak ");
+                    serial::write_u32_decimal(pk);
+                    serial::write_str(" runnable, ended idle=");
+                    serial::writeln(if idle { "true" } else { "false" });
+                    if pk != TASKS_PER_CORE || !idle {
+                        all_ok = false;
+                    }
+                }
+                if all_ok {
+                    serial::writeln("[smp] per-core Frame schedulers driven cross-core: ok");
                 }
             }
         } else {

@@ -1508,6 +1508,22 @@ const SMOKE_TESTS: &[SmokeTest] = &[
         expect_absent: &["KERNEL EXCEPTION", "KERNEL PANIC", "triple fault"],
         timeout_secs: 30,
     },
+    SmokeTest {
+        // R1a: per-core Frame schedulers driven by cross-core posts. Each AP owns
+        // its own Scheduler Frame instance; the BSP posts 3 task_ready + 3
+        // task_unready into each core's MPSC queue, and that core drains them into
+        // its Scheduler — which goes $Idle -> $Active (peak 3 runnable) -> $Idle.
+        // Puts the B7 cross-core-post finding under N real Scheduler instances;
+        // each instance stays pinned to its core (only SchedPost data crosses).
+        name: "smp_percpu_sched_b7",
+        expect_contains: &[
+            "[smp] core 1 Frame scheduler: peak 3 runnable, ended idle=true",
+            "[smp] core 3 Frame scheduler: peak 3 runnable, ended idle=true",
+            "[smp] per-core Frame schedulers driven cross-core: ok",
+        ],
+        expect_absent: &["KERNEL EXCEPTION", "KERNEL PANIC", "triple fault"],
+        timeout_secs: 30,
+    },
 ];
 
 fn run_qemu_test() -> Result<()> {
