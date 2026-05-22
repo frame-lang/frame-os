@@ -24,6 +24,12 @@ use crate::serial;
 const TIMER_VECTOR: usize = crate::pic::PIC1_OFFSET as usize;
 /// virtio-blk is on IRQ11 (slave PIC) → vector 0x20 + 11 (B4).
 const VIRTIO_BLK_VECTOR: usize = crate::pic::PIC1_OFFSET as usize + 11;
+/// LAPIC timer vector (B7 Step 4) — the APs' per-core periodic timer. Must match
+/// `crate::lapic::TIMER_VECTOR`.
+const LAPIC_TIMER_VECTOR: usize = 0x40;
+/// LAPIC spurious-interrupt vector — a present no-op gate (must match the
+/// spurious vector programmed into the LAPIC SVR).
+const SPURIOUS_VECTOR: usize = 0xFF;
 
 /// Monotonic timer tick count, incremented by the timer ISR.
 static TICKS: AtomicU64 = AtomicU64::new(0);
@@ -172,6 +178,39 @@ global_asm!(
     "  pop rcx",
     "  pop rax",
     "  iretq",
+    // LAPIC timer (B7 Step 4, vector 0x40) — the application processors' own
+    // periodic timer. Same minimal shape as the virtio post stubs (save the 9
+    // caller-saved GPRs, call the Rust half, restore, iretq). The handler bumps
+    // this core's per-CPU tick and EOIs the LAPIC — no scheduling, no Frame
+    // dispatch. (9 pushes keep rsp 16-aligned for the SysV call.)
+    ".global isr_lapic_timer",
+    "isr_lapic_timer:",
+    "  push rax",
+    "  push rcx",
+    "  push rdx",
+    "  push rsi",
+    "  push rdi",
+    "  push r8",
+    "  push r9",
+    "  push r10",
+    "  push r11",
+    "  call lapic_timer_irq",
+    "  pop r11",
+    "  pop r10",
+    "  pop r9",
+    "  pop r8",
+    "  pop rdi",
+    "  pop rsi",
+    "  pop rdx",
+    "  pop rcx",
+    "  pop rax",
+    "  iretq",
+    // Spurious interrupt (vector 0xFF) — the LAPIC delivers this if an interrupt
+    // is withdrawn before being serviced. By spec it must NOT be EOI'd; just
+    // return. A present gate here keeps a spurious IRQ from faulting.
+    ".global isr_spurious",
+    "isr_spurious:",
+    "  iretq",
     // Page fault (#PF, vector 14). Unlike most exceptions, #PF pushes an
     // error code (below the iretq frame), and the faulting address is in
     // CR2. Pass both to the Rust handler; it returns (recovered → retry) or
@@ -263,6 +302,16 @@ extern "C" {
     fn isr_page_fault();
     fn isr_virtio_blk();
     fn isr_virtio_net();
+    fn isr_lapic_timer();
+    fn isr_spurious();
+}
+
+/// Rust half of the LAPIC-timer ISR (B7 Step 4). Records a per-CPU tick (proof
+/// this core was preempted) and EOIs the *LAPIC* (not the PIC). Runs on each AP.
+#[no_mangle]
+extern "C" fn lapic_timer_irq() {
+    crate::percpu::record_tick();
+    crate::lapic::eoi();
 }
 
 /// Rust half of the virtio-blk IRQ stub (B4). Posts the completion (native,
@@ -347,7 +396,25 @@ pub fn init() {
         (*idt)[TIMER_VECTOR].set(timer, cs);
         // virtio-blk IRQ (B4).
         (*idt)[VIRTIO_BLK_VECTOR].set(isr_virtio_blk as *const () as usize as u64, cs);
+        // LAPIC timer (B7 Step 4) — the APs' per-core timer; the spurious vector
+        // gets a present (no-op) gate so a withdrawn IRQ can't fault.
+        (*idt)[LAPIC_TIMER_VECTOR].set(isr_lapic_timer as *const () as usize as u64, cs);
+        (*idt)[SPURIOUS_VECTOR].set(isr_spurious as *const () as usize as u64, cs);
 
+        let idtr = Idtr {
+            limit: (core::mem::size_of::<[IdtEntry; 256]>() - 1) as u16,
+            base: idt as u64,
+        };
+        asm!("lidt [{}]", in(reg) &idtr, options(readonly, nostack, preserves_flags));
+    }
+}
+
+/// Load the (already-built) IDT on an application processor. The BSP's `init()`
+/// built the table; an AP just points its IDTR at it with `lidt` before it
+/// enables interrupts. (B7 Step 4.)
+pub fn load_idt_on_ap() {
+    unsafe {
+        let idt = &raw const IDT;
         let idtr = Idtr {
             limit: (core::mem::size_of::<[IdtEntry; 256]>() - 1) as u16,
             base: idt as u64,

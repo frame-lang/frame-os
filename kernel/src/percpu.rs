@@ -20,11 +20,18 @@ pub const MAX_CPUS: usize = 8;
 pub struct PerCpu {
     pub cpu_index: u32,
     pub lapic_id: u32,
+    /// LAPIC-timer ticks this core has taken (B7 Step 4 — proof of per-core
+    /// preemption). Written only by this core's timer ISR.
+    pub ticks: u64,
+    /// Work iterations this core completed between ticks (proof it ran a thread).
+    pub work: u64,
 }
 
 const PERCPU_INIT: PerCpu = PerCpu {
     cpu_index: 0,
     lapic_id: 0,
+    ticks: 0,
+    work: 0,
 };
 static mut PERCPU: [PerCpu; MAX_CPUS] = [PERCPU_INIT; MAX_CPUS];
 
@@ -64,4 +71,39 @@ pub fn this_cpu_index() -> u32 {
         asm!("mov {0:e}, gs:[0]", out(reg) v, options(nostack, preserves_flags));
     }
     v
+}
+
+fn slot(index: usize) -> *mut PerCpu {
+    let base = &raw mut PERCPU as *mut PerCpu;
+    unsafe { base.add(index) }
+}
+
+/// Record a LAPIC-timer tick on the calling core. Called from this core's timer
+/// ISR; the field is single-writer (only this core touches its own slot).
+pub fn record_tick() {
+    let p = slot(this_cpu_index() as usize);
+    unsafe { (*p).ticks += 1 };
+}
+
+/// This core's tick count, read by its own preemptible loop. Volatile so the
+/// loop re-reads it (the ISR updates it asynchronously on the same core).
+pub fn this_cpu_ticks() -> u64 {
+    let p = slot(this_cpu_index() as usize);
+    unsafe { core::ptr::read_volatile(&(*p).ticks) }
+}
+
+/// Store this core's completed work-iteration count.
+pub fn set_this_cpu_work(w: u64) {
+    let p = slot(this_cpu_index() as usize);
+    unsafe { (*p).work = w };
+}
+
+/// Read core `index`'s tick count (the BSP reads each AP's after the demo).
+pub fn cpu_ticks(index: usize) -> u64 {
+    unsafe { (*slot(index)).ticks }
+}
+
+/// Read core `index`'s work count.
+pub fn cpu_work(index: usize) -> u64 {
+    unsafe { (*slot(index)).work }
 }

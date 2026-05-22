@@ -1480,6 +1480,20 @@ const SMOKE_TESTS: &[SmokeTest] = &[
         ],
         timeout_secs: 30,
     },
+    SmokeTest {
+        // B7 Step 4: per-CPU preemptive execution. Each AP loads the IDT, starts
+        // its own LAPIC timer, enables interrupts, and runs a busy loop that the
+        // timer preempts — proving each core runs a real, time-sliced thread (not
+        // just a one-shot). The BSP reports each core's tick + work counts; "ok"
+        // means every AP was preempted TARGET_TICKS times.
+        name: "smp_preempt_b7",
+        expect_contains: &[
+            "[smp] core 1: ",
+            "[smp] per-core preemption: ok (each AP timer-sliced)",
+        ],
+        expect_absent: &["KERNEL EXCEPTION", "KERNEL PANIC", "triple fault"],
+        timeout_secs: 30,
+    },
 ];
 
 fn run_qemu_test() -> Result<()> {

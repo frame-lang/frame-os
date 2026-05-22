@@ -38,6 +38,7 @@ mod gdt;
 mod interrupts;
 mod io;
 mod ip_reasm;
+mod lapic;
 mod net;
 mod paging;
 mod pci;
@@ -100,6 +101,11 @@ static SHARED_COUNTER: spin::SpinLock<u64> = spin::SpinLock::new(0);
 static AP_HAMMERED: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
 const HAMMER_ITERS: u64 = 50_000;
 
+// B7 Step 4: per-CPU preemption. Each AP runs a busy loop preempted by its own
+// LAPIC timer until the timer has fired `TARGET_TICKS` times, then signals done.
+static AP_PREEMPTED: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+const TARGET_TICKS: u64 = 5;
+
 /// Increment the shared counter `HAMMER_ITERS` times, taking the lock each time —
 /// the cross-core critical-section stress. Run concurrently by every core.
 fn hammer_counter() {
@@ -115,6 +121,9 @@ fn hammer_counter() {
 unsafe extern "C" fn ap_entry(cpu: &limine::mp::Cpu) -> ! {
     use core::sync::atomic::Ordering;
     let index = cpu.extra.load(Ordering::SeqCst) as usize;
+    // Load our GDT first (it reloads gs, zeroing the GS base), THEN set up the
+    // per-CPU block — so the GS-based per-CPU state survives.
+    gdt::load_on_ap();
     percpu::init_this_cpu(index, cpu.lapic_id);
     AP_ONLINE.fetch_add(1, Ordering::SeqCst);
     // B7 Step 2: hammer the shared counter concurrently with the other cores
@@ -124,8 +133,24 @@ unsafe extern "C" fn ap_entry(cpu: &limine::mp::Cpu) -> ! {
     // B7 cross-core post: contribute this AP's events into the MPSC queue that
     // the BSP drains into its EventCounter Frame system instance.
     crosscore::ap_post_phase();
-    // Park: interrupts off (the timer/PIC route to the BSP; APs run the
-    // scheduler from a later B7 step), low-power halt.
+
+    // B7 Step 4: per-CPU preemptive execution. Load the IDT, start this core's
+    // LAPIC timer, enable interrupts, and run a busy loop that the timer
+    // preempts — proving the core runs a real, time-sliced thread (not just a
+    // one-shot). Run until the timer has fired TARGET_TICKS times.
+    interrupts::load_idt_on_ap();
+    lapic::init_this_cpu();
+    unsafe { core::arch::asm!("sti", options(nomem, nostack)) };
+    let mut work = 0u64;
+    while percpu::this_cpu_ticks() < TARGET_TICKS {
+        work += 1;
+        core::hint::spin_loop();
+    }
+    unsafe { core::arch::asm!("cli", options(nomem, nostack)) };
+    percpu::set_this_cpu_work(work);
+    AP_PREEMPTED.fetch_add(1, Ordering::SeqCst);
+
+    // Park.
     loop {
         unsafe { core::arch::asm!("cli; hlt", options(nomem, nostack)) };
     }
@@ -179,6 +204,7 @@ unsafe extern "C" fn kmain() -> ! {
         if let Some(mp) = MP_REQUEST.get_response() {
             let bsp = mp.bsp_lapic_id();
             percpu::init_this_cpu(0, bsp); // BSP is per-CPU index 0
+            lapic::map(); // map the LAPIC register page before the APs use it
             let mut next_index = 1usize;
             let mut ap_count = 0usize;
             for cpu in mp.cpus() {
@@ -236,6 +262,33 @@ unsafe extern "C" fn kmain() -> ! {
             // into it — the instance never leaves this core, so framec's
             // non-Send codegen is fine.
             crosscore::run_drain_demo(ap_count);
+
+            // B7 Step 4: per-CPU preemption. Wait for each AP to be preempted
+            // TARGET_TICKS times by its own LAPIC timer (proving it ran a real,
+            // time-sliced thread), then report each core's tick + work counts.
+            let mut spins = 0u64;
+            while AP_PREEMPTED.load(Ordering::SeqCst) < ap_count && spins < 2_000_000_000 {
+                spins += 1;
+                core::hint::spin_loop();
+            }
+            let mut all_preempted = true;
+            for i in 1..=ap_count {
+                let t = percpu::cpu_ticks(i);
+                let w = percpu::cpu_work(i);
+                serial::write_str("[smp] core ");
+                serial::write_u32_decimal(i as u32);
+                serial::write_str(": ");
+                serial::write_u32_decimal(t as u32);
+                serial::write_str(" timer ticks, ");
+                serial::write_u32_decimal(w as u32);
+                serial::writeln(" work units");
+                if t < TARGET_TICKS {
+                    all_preempted = false;
+                }
+            }
+            if all_preempted && ap_count > 0 {
+                serial::writeln("[smp] per-core preemption: ok (each AP timer-sliced)");
+            }
         } else {
             serial::writeln("[smp] no MP response (single core)");
         }

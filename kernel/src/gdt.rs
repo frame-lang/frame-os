@@ -135,3 +135,41 @@ pub fn init() {
         );
     }
 }
+
+/// Load the already-built GDT on an application processor and reload its segment
+/// registers (B7 Step 4). The BSP's `init()` built the GDT + TSS; an AP just
+/// needs `lgdt` + a far-return to reload CS to our kernel code selector, so the
+/// IDT gates' `CS = 0x08` is valid when it takes an interrupt. We deliberately do
+/// **not** `ltr` here: an AP running only ring-0 code never consults the TSS
+/// (ring-0→ring-0 interrupts stay on the current stack, no IST), and the single
+/// shared TSS is the BSP's. Per-CPU TSSes arrive when APs run ring-3 processes.
+///
+/// NOTE: this reloads `gs` (zeroing the GS base), so a caller that uses per-CPU
+/// GS state must call `percpu::init_this_cpu` *after* this, not before.
+pub fn load_on_ap() {
+    unsafe {
+        let gdt = &raw const GDT;
+        let gdtr = Gdtr {
+            limit: (core::mem::size_of::<[u64; 7]>() - 1) as u16,
+            base: gdt as u64,
+        };
+        asm!(
+            "lgdt [{gdtr}]",
+            "push {kcode}",
+            "lea {tmp}, [rip + 2f]",
+            "push {tmp}",
+            "retfq",
+            "2:",
+            "mov ds, {kdata:x}",
+            "mov es, {kdata:x}",
+            "mov ss, {kdata:x}",
+            "mov fs, {kdata:x}",
+            "mov gs, {kdata:x}",
+            gdtr = in(reg) &gdtr,
+            kcode = in(reg) KERNEL_CODE as u64,
+            kdata = in(reg) KERNEL_DATA as u32,
+            tmp = out(reg) _,
+            options(preserves_flags),
+        );
+    }
+}
