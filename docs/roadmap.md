@@ -418,13 +418,13 @@ H3 is the H-track's final committed milestone. Further H-track work (a configura
 
 | # | Exit criterion | Validating test(s) |
 |---|---|---|
-| B5-1 | `TcpConnection` state graph matches the RFC-793 diagram | Snapshot `tcp_connection_state_graph_snapshot`; review against RFC-793 |
-| B5-2 | Per-transition behavior incl the hard edges: simultaneous open/close, retransmit, `TIME_WAIT` expiry | Behavioral tests (host) per transition |
-| B5-3 | The kernel answers `ping` (ICMP echo) | QEMU smoke `kernel_answers_ping_b5` (external client over QEMU user-net) |
-| B5-4 | A full TCP handshake + a trivial request/response + clean close, against an external client | QEMU smoke `tcp_echo_or_http_b5` |
-| B5-5 | ARP resolution and IP reassembly correct | Behavioral + smoke |
-| B5-6 | Per-system docs incl a `TcpConnection`-vs-RFC-793 comparison write-up | Review |
-| B5-7 | Diagrams + all CI gates + QEMU smoke | `cargo xtask check-diagrams`; full CI + `qemu-test` |
+| B5-1 | `TcpConnection` state graph matches the RFC-793 diagram | **Done** — `tcp_connection_state_graph_snapshot` + the RFC-793↔Frame table in `systems/tcp_connection.md` |
+| B5-2 | Per-transition behavior incl the hard edges: simultaneous open/close, retransmit, `TIME_WAIT` expiry | **Done** — 16 behavioral tests in `tcp_connection_behavior.rs` (both opens, both closes, simultaneous open/close, RST funnel, SYN/SYN-ACK retransmit, TIME_WAIT timeout) |
+| B5-3 | The kernel answers `ping` (ICMP echo) | **Partial** — the kernel *sends* ping + matches the reply (`kernel_pings_gateway_b5`); the inbound *responder* needs slirp to route inbound ICMP, which it won't — **deferred to the TAP transport** |
+| B5-4 | A full TCP handshake + a trivial request/response + clean close, against an external client | **Done** — `tcp_echo_b5` (handshake → echo → clean close vs. the host's real TCP stack) + `tcp_active_open_b5` (active open) |
+| B5-5 | ARP resolution and IP reassembly correct | **Partial** — ARP resolution done (`ArpResolver`, `arp_resolves_gateway_b5`); IP reassembly not needed over slirp (unfragmented) — revisit with TAP |
+| B5-6 | Per-system docs incl a `TcpConnection`-vs-RFC-793 comparison write-up | **Done** — `systems/tcp_connection.md` (RFC-793↔Frame mapping table) + per-system docs for all 5 B5 systems |
+| B5-7 | Diagrams + all CI gates + QEMU smoke | **Local: green** (`check-diagrams` clean; 28/28 `qemu-test`; host suite passes). **crates.io CI: blocked** — the kernel now uses typed *struct* enter params (`ElfLoader`, `RxPipeline`), which need the new typed-context framec; CI's `cargo install framec` (4.2.0, String-form enter args) can't build it until that framec is published |
 
 **Estimated effort:** Very large. This is the milestone the "stress-test Frame" thesis is pointed at — if Frame expresses a correct TCP FSM cleanly, that is the headline result.
 
@@ -439,7 +439,9 @@ H3 is the H-track's final committed milestone. Further H-track work (a configura
 - **Step 4c (data echo):** Done. `$Established` echoes the client's bytes back (the demo's echo "app"; the data segment piggybacks the ACK). The harness sends a request and **reads it back** (`tcp_echo_b5`, gated in the harness), validating the outbound data path's seq + pseudo-header checksum against the host's TCP. Added server connection-recycling (drop a dead/idle slirp connection → re-listen → accept the live one) and a serial-gated probe (the harness waits for `[tcp] listening` before connecting, making exactly one connection). **27/27** QEMU.
 - **Step 4d (clean close + TIME_WAIT timer wheel) — B5-4 met:** Done. After the echo the kernel actively closes; the native timer wheel (`tcp::drain_timers`, wired into the serve loop — the post/drain pattern) fires `$TimeWait`'s 2·MSL timeout → `$Closed`. `tcp_echo_b5` now covers the **full handshake + request/response + clean close** against the host's TCP stack (asserts `[tcp] established`/`echoed`/`closed`). **27/27** QEMU. So **B5-4 is met** — a complete TCP exchange driven by the RFC-793 Frame FSM, with timers expressed as enter-handler-armed + native-wheel-fired (the "Frame has no `after(ms)`" answer, proven on TCP).
 - **Step 4e (active open + retransmit):** Done. The kernel connects *out* to 10.0.2.100:9 — slirp `guestfwd` forwards it to a host listener (the harness binds it before QEMU starts, since QEMU opens the guestfwd target at startup); reached via the already-resolved gateway MAC (slirp uses one MAC for all its virtual addresses). `$SynSent` → `$Established`, validated by `tcp_active_open_b5` (**28/28** QEMU). Added a SYN-ACK retransmit behavioral test (16 total). guestfwd is only attached for the active test (it must connect at startup); the kernel's active-open on other boots RSTs fast (~1.5s cap). So **both passive and active opens are now live against a real peer.**
-- **Remaining:** Step 4f — the `TcpConnection`-vs-RFC-793 write-up (B5-6; the per-system doc already has the mapping table) + confirm all CI gates (B5-7). See [`plans/b5_tcp.md`](plans/b5_tcp.md). ICMP responder (B5-3) rides the TAP upgrade.
+- **Step 4f (wrap-up):** Done. B5-1/B5-2 (TcpConnection snapshot + 16 behavioral) and B5-6 (RFC-793↔Frame write-up + per-system docs for all 5 B5 systems) confirmed; diagrams in sync; 28/28 QEMU. B5-7's *local* gates are green; the *crates.io* CI is blocked on publishing the typed-context framec (the kernel now uses struct enter params). The headline result stands: **a real TCP connection — passive (handshake → echo → clean close, B5-4) and active open — driven entirely by the RFC-793 `TcpConnection` Frame FSM against the host's real TCP stack, with timers via the enter-handler + native-wheel idiom.**
+
+**B5 status: substantially complete.** The core (NIC + ARP + IPv4/ICMP + UDP + the full TCP exchange) is done and validated. **Deferred to the TAP transport upgrade:** the inbound ICMP responder (B5-3) and IP reassembly (B5-5) — both need real inbound L2 that slirp's NAT won't provide. **Deferred to the framec release:** crates.io CI (B5-7). The "stress-test Frame" findings are recorded in [`frame_assessment.md`](frame_assessment.md).
 
 ### B6 — USB
 
