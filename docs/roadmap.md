@@ -712,10 +712,31 @@ root cause behind post/drain and the hot-path verdict — re-run R1/R2 against i
 
 ### R5 — deeper SMP correctness (native)
 
-Nested locks with a documented acquire order, sleep-locks (block rather than spin
-for long holds), a deadlock stress test, and proper per-CPU TSS/IST. Completes
-B7-3 beyond the leaf-lock stage. Mostly native; the payoff is robustness, not a
-Frame finding.
+Completes B7-3 beyond the leaf-lock stage. Mostly native; the payoff is robustness.
+
+- **R5a — lock ordering + nested-lock deadlock stress — done.** `SpinLock` gained an
+  optional **rank** (`with_rank`; `new` stays a rank-0 leaf, unchecked) and a per-CPU
+  held-rank checker that **panics at the acquire** if a core tries to take a lock whose
+  rank ≤ the highest it already holds — catching an ordering reversal *before* it can
+  deadlock against another core. `lockorder.rs` exercises it: two ranked locks (A rank 1,
+  B rank 2), every core (BSP + APs) runs `A→B→bump both→release` 20000× concurrently. The
+  counters end at exactly cores × 20000 (= 80000) on both iff every nested increment
+  serialized with no lost update and no deadlock. Serial: `[smp] nested-lock stress:
+  A=80000 B=80000` → `nested-lock ordering: ok`. Validated by `smp_nested_lock_r5`.
+- **R5b — per-CPU TSS + IST — done.** APs no longer share the BSP's single TSS. `gdt.rs`
+  now holds a TSS per core (GDT grew a TSS descriptor per CPU; `tss_selector(cpu)`), each
+  with its own **double-fault IST stack** (`TSS.ist[0]`); the BSP builds them all in
+  `gdt::init`, and each AP `ltr`s its own in `load_on_ap(cpu)`. IDT vector 8 (#DF) routes
+  through **IST1**, so a fault on any core lands on a known-good per-core stack instead of
+  triple-faulting. `set_rsp0` is now per-CPU (`this_cpu_index`); the B3 ring-3/syscall
+  path (BSP = core 0) is unchanged (all 6 B3 tests still pass). Each core verifies its own
+  loaded TR via `str`. Serial: `[smp] per-CPU TSS+IST: 4 of 4 cores armed (#DF -> IST1)` →
+  `ok`. Validated by `smp_percpu_tss_r5`.
+- **R5c — sleep-locks — deferred.** "Block rather than spin for long holds" needs a
+  blocking scheduler to yield/resume a waiter, which the current run-to-exit AP model
+  (`pcsched`) doesn't provide — it's an R1-track scheduler extension, not lock work.
+  Deferred with rationale rather than half-built; the leaf/ranked spinlocks cover the
+  current short-critical-section needs.
 
 ### R6 — the crates.io CI gate (tooling)
 

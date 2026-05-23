@@ -80,6 +80,14 @@ impl IdtEntry {
         self.type_attr = 0x8E;
         self.zero = 0;
     }
+
+    /// Like `set`, but routes the gate to Interrupt Stack Table slot `ist`
+    /// (1..=7): the CPU loads RSP from this core's `TSS.ist[ist-1]` on entry,
+    /// switching to a known-good stack (R5b — used by the #DF handler).
+    fn set_ist(&mut self, handler: u64, selector: u16, ist: u8) {
+        self.set(handler, selector);
+        self.ist = ist & 0x7;
+    }
 }
 
 #[repr(C, packed)]
@@ -101,6 +109,19 @@ global_asm!(
     ".global isr_exception",
     "isr_exception:",
     "  call exception_handler",
+    "1:",
+    "  hlt",
+    "  jmp 1b",
+    // Double fault (#DF, vector 8). Routed through IST1 (this core's #DF stack)
+    // so it runs on a known-good stack even if the interrupted stack is corrupt.
+    // #DF is not recoverable: report which core and halt. The CPU pushed an
+    // (always-zero) error code; we never return, so we don't clean it up. `cli`
+    // + 16-align before the call (SysV).
+    ".global isr_double_fault",
+    "isr_double_fault:",
+    "  cli",
+    "  and rsp, -16",
+    "  call double_fault_handler",
     "1:",
     "  hlt",
     "  jmp 1b",
@@ -349,6 +370,20 @@ extern "C" {
     fn isr_lapic_timer();
     fn isr_spurious();
     fn isr_tlb_shootdown();
+    fn isr_double_fault();
+}
+
+/// Rust half of the #DF handler (R5b). Runs on this core's IST1 stack. A double
+/// fault is unrecoverable; report which core hit it and halt (so it surfaces in
+/// the serial log instead of escalating to a triple fault / silent reboot).
+#[no_mangle]
+extern "C" fn double_fault_handler() -> ! {
+    crate::serial::write_str("[df] double fault on core ");
+    crate::serial::write_u32_decimal(crate::percpu::this_cpu_index());
+    crate::serial::writeln(" — halting");
+    loop {
+        unsafe { asm!("hlt", options(nomem, nostack)) };
+    }
 }
 
 /// Rust half of the LAPIC-timer ISR (B7 Step 4 / R1b). Records a per-CPU tick
@@ -479,6 +514,9 @@ pub fn init() {
             (*idt)[v].set(exc, cs);
         }
         (*idt)[3].set(bp, cs);
+        // Double fault (#DF, vector 8) → per-core IST1 stack (R5b), so it runs on
+        // a known-good stack instead of triple-faulting.
+        (*idt)[8].set_ist(isr_double_fault as *const () as usize as u64, cs, 1);
         // Page fault (#PF) → demand-paging / fatal classifier.
         (*idt)[14].set(pf, cs);
         // IRQ0 timer.

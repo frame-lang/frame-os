@@ -40,6 +40,7 @@ mod io;
 mod ip_reasm;
 mod ksched;
 mod lapic;
+mod lockorder;
 mod net;
 mod paging;
 mod pci;
@@ -95,6 +96,8 @@ static MP_REQUEST: limine::request::MpRequest = limine::request::MpRequest::new(
 /// Count of application processors that have reached `ap_entry` and set up their
 /// per-CPU state. The BSP waits on this during SMP bringup.
 static AP_ONLINE: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+// R5b: count of APs that verified they loaded *their own* per-CPU TSS selector.
+static AP_TSS_OK: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
 
 // B7 Step 2: a cross-core, lock-protected shared counter. Every core (BSP + APs)
 // hammers it concurrently; if the `SpinLock` is correct, the final total is
@@ -125,9 +128,15 @@ unsafe extern "C" fn ap_entry(cpu: &limine::mp::Cpu) -> ! {
     use core::sync::atomic::Ordering;
     let index = cpu.extra.load(Ordering::SeqCst) as usize;
     // Load our GDT first (it reloads gs, zeroing the GS base), THEN set up the
-    // per-CPU block — so the GS-based per-CPU state survives.
-    gdt::load_on_ap();
+    // per-CPU block — so the GS-based per-CPU state survives. `load_on_ap` also
+    // `ltr`s this core's own TSS (R5b), so a #DF here lands on this core's IST
+    // stack rather than triple-faulting.
+    gdt::load_on_ap(index);
     percpu::init_this_cpu(index, cpu.lapic_id);
+    // R5b: confirm this core loaded its own per-CPU TSS (so #DF uses its IST stack).
+    if gdt::current_tr() == gdt::tss_selector(index) {
+        AP_TSS_OK.fetch_add(1, Ordering::SeqCst);
+    }
     AP_ONLINE.fetch_add(1, Ordering::SeqCst);
     // B7 Step 2: hammer the shared counter concurrently with the other cores
     // (the SpinLock cross-core stress), then signal done.
@@ -162,6 +171,11 @@ unsafe extern "C" fn ap_entry(cpu: &limine::mp::Cpu) -> ! {
     // own Scheduler Frame instance through $Active→$Idle as they spawn and exit.
     // Real preemptive multitasking per core; the BSP reads back the results.
     pcsched::ap_run(index);
+
+    // R5a: nested-lock deadlock-avoidance stress. This core acquires two ranked
+    // locks (A→B) in the documented global order, many times, concurrently with
+    // every other core — exercising nested locking beyond the B7 leaf-lock stage.
+    lockorder::stress();
 
     // B7 Step 5: stay *interrupt-enabled* and idle, so this core can service the
     // BSP's TLB-shootdown IPI (and its own timer). `hlt` with IF=1 wakes on each
@@ -247,6 +261,22 @@ unsafe extern "C" fn kmain() -> ! {
             serial::write_str(", this cpu ");
             serial::write_u32_decimal(percpu::this_cpu_index());
             serial::writeln(")");
+
+            // R5b: per-CPU TSS + IST. Each core (BSP in gdt::init, APs in
+            // load_on_ap) loaded *its own* TSS, whose ist[0] points at that core's
+            // #DF stack — so a double fault on any core lands on a known-good stack
+            // (IDT vector 8 → IST1) instead of triple-faulting. Verify: the BSP's
+            // TR is core 0's selector, and every AP confirmed its own.
+            let bsp_tss_ok = gdt::current_tr() == gdt::tss_selector(0);
+            let ap_tss_ok = AP_TSS_OK.load(Ordering::SeqCst);
+            serial::write_str("[smp] per-CPU TSS+IST: ");
+            serial::write_u32_decimal((ap_tss_ok + bsp_tss_ok as usize) as u32);
+            serial::write_str(" of ");
+            serial::write_u32_decimal((ap_count + 1) as u32);
+            serial::writeln(" cores armed (#DF -> IST1)");
+            if bsp_tss_ok && ap_tss_ok == ap_count {
+                serial::writeln("[smp] per-CPU TSS+IST: ok");
+            }
 
             // B7 Step 2: the BSP joins the APs in hammering the shared counter
             // (they started as soon as they came online), then waits for all APs
@@ -421,6 +451,32 @@ unsafe extern "C" fn kmain() -> ! {
                 if all_ok {
                     serial::writeln("[r1b] per-core context-switched execution: ok");
                 }
+            }
+
+            // R5a: nested-lock deadlock-avoidance stress. The BSP joins the APs
+            // (which started in ap_entry) in hammering two ranked locks in the
+            // documented A→B order, then waits for all cores and checks the
+            // counters: exactly cores × ITERS on each iff every nested increment
+            // serialized with no lost update and no deadlock. The SpinLock rank
+            // checker would have panicked had any core reversed the order.
+            lockorder::stress();
+            let cores = ap_count + 1; // + BSP
+            let mut spins = 0u64;
+            while lockorder::done_count() < cores && spins < 4_000_000_000 {
+                spins += 1;
+                core::hint::spin_loop();
+            }
+            let (ta, tb) = lockorder::totals();
+            let want = lockorder::expected(cores as u64);
+            serial::write_str("[smp] nested-lock stress: A=");
+            serial::write_u32_decimal(ta as u32);
+            serial::write_str(" B=");
+            serial::write_u32_decimal(tb as u32);
+            serial::write_str(" (expected ");
+            serial::write_u32_decimal(want as u32);
+            serial::writeln(")");
+            if ta == want && tb == want && lockorder::done_count() == cores {
+                serial::writeln("[smp] nested-lock ordering: ok (no deadlock, no lost updates)");
             }
         } else {
             serial::writeln("[smp] no MP response (single core)");

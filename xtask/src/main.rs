@@ -1665,6 +1665,41 @@ const SMOKE_TESTS: &[SmokeTest] = &[
         expect_absent: &["KERNEL EXCEPTION", "KERNEL PANIC", "triple fault"],
         timeout_secs: 30,
     },
+    SmokeTest {
+        // R5a: nested-lock deadlock-avoidance stress. Every core acquires two
+        // *ranked* locks in the documented global order (A rank 1 → B rank 2),
+        // 20000 times, concurrently — nested locking beyond the B7 leaf-lock
+        // stage. The counters end at exactly cores × 20000 (= 80000 with 4 cores)
+        // on both locks iff every nested increment serialized with no lost update
+        // and no deadlock. The SpinLock rank checker would have panicked at the
+        // acquire had any core reversed the order (B → A).
+        name: "smp_nested_lock_r5",
+        expect_contains: &[
+            "[smp] nested-lock stress: A=80000 B=80000 (expected 80000)",
+            "[smp] nested-lock ordering: ok (no deadlock, no lost updates)",
+        ],
+        expect_absent: &[
+            "KERNEL EXCEPTION",
+            "KERNEL PANIC",
+            "triple fault",
+            "lock order violation",
+        ],
+        timeout_secs: 30,
+    },
+    SmokeTest {
+        // R5b: per-CPU TSS + IST. Each core loads its own TSS (the BSP in
+        // gdt::init, APs in load_on_ap), whose ist[0] points at that core's
+        // double-fault stack; IDT vector 8 (#DF) routes through IST1. So a fault
+        // on any core lands on a known-good per-core stack instead of escalating
+        // to a triple fault. Each core verifies its own TR via `str`.
+        name: "smp_percpu_tss_r5",
+        expect_contains: &[
+            "[smp] per-CPU TSS+IST: 4 of 4 cores armed (#DF -> IST1)",
+            "[smp] per-CPU TSS+IST: ok",
+        ],
+        expect_absent: &["KERNEL EXCEPTION", "KERNEL PANIC", "triple fault"],
+        timeout_secs: 30,
+    },
 ];
 
 fn run_qemu_test() -> Result<()> {
