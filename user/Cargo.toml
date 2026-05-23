@@ -55,6 +55,13 @@ path = "src/argtest.rs"
 name = "fwtest"
 path = "src/fwtest.rs"
 
+# C-style program over frame-libc (B10-1): no `_start` of its own — crt0 comes
+# from frame-os-libc — just `main(argc, argv, envp)`. Disk-only (the shell runs
+# /bin/cmain), exercising the exact entry path a tcc-compiled C program will use.
+[[bin]]
+name = "cmain"
+path = "src/cmain.rs"
+
 # Scripted shell: cat /motd + exec /bin/hello from disk (B4 Step 4a).
 [[bin]]
 name = "shell"
@@ -78,6 +85,10 @@ path = "src/ish.rs"
 # allocator-free. Same crate + version the kernel uses.
 [dependencies]
 linked_list_allocator = "0.10"
+# frame-os-libc (B10): the C/POSIX-ish runtime. Only `cmain` links it (for its
+# crt0 + libc calls); the other bins define their own `_start` and don't
+# reference it, so its symbols aren't pulled into them.
+frame-os-libc = { path = "../libc" }
 
 [profile.dev]
 panic = "abort"

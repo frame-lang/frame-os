@@ -1,0 +1,16 @@
+# frame-os-libc (B10): a minimal C/POSIX-ish runtime for Frame OS user programs.
+#
+# Built on the Frame OS syscall ABI (B8/B9). This is the "C side" a future
+# tcc-compiled program links against; for now Rust user programs link it via the
+# same `extern "C"` surface, exercising exactly the path C will take. Built for
+# the bare-metal `x86_64-unknown-none` target as a path dependency of the `user`
+# crate (which supplies the target + linker script), so it is excluded from the
+# host workspace. In B11 a `staticlib` crate-type is added to emit a `.a` for tcc.
+[package]
+name = "frame-os-libc"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "frame_os_libc"
+path = "src/lib.rs"

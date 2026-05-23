@@ -844,6 +844,16 @@ from it" are largely built; the gaps are input, a growable heap, and the toolcha
   library (malloc/free over `brk`, file I/O, string, stdio, `exit`) for tcc, **and** a
   Rust `std` backend (`std::sys::frameos`) on top, so framec (Rust + std) can be built
   for the OS. The Redox model. *Large — the "real program-hosting OS" milestone.*
+  - **B10-1 — `frame-libc` crate + crt0 — done.** A new `libc/` crate
+    (`frame-os-libc`, `no_std`) exposing an `extern "C"` surface: crt0 (`_start` parses
+    the kernel's SysV initial stack and calls `main`, generalizing the B9-2 `argtest`
+    shim — every program that links the libc gets a real `_start` and just writes
+    `main`), syscall thunks, `write` (stdout/stderr → console, else file), `exit`,
+    `strlen`. The `cmain` test program is `#![no_main]` and pulls `_start` from the libc
+    — exactly the entry path a tcc-compiled C program will take. Validated by
+    `console-test` (`/bin/cmain one two` → crt0 → `main` echoes `argc=3`, `argv[2]=two`).
+    *Next: B10-2 malloc over `brk`, B10-3 stdio + printf (the `FILE*` + format-scanner
+    FSMs), B10-4 file streams, B10-5 the Rust `std` port.*
 - **B11 — on-device C toolchain (tcc).** Port **tcc** to build against `frame-libc`
   and emit Frame-OS ELF: `cc hello.c -o hello` from the shell. tcc is the right choice
   — small, single-pass, self-contained, designed for exactly this. ✅ **"compile

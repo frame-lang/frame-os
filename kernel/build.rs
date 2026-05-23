@@ -163,12 +163,16 @@ fn build_user_program(workspace_root: &Path, out_dir: &Path) -> Result<()> {
         "src/shell.rs",
         "src/frameshell.rs",
         "src/ish.rs",
+        "src/cmain.rs",
         "src/frame_systems.rs",
         "src/mem.rs",
         "build.rs",
         "linker.ld",
         "Cargo.toml",
         ".cargo/config.toml",
+        // frame-os-libc (B10): a sibling path dependency of the user crate.
+        "../libc/src/lib.rs",
+        "../libc/Cargo.toml",
     ] {
         println!("cargo:rerun-if-changed={}", user_dir.join(f).display());
     }

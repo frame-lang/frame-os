@@ -12,6 +12,10 @@ members = [
 # excluded so workspace-wide commands don't try to build it for the host target.
 exclude = [
     "user",
+    # frame-os-libc (B10): a bare-metal userspace runtime, built only as a path
+    # dependency of `user` (for `x86_64-unknown-none`). Excluded so workspace-wide
+    # host commands don't try to build it for the host target.
+    "libc",
 ]
 
 # `default-members` excludes the kernel from `cargo build` / `cargo test` at the

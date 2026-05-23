@@ -3,9 +3,14 @@
 version = 4
 
 [[package]]
+name = "frame-os-libc"
+version = "0.1.0"
+
+[[package]]
 name = "frame-os-user-hello"
 version = "0.1.0"
 dependencies = [
+ "frame-os-libc",
  "linked_list_allocator",
 ]
 

@@ -369,9 +369,11 @@ fn prepare_qemu_artifacts_features(workspace: &Path, interactive: bool) -> Resul
     let blk_template = qemu_dir.join("blk-template.img");
     let hello_elf = build_user_disk_elf(workspace, "hello")?;
     let argtest_elf = build_user_disk_elf(workspace, "argtest")?;
+    let cmain_elf = build_user_disk_elf(workspace, "cmain")?;
     let mut files: Vec<(&str, &[u8])> = FS_FILES.to_vec();
     files.push(("/bin/hello", &hello_elf));
     files.push(("/bin/argtest", &argtest_elf));
+    files.push(("/bin/cmain", &cmain_elf));
     let image = build_fs_image(BLK_DISK_BLOCKS, &files);
     std::fs::write(&blk_template, &image)
         .with_context(|| format!("failed to write {}", blk_template.display()))?;
@@ -814,7 +816,17 @@ fn run_console_test() -> Result<()> {
         stdin.flush().ok();
         wait_for_output(&buf, "argv[1]=alpha", 20)?;
         wait_for_output(&buf, "argv[2]=beta", 20)?;
-        eprintln!("console-test: argv arrived; typing `exit`");
+        // B10-1: a C-style program over frame-libc — crt0 (from the libc) parses
+        // the argv stack and calls main, which echoes via the libc's write. Same
+        // entry path a tcc-compiled C program will take.
+        eprintln!("console-test: typing `/bin/cmain one two`");
+        stdin
+            .write_all(b"/bin/cmain one two\n")
+            .context("write cmain")?;
+        stdin.flush().ok();
+        wait_for_output(&buf, "cmain: hello from frame-libc; argc=3", 20)?;
+        wait_for_output(&buf, "argv[2]=two", 20)?;
+        eprintln!("console-test: frame-libc crt0+main ok; typing `exit`");
         stdin.write_all(b"exit\n").context("write exit")?;
         stdin.flush().ok();
         Ok(())
