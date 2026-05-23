@@ -13,8 +13,17 @@
 use core::panic::PanicInfo;
 use frame_os_libc::{
     exit, fclose, feof, fgets, fopen, fprintf_args, fputs, fread, free, malloc, print_fmt, realloc,
-    stdout, strlen, write, Arg,
+    stdout, strlen, write, Arg, FILE,
 };
+
+// The C-ABI variadic printf/fprintf frame-libc provides (B11-1). *Calling* a
+// variadic extern is stable Rust, so this exercises the real C ABI path a
+// tcc-compiled program takes — the args go through registers/stack exactly as a
+// C compiler would emit, and frame-libc's naked trampoline reads them.
+extern "C" {
+    fn printf(fmt: *const u8, ...) -> i32;
+    fn fprintf(f: *mut FILE, fmt: *const u8, ...) -> i32;
+}
 
 // `main`, C-style: `int main(int argc, char **argv, char **envp)`. frame-libc's
 // crt0 calls this, then `exit`s with the returned code.
@@ -53,6 +62,24 @@ extern "C" fn main(argc: i32, argv: *const *const u8, _envp: *const *const u8) -
             Arg::Int(7),
         ],
     );
+
+    // B11-1: the C-ABI variadic printf/fprintf (real varargs through registers).
+    unsafe {
+        printf(
+            b"cmain: va printf d=%d x=%x s=%s c=%c\n\0".as_ptr(),
+            -7i32,
+            0xbeefu32,
+            b"hi\0".as_ptr(),
+            b'Z' as i32,
+        );
+        fprintf(
+            stdout(),
+            b"cmain: va fprintf %d+%d=%d\n\0".as_ptr(),
+            20i32,
+            22i32,
+            42i32,
+        );
+    }
 
     // B10-3b: buffered FILE* streams. fprintf to the console, then write a file
     // with fprintf + fputs, close it, reopen it, read it back, and confirm feof.

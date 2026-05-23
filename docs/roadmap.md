@@ -899,6 +899,16 @@ from it" are largely built; the gaps are input, a growable heap, and the toolcha
   and emit Frame-OS ELF: `cc hello.c -o hello` from the shell. tcc is the right choice
   — small, single-pass, self-contained, designed for exactly this. ✅ **"compile
   hello-world in C and run it from the shell"** (framec emits C → tcc → ELF → run).
+  - **B11-1 — C-variadic `printf`/`fprintf` — done.** The deferred shim, on stable
+    Rust via a hand-rolled SysV va_list (no nightly). A naked trampoline spills the
+    vararg integer registers (printf: rsi–r9; fprintf: rdx–r9) to a stack save area and
+    calls a Rust impl that walks them + the stack overflow, feeding the existing scanner
+    + conversion engine. Integer/pointer only — we don't support `%f`, so the SSE
+    registers are never touched. (*Calling* a variadic extern is stable Rust, so `cmain`
+    tests it through the real C ABI: `printf("d=%d x=%x s=%s c=%c", -7, 0xbeef, "hi",
+    'Z')` → `d=-7 x=beef s=hi c=Z`.) frame-libc's printf is now genuinely C-callable —
+    what a tcc-compiled program emits. *Next: B11-2 a host-cross-compiled C program runs
+    on Frame OS (frame-libc as a `.a`); B11-3 tcc itself on-device.*
 - **B12 — framec on-device.** Cross-compile framec (Rust + std) for the Frame OS
   target — possible because B10 ported std. `framec hello.frs -l c` runs on the OS.
   *Large, but framec is a big Rust program, not a toolchain — and it dogfoods itself

@@ -331,9 +331,46 @@ pub fn stderr() -> *mut FILE {
     unsafe { console_stream(&raw mut STDERR, 2, true) }
 }
 
-/// `fprintf` into a stream (B10-3b). The Rust-friendly front end driving the
-/// printf engine; the C-variadic `fprintf(f, fmt, ...)` lands at B11 with tcc.
+/// `fprintf` into a stream (B10-3b). The Rust-friendly front end alongside the
+/// C-ABI variadic `fprintf` below.
 pub fn fprintf_args(f: *mut FILE, fmt: &str, args: &[Arg]) {
     let bytes = vformat(fmt, args);
     unsafe { fwrite(bytes.as_ptr(), 1, bytes.len(), f) };
+}
+
+/// Rust target of the `fprintf` trampoline: `rdi` = stream, `rsi` = fmt,
+/// `rdx` = saved-reg area (rdx,rcx,r8,r9), `rcx` = stack overflow.
+extern "C" fn vfprintf_impl(
+    f: *mut FILE,
+    fmt: *const u8,
+    regs: *const u64,
+    overflow: *const u64,
+) -> i32 {
+    let mut va = crate::printf::VaArgs::new(regs, 4, overflow);
+    let bytes = crate::printf::vformat_va(fmt, &mut va);
+    unsafe { fwrite(bytes.as_ptr(), 1, bytes.len(), f) };
+    bytes.len() as i32
+}
+
+/// C `fprintf(FILE *f, const char *fmt, ...)`. Naked: stream stays in rdi and
+/// fmt in rsi; spill the 4 vararg integer registers (rdx,rcx,r8,r9). Four pushes
+/// from a post-`call` rsp leave it ≡8 mod 16, so one extra 8-byte pad aligns the
+/// inner call (B11-1).
+#[no_mangle]
+#[unsafe(naked)]
+pub unsafe extern "C" fn fprintf(_f: *mut FILE, _fmt: *const u8) -> i32 {
+    core::arch::naked_asm!(
+        "push r9",
+        "push r8",
+        "push rcx",
+        "push rdx",
+        "mov rdx, rsp",        // arg2 = saved-reg area [rdx,rcx,r8,r9]
+        "lea rcx, [rsp + 40]", // arg3 = overflow (32 pushed + 8 return addr)
+        "sub rsp, 8",          // 16-align the call
+        "call {f}",
+        "add rsp, 8",
+        "add rsp, 32",         // pop the 4 saved regs
+        "ret",
+        f = sym vfprintf_impl,
+    );
 }

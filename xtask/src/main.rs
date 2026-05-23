@@ -861,6 +861,9 @@ fn run_console_test() -> Result<()> {
             "cmain: d=-42 u=42 x=ff X=FF c=Q s=world p=0xdead pad=[    7][7    ][00007] pct=%",
             20,
         )?;
+        // B11-1: the C-ABI variadic printf/fprintf (real varargs).
+        wait_for_output(&buf, "cmain: va printf d=-7 x=beef s=hi c=Z", 20)?;
+        wait_for_output(&buf, "cmain: va fprintf 20+22=42", 20)?;
         // B10-3b: buffered FILE* streams (fopen/fprintf/fwrite/fread/feof).
         wait_for_output(&buf, "cmain: fprintf to stdout: 2+3=5", 20)?;
         wait_for_output(&buf, "cmain: FILE* write/read/feof ok", 20)?;
