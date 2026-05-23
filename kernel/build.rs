@@ -172,6 +172,11 @@ fn build_user_program(workspace_root: &Path, out_dir: &Path) -> Result<()> {
         ".cargo/config.toml",
         // frame-os-libc (B10): a sibling path dependency of the user crate.
         "../libc/src/lib.rs",
+        "../libc/src/malloc.rs",
+        "../libc/src/printf.rs",
+        "../libc/src/frame_systems.rs",
+        "../libc/build.rs",
+        "../libc/frame/printf_scan.frs",
         "../libc/Cargo.toml",
     ] {
         println!("cargo:rerun-if-changed={}", user_dir.join(f).display());

@@ -858,7 +858,21 @@ from it" are largely built; the gaps are input, a growable heap, and the toolcha
     caller-supplied size, and `realloc` preserves contents. Validated by `cmain`
     allocating 200 KiB (forcing a `brk`-grow past the initial 64 KiB chunk), writing +
     verifying a pattern, `realloc`-growing it, and freeing — asserted by `console-test`.
-    *Next: B10-3 stdio + printf (the `FILE*` + format-scanner FSMs), B10-4 file streams,
+  - **B10-3a — `printf` format-scanner FSM + conversion engine — done.** The **first
+    of frame-libc's two Frame systems**: `PrintfScan` (`libc/frame/printf_scan.frs`), a
+    per-char scanner over the format string — the same shape as the shell `parser.frs`,
+    now compiled a *fourth* time. It emits a directive plan (`Lit` / `Conv{flags,width}`)
+    that the native engine (`printf.rs`) renders: number→string for `d i u x X c s p`,
+    `%%`, and `0`/`-`/width padding. Frame owns the parsing modes; native owns the bytes.
+    Arguments arrive as an explicit `&[Arg]` slice (the Rust-friendly front); the
+    C-variadic `printf(fmt, ...)` ABI shim is deferred to B11 (with tcc). frame-libc now
+    registers a `#[global_allocator]` over its own `malloc` so the FSM's generated code
+    (Vec/Rc/BTreeMap) and the engine can allocate. This also pulled **host indirect-block
+    staging** forward (the printf-laden cmain is 33 blocks > the 14 KiB direct limit):
+    `mkfs` now writes single/double indirect, mirroring the kernel — so the host stages
+    files up to ~8 MiB (tcc-scale). Validated by `console-test` (`/bin/cmain` prints
+    `d=-42 u=42 x=ff X=FF c=Q s=world p=0xdead pad=[    7][7    ][00007] pct=%`).
+    *Next: B10-3b the `FILE*` lifecycle FSM + buffered streams, B10-4 file streams,
     B10-5 the Rust `std` port.*
 - **B11 — on-device C toolchain (tcc).** Port **tcc** to build against `frame-libc`
   and emit Frame-OS ELF: `cc hello.c -o hello` from the shell. tcc is the right choice

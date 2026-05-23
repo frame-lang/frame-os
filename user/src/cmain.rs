@@ -11,7 +11,7 @@
 #![no_main]
 
 use core::panic::PanicInfo;
-use frame_os_libc::{exit, free, malloc, realloc, strlen, write};
+use frame_os_libc::{exit, free, malloc, print_fmt, realloc, strlen, write, Arg};
 
 // `main`, C-style: `int main(int argc, char **argv, char **envp)`. frame-libc's
 // crt0 calls this, then `exit`s with the returned code.
@@ -32,6 +32,24 @@ extern "C" fn main(argc: i32, argv: *const *const u8, _envp: *const *const u8) -
         write(1, b"\n");
         i += 1;
     }
+
+    // B10-3a: printf via the format-scanner FSM + native conversions. Covers
+    // every supported conversion plus the width/left/zero padding flags.
+    print_fmt(
+        "cmain: d=%d u=%u x=%x X=%X c=%c s=%s p=%p pad=[%5d][%-5d][%05d] pct=%%\n",
+        &[
+            Arg::Int(-42),
+            Arg::UInt(42),
+            Arg::UInt(255),
+            Arg::UInt(255),
+            Arg::Char(b'Q'),
+            Arg::Str(b"world\0".as_ptr()),
+            Arg::Ptr(0xdead),
+            Arg::Int(7),
+            Arg::Int(7),
+            Arg::Int(7),
+        ],
+    );
 
     // B10-2: exercise the heap. 200 KiB forces the libc to grow the program
     // break past its initial 64 KiB chunk; realloc then grows the block further,

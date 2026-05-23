@@ -1,0 +1,126 @@
+// libc/frame/printf_scan.frs
+//
+// PrintfScan — the printf format-string scanner (B10-3a).
+//
+// A per-character scanner over a C `printf` format string, the second of
+// frame-libc's two Frame systems (the FILE* lifecycle is the other). It is the
+// *same shape* as the shell's `parser.frs`: feed the format string one char at
+// a time via `consume(c)`; the current state decides what each char means;
+// `directives()` returns the parsed plan. The native engine (`printf.rs`) then
+// walks that plan, copying literals and formatting one argument per conversion.
+//
+// Supported conversions: d i u x X c s p, plus `%%`, an optional `0`/`-` flag
+// and a decimal field width (e.g. `%05d`, `%-8s`, `%x`). Precision and length
+// modifiers are not handled yet — a C hello-world doesn't need them, and they
+// drop in as more states/fields when something does.
+//
+// State graph (consume events; finalize() ends the scan):
+//
+//   $Literal ──'%'──► $Percent ──'0'/'-'──► $Width ──digit──► (stay)
+//      │ other          │ digit(1-9) ──────────►│        │ conv ──► emit, $Literal
+//      │ (emit Lit)     │ conv ──► emit, $Literal         │ other ──► emit Lit, $Literal
+//      ▼                │ '%' ──► emit Lit('%'), $Literal
+//   (stay)              │ other ──► emit Lit('%')+Lit(c), $Literal
+//
+// Why a state machine: the meaning of a char depends on the mode — '0' is a
+// flag right after '%', a width digit after a width has started, and a literal
+// in $Literal. That mode-dependent dispatch is the textbook FSM, and modeling
+// it in Frame keeps the scanner's modes explicit + the diagram readable, the
+// same argument `parser.frs` makes. `PfDir` and `is_conv` are defined in the
+// including module (src/frame_systems.rs).
+
+@@[target("rust")]
+
+@@system PrintfScan {
+    interface:
+        consume(c: char)
+        finalize()
+        directives(): Vec<PfDir> = self.dirs.clone()
+
+    machine:
+        $Literal {
+            consume(c: char) {
+                if c == '%' {
+                    self.f_zero = false;
+                    self.f_left = false;
+                    self.width = 0;
+                    -> $Percent
+                } else {
+                    self.dirs.push(PfDir::Lit(c));
+                }
+            }
+            finalize() {
+                -> $Done
+            }
+        }
+
+        $Percent {
+            consume(c: char) {
+                if c == '%' {
+                    self.dirs.push(PfDir::Lit('%'));
+                    -> $Literal
+                } else if c == '0' {
+                    self.f_zero = true;
+                    -> $Width
+                } else if c == '-' {
+                    self.f_left = true;
+                    -> $Width
+                } else if c.is_ascii_digit() {
+                    self.width = c as u32 - '0' as u32;
+                    -> $Width
+                } else if is_conv(c) {
+                    self.dirs.push(PfDir::Conv {
+                        zero: self.f_zero,
+                        left: self.f_left,
+                        width: self.width,
+                        conv: c,
+                    });
+                    -> $Literal
+                } else {
+                    // Unknown conversion — show it verbatim.
+                    self.dirs.push(PfDir::Lit('%'));
+                    self.dirs.push(PfDir::Lit(c));
+                    -> $Literal
+                }
+            }
+            finalize() {
+                -> $Done
+            }
+        }
+
+        $Width {
+            consume(c: char) {
+                if c.is_ascii_digit() {
+                    self.width = self.width * 10 + (c as u32 - '0' as u32);
+                } else if c == '-' {
+                    self.f_left = true;
+                } else if is_conv(c) {
+                    self.dirs.push(PfDir::Conv {
+                        zero: self.f_zero,
+                        left: self.f_left,
+                        width: self.width,
+                        conv: c,
+                    });
+                    -> $Literal
+                } else {
+                    // Malformed spec — show the stray char and resume literals.
+                    self.dirs.push(PfDir::Lit(c));
+                    -> $Literal
+                }
+            }
+            finalize() {
+                -> $Done
+            }
+        }
+
+        $Done {
+        }
+
+    domain:
+        // The parsed plan: literal chars + conversion specs, in order.
+        dirs: Vec<PfDir> = Vec::new()
+        // The conversion currently being parsed (reset on each '%').
+        f_zero: bool = false
+        f_left: bool = false
+        width: u32 = 0
+}

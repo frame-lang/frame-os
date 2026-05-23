@@ -469,26 +469,55 @@ fn build_fs_image(total_blocks: u32, files: &[(&str, &[u8])]) -> Vec<u8> {
         node.nlink = 1;
         node.size = data.len() as u32;
         let nb = data.len().div_ceil(fs::BLOCK_SIZE);
-        // The host mkfs writes files with direct blocks only (≤ 28 blocks =
-        // 14 KiB) — enough for every staged program today. Staging a larger
-        // binary (e.g. tcc at B11) will need the host to learn indirect blocks,
-        // which the *kernel* already does; fail loudly rather than truncate.
-        assert!(
-            nb <= fs::NDIRECT,
-            "mkfs: {} is {} blocks (> {} direct); host indirect-block staging is a B11 task",
-            path,
-            nb,
-            fs::NDIRECT
-        );
-        for (i, item) in node.direct.iter_mut().enumerate().take(nb) {
+        // Allocate + fill the data blocks, collecting their numbers.
+        let mut blocks: Vec<u32> = Vec::with_capacity(nb);
+        for i in 0..nb {
             let b = next_data;
             next_data += 1;
             set_used(&mut disk, b);
-            *item = b;
             let lo = i * fs::BLOCK_SIZE;
             let hi = ((i + 1) * fs::BLOCK_SIZE).min(data.len());
             let r = blk(b);
             disk[r.start..r.start + (hi - lo)].copy_from_slice(&data[lo..hi]);
+            blocks.push(b);
+        }
+        // Distribute the data blocks across direct + single/double indirect,
+        // mirroring the kernel's `block_for` so logical block i lands at
+        // blocks[i] either way (B9.5 format; host indirect staging). Lets the
+        // host stage files up to ~8 MiB (tcc-scale, B11).
+        let ptrs = fs::PTRS_PER_BLOCK;
+        let le = |disk: &mut [u8], at: usize, v: u32| {
+            disk[at..at + 4].copy_from_slice(&v.to_le_bytes());
+        };
+        for (i, &b) in blocks.iter().take(fs::NDIRECT).enumerate() {
+            node.direct[i] = b;
+        }
+        if nb > fs::NDIRECT {
+            let ind = next_data;
+            next_data += 1;
+            set_used(&mut disk, ind);
+            node.indirect = ind;
+            let base = blk(ind).start;
+            for (k, &b) in blocks.iter().skip(fs::NDIRECT).take(ptrs).enumerate() {
+                le(&mut disk, base + k * 4, b);
+            }
+        }
+        if nb > fs::NDIRECT + ptrs {
+            let dind = next_data;
+            next_data += 1;
+            set_used(&mut disk, dind);
+            node.double_indirect = dind;
+            let dbase = blk(dind).start;
+            for (l1, chunk) in blocks[fs::NDIRECT + ptrs..].chunks(ptrs).enumerate() {
+                let mid = next_data;
+                next_data += 1;
+                set_used(&mut disk, mid);
+                le(&mut disk, dbase + l1 * 4, mid);
+                let mbase = blk(mid).start;
+                for (k, &b) in chunk.iter().enumerate() {
+                    le(&mut disk, mbase + k * 4, b);
+                }
+            }
         }
         let (iblk, ioff) = layout.inode_loc(ino);
         node.write(&mut disk[blk(iblk)], ioff);
@@ -826,9 +855,15 @@ fn run_console_test() -> Result<()> {
         stdin.flush().ok();
         wait_for_output(&buf, "cmain: hello from frame-libc; argc=3", 20)?;
         wait_for_output(&buf, "argv[2]=two", 20)?;
+        // B10-3a: printf via the format-scanner FSM — conversions + padding.
+        wait_for_output(
+            &buf,
+            "cmain: d=-42 u=42 x=ff X=FF c=Q s=world p=0xdead pad=[    7][7    ][00007] pct=%",
+            20,
+        )?;
         // B10-2: the libc heap (malloc/realloc/free over brk).
         wait_for_output(&buf, "cmain: malloc/realloc/free ok", 20)?;
-        eprintln!("console-test: frame-libc crt0+malloc ok; typing `exit`");
+        eprintln!("console-test: frame-libc crt0+printf+malloc ok; typing `exit`");
         stdin.write_all(b"exit\n").context("write exit")?;
         stdin.flush().ok();
         Ok(())

@@ -10,10 +10,40 @@
 
 #![no_std]
 
+extern crate alloc;
+
+use core::alloc::{GlobalAlloc, Layout};
 use core::arch::{asm, global_asm};
 
+mod frame_systems;
 mod malloc;
+mod printf;
 pub use malloc::{calloc, free, malloc, realloc};
+pub use printf::{print_fmt, vformat, Arg};
+
+// The Frame-generated code (the printf scanner) and the printf engine use Rust
+// `alloc` (Vec/String/Rc/BTreeMap), so frame-libc registers its own global
+// allocator — backed by the very `malloc`/`free` above (over `brk`). A program
+// that links frame-libc thus gets a working heap for both C `malloc` and Rust
+// `alloc`. `malloc` returns 16-aligned blocks, which covers every alignment the
+// generated/engine code requests; a larger request would fail loudly (null).
+struct LibcAlloc;
+
+unsafe impl GlobalAlloc for LibcAlloc {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        if layout.align() <= 16 {
+            malloc(layout.size())
+        } else {
+            core::ptr::null_mut()
+        }
+    }
+    unsafe fn dealloc(&self, ptr: *mut u8, _layout: Layout) {
+        free(ptr);
+    }
+}
+
+#[global_allocator]
+static GLOBAL: LibcAlloc = LibcAlloc;
 
 // crt0 — the program entry. At process start `rsp` points at the System V
 // x86-64 initial stack the kernel built (argc, argv[], NULL, envp[], NULL,
