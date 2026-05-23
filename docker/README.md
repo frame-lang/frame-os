@@ -7,8 +7,9 @@ provides the Linux toolchain + QEMU. This gives:
 - **dev/CI parity** — CI is Linux, and now so is the local build/test environment;
 - **a working TAP path** — Linux TAP (`/dev/net/tun`) for the inbound-L2 networking
   tests, which macOS can't provide without a kext or root `vmnet`;
-- **the typed-context framec** — built from source in the container (it isn't on
-  crates.io yet), so the kernel's struct enter params compile.
+- **framec** — pinned to the **4.2.1 crates.io release** and baked into the image, so
+  frame-os builds are reproducible and never recompile the transpiler from a local
+  source tree.
 
 ## One-time
 
@@ -31,21 +32,19 @@ docker/run.sh "FRAMEOS_SMOKE_FILTER=tcp_ cargo xtask qemu-test"   # one group
 docker/run.sh shell                                               # interactive
 ```
 
-Each invocation first (re)builds framec from the bind-mounted source
-(`$FRAMEC_SRC`, default `~/projects/framec`) into a cached volume and puts it on
-PATH — incremental, so it's fast after the first run.
+`framec` is the pinned binary baked into the image (no source mount, no
+build-from-source step) — `docker/run.sh` just runs the command.
 
 ## Mounts / volumes
 
 | Mount | Purpose |
 |---|---|
 | `~/projects/frame-os` → `/work` | the repo (source edited on the Mac) |
-| `~/projects/framec` → `/framec` (ro) | framec source (built to the binary) |
 | `frameos-target` (volume) → `/target` | `CARGO_TARGET_DIR` (kept off the bind mount) |
-| `frameos-framec-target` (volume) | framec's build cache |
 | `frameos-cargo-registry` (volume) | the cargo registry cache |
 
-Override the framec location with `FRAMEC_SRC=/path docker/run.sh …`.
+To use a different framec, rebuild the image with a new pin in the Dockerfile
+(`cargo install framec --version <x>`).
 
 ## TAP / inbound networking
 

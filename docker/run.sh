@@ -14,14 +14,13 @@
 set -eo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-FRAMEC_SRC="${FRAMEC_SRC:-$HOME/projects/framec}"
 IMAGE="${FRAMEOS_IMAGE:-frameos-dev}"
 
+# framec is baked into the image (pinned 4.2.1) — no framec source mount, no
+# build-from-source step. frame-os is self-contained.
 mounts=(
     -v "$ROOT:/work"
-    -v "$FRAMEC_SRC:/framec:ro"
     -v frameos-target:/target
-    -v frameos-framec-target:/framec-target
     -v frameos-cargo-registry:/usr/local/cargo/registry
     -e CARGO_TARGET_DIR=/target
     -w /work
@@ -34,10 +33,7 @@ if [ "${TAP:-0}" = "1" ]; then
 fi
 
 if [ "${1:-}" = "shell" ]; then
-    exec docker run --rm -it "${mounts[@]}" "${caps[@]}" "$IMAGE" \
-        bash -lc 'ensure-framec >/dev/null 2>&1 || ensure-framec; exec bash'
+    exec docker run --rm -it "${mounts[@]}" "${caps[@]}" "$IMAGE" bash -l
 fi
 
-# Build framec (cached) then run the requested command.
-exec docker run --rm "${mounts[@]}" "${caps[@]}" "$IMAGE" \
-    bash -lc "ensure-framec >/dev/null && $*"
+exec docker run --rm "${mounts[@]}" "${caps[@]}" "$IMAGE" bash -lc "$*"
