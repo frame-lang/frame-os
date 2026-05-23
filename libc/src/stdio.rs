@@ -17,7 +17,7 @@ use alloc::vec::Vec;
 
 use crate::frame_systems::OpenFile;
 use crate::printf::Arg;
-use crate::{strlen, sys_close, sys_open, sys_read, vformat, write};
+use crate::{strlen, sys_close, sys_open, sys_read, sys_read_line, vformat, write};
 
 /// A buffered stream. The C ABI passes `*mut FILE`.
 pub struct FileStream {
@@ -25,7 +25,9 @@ pub struct FileStream {
     of: OpenFile, // mode gate (reused kernel FSM)
     eof: bool,
     err: bool,
-    obuf: Vec<u8>, // pending output
+    obuf: Vec<u8>,  // pending output
+    ibuf: Vec<u8>,  // input buffer (drained by fread/fgetc/fgets)
+    ipos: usize,    // read cursor within ibuf
 }
 
 /// C's opaque `FILE`.
@@ -39,6 +41,36 @@ impl FileStream {
             write(self.fd, &self.obuf);
             self.obuf.clear();
         }
+    }
+
+    /// Refill the input buffer. fd 0 (console stdin) blocks for a whole line via
+    /// `read_line`; other fds read a chunk via the file `read` syscall. Returns
+    /// false (and sets eof) when there is no more input.
+    fn refill(&mut self) -> bool {
+        self.ibuf.clear();
+        self.ipos = 0;
+        let mut tmp = [0u8; 512];
+        let n = if self.fd == 0 {
+            sys_read_line(&mut tmp)
+        } else {
+            sys_read(self.fd, &mut tmp)
+        };
+        if n == 0 {
+            self.eof = true;
+            return false;
+        }
+        self.ibuf.extend_from_slice(&tmp[..n]);
+        true
+    }
+
+    /// Next input byte, or None at EOF.
+    fn next_byte(&mut self) -> Option<u8> {
+        if self.ipos >= self.ibuf.len() && !self.refill() {
+            return None;
+        }
+        let b = self.ibuf[self.ipos];
+        self.ipos += 1;
+        Some(b)
     }
 }
 
@@ -67,6 +99,8 @@ pub unsafe extern "C" fn fopen(path: *const u8, mode: *const u8) -> *mut FILE {
         eof: false,
         err: false,
         obuf: Vec::new(),
+        ibuf: Vec::new(),
+        ipos: 0,
     });
     alloc::boxed::Box::into_raw(f)
 }
@@ -107,11 +141,72 @@ pub unsafe extern "C" fn fread(ptr: *mut u8, size: usize, nmemb: usize, f: *mut 
     }
     let total = size.saturating_mul(nmemb);
     let dst = core::slice::from_raw_parts_mut(ptr, total);
-    let n = sys_read(s.fd, dst);
-    if n == 0 {
-        s.eof = true;
+    let mut got = 0;
+    while got < total {
+        if s.ipos >= s.ibuf.len() && !s.refill() {
+            break;
+        }
+        let take = (total - got).min(s.ibuf.len() - s.ipos);
+        dst[got..got + take].copy_from_slice(&s.ibuf[s.ipos..s.ipos + take]);
+        s.ipos += take;
+        got += take;
     }
-    n / size
+    got / size
+}
+
+/// `fgetc(f)` — next byte as an `int`, or EOF (-1). 0 if not open for reading.
+#[no_mangle]
+pub unsafe extern "C" fn fgetc(f: *mut FILE) -> i32 {
+    if f.is_null() {
+        return -1;
+    }
+    let s = &mut *f;
+    s.of.read();
+    if !s.of.is_reading() {
+        return -1;
+    }
+    match s.next_byte() {
+        Some(b) => b as i32,
+        None => -1,
+    }
+}
+
+/// `fgets(s, n, f)` — read at most `n-1` bytes, stopping after a newline (kept),
+/// and NUL-terminate. Returns `s`, or NULL if EOF with nothing read.
+#[no_mangle]
+pub unsafe extern "C" fn fgets(out: *mut u8, n: i32, f: *mut FILE) -> *mut u8 {
+    if out.is_null() || n <= 0 || f.is_null() {
+        return core::ptr::null_mut();
+    }
+    let s = &mut *f;
+    s.of.read();
+    if !s.of.is_reading() {
+        return core::ptr::null_mut();
+    }
+    let cap = (n - 1) as usize;
+    let mut i = 0;
+    while i < cap {
+        match s.next_byte() {
+            Some(b) => {
+                *out.add(i) = b;
+                i += 1;
+                if b == b'\n' {
+                    break;
+                }
+            }
+            None => break, // EOF
+        }
+    }
+    if i == 0 {
+        return core::ptr::null_mut(); // EOF, nothing read
+    }
+    *out.add(i) = 0;
+    out
+}
+
+/// `getchar()` — next byte from stdin, or EOF.
+pub fn getchar() -> i32 {
+    unsafe { fgetc(stdin()) }
 }
 
 /// `fputs(str, f)` — write a NUL-terminated string. Returns 0 on success, EOF
@@ -193,33 +288,47 @@ pub unsafe extern "C" fn clearerr(f: *mut FILE) {
     }
 }
 
-// Standard streams (console-backed: fd 1/2). Lazily created; single-threaded.
+// Standard streams (console-backed). Lazily created; single-threaded. stdin
+// (fd 0) is a read stream that refills via `read_line`; stdout/stderr (fd 1/2)
+// are write streams flushed per write.
+static mut STDIN: Option<FileStream> = None;
 static mut STDOUT: Option<FileStream> = None;
 static mut STDERR: Option<FileStream> = None;
 
-unsafe fn console_stream(slot: *mut Option<FileStream>, fd: i32) -> *mut FILE {
+unsafe fn console_stream(slot: *mut Option<FileStream>, fd: i32, write_mode: bool) -> *mut FILE {
     if (*slot).is_none() {
         let mut of = OpenFile::__create();
-        of.open_write();
+        if write_mode {
+            of.open_write();
+        } else {
+            of.open_read();
+        }
         *slot = Some(FileStream {
             fd,
             of,
             eof: false,
             err: false,
             obuf: Vec::new(),
+            ibuf: Vec::new(),
+            ipos: 0,
         });
     }
     (*slot).as_mut().unwrap() as *mut FILE
 }
 
+/// The standard input stream (the console; reads block for a line).
+pub fn stdin() -> *mut FILE {
+    unsafe { console_stream(&raw mut STDIN, 0, false) }
+}
+
 /// The standard output stream (the console).
 pub fn stdout() -> *mut FILE {
-    unsafe { console_stream(&raw mut STDOUT, 1) }
+    unsafe { console_stream(&raw mut STDOUT, 1, true) }
 }
 
 /// The standard error stream (the console).
 pub fn stderr() -> *mut FILE {
-    unsafe { console_stream(&raw mut STDERR, 2) }
+    unsafe { console_stream(&raw mut STDERR, 2, true) }
 }
 
 /// `fprintf` into a stream (B10-3b). The Rust-friendly front end driving the

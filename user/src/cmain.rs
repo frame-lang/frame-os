@@ -12,7 +12,7 @@
 
 use core::panic::PanicInfo;
 use frame_os_libc::{
-    exit, fclose, feof, fopen, fprintf_args, fputs, fread, free, malloc, print_fmt, realloc,
+    exit, fclose, feof, fgets, fopen, fprintf_args, fputs, fread, free, malloc, print_fmt, realloc,
     stdout, strlen, write, Arg,
 };
 
@@ -87,6 +87,28 @@ extern "C" fn main(argc: i32, argv: *const *const u8, _envp: *const *const u8) -
         write(1, b"cmain: FILE* write/read/feof ok\n");
     } else {
         write(1, b"cmain: FILE* MISMATCH\n");
+    }
+
+    // B10-4: line input. Reopen /gen.txt and read it back a line at a time with
+    // fgets (which keeps the trailing newline), then NULL at EOF.
+    let h = unsafe { fopen(b"/gen.txt\0".as_ptr(), b"r\0".as_ptr()) };
+    if h.is_null() {
+        write(2, b"cmain: fopen(r) for fgets FAILED\n");
+        return 1;
+    }
+    let mut line = [0u8; 64];
+    let l1 = unsafe { fgets(line.as_mut_ptr(), line.len() as i32, h) };
+    let line1_ok = !l1.is_null() && unsafe { core::slice::from_raw_parts(l1, strlen(l1)) } == b"result=42\n";
+    let l2 = unsafe { fgets(line.as_mut_ptr(), line.len() as i32, h) };
+    let line2_ok =
+        !l2.is_null() && unsafe { core::slice::from_raw_parts(l2, strlen(l2)) } == b"second line\n";
+    let l3 = unsafe { fgets(line.as_mut_ptr(), line.len() as i32, h) };
+    let eof_null = l3.is_null();
+    unsafe { fclose(h) };
+    if line1_ok && line2_ok && eof_null {
+        write(1, b"cmain: fgets line-by-line ok\n");
+    } else {
+        write(1, b"cmain: fgets MISMATCH\n");
     }
 
     // B10-2: exercise the heap. 200 KiB forces the libc to grow the program

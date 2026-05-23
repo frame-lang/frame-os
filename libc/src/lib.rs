@@ -22,8 +22,8 @@ mod stdio;
 pub use malloc::{calloc, free, malloc, realloc};
 pub use printf::{print_fmt, vformat, Arg};
 pub use stdio::{
-    clearerr, fclose, feof, ferror, fflush, fopen, fprintf_args, fputc, fputs, fread, fwrite,
-    stderr, stdout, FileStream, FILE,
+    clearerr, fclose, feof, ferror, fflush, fgetc, fgets, fopen, fprintf_args, fputc, fputs, fread,
+    fwrite, getchar, stderr, stdin, stdout, FileStream, FILE,
 };
 
 // The Frame-generated code (the printf scanner) and the printf engine use Rust
@@ -152,6 +152,12 @@ pub(crate) fn sys_read(fd: i32, buf: &mut [u8]) -> usize {
 /// close(fd) (syscall #7).
 pub(crate) fn sys_close(fd: i32) {
     unsafe { syscall3(7, fd as u64, 0, 0) };
+}
+
+/// read_line(buf) → bytes read for the console (blocks until a line; B8 syscall
+/// #9). Backs `stdin` refills, where the console has no plain readable fd.
+pub(crate) fn sys_read_line(buf: &mut [u8]) -> usize {
+    unsafe { syscall3(9, buf.as_mut_ptr() as u64, buf.len() as u64, 0) as usize }
 }
 
 /// Terminate the process with status `code` (POSIX `_exit`). Never returns.

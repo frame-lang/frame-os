@@ -864,6 +864,8 @@ fn run_console_test() -> Result<()> {
         // B10-3b: buffered FILE* streams (fopen/fprintf/fwrite/fread/feof).
         wait_for_output(&buf, "cmain: fprintf to stdout: 2+3=5", 20)?;
         wait_for_output(&buf, "cmain: FILE* write/read/feof ok", 20)?;
+        // B10-4: line input via fgets.
+        wait_for_output(&buf, "cmain: fgets line-by-line ok", 20)?;
         // B10-2: the libc heap (malloc/realloc/free over brk).
         wait_for_output(&buf, "cmain: malloc/realloc/free ok", 20)?;
         eprintln!("console-test: frame-libc crt0+printf+stdio+malloc ok; typing `exit`");

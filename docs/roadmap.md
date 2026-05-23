@@ -883,8 +883,18 @@ from it" are largely built; the gaps are input, a growable heap, and the toolcha
     `fprintf_args` driving the printf engine into a stream (the variadic `fprintf(f,
     fmt, ...)` waits for B11). Validated by `console-test`: `/bin/cmain` fprintf's to the
     console, writes `/gen.txt` via fprintf+fputs, reopens it, reads it back, and confirms
-    `feof`. *Next: B10-4 stdin/`fgets` (the read-side polish), B10-5 the Rust `std`
-    port.*
+    `feof`. 
+  - **B10-4 — line input: `fgetc`/`fgets` + input buffering — done.** The stream's
+    read side gained an input buffer (`ibuf`/`ipos`): `fread`/`fgetc`/`fgets` all drain
+    it, refilling via the file `read` syscall or — for `stdin` (fd 0, the console, which
+    has no plain readable fd) — the blocking `read_line` syscall (#9). `fgetc`, `fgets`
+    (newline-keeping, NUL-terminating, NULL at EOF), `getchar`, and `stdin` are added;
+    `fread` reworked through the buffer. Validated by `console-test` (`/bin/cmain`
+    reopens `/gen.txt` and reads it back a line at a time with `fgets`, then NULL at EOF).
+    The C-side libc core (crt0, malloc, printf, full `FILE*` r/w) is now functionally
+    complete for a C hello-world. *Next: B10-5 the Rust `std` platform port — the heavy
+    half, so framec itself can be built for the OS; the C-variadic `printf`/`fprintf`
+    shim lands at B11 with tcc.*
 - **B11 — on-device C toolchain (tcc).** Port **tcc** to build against `frame-libc`
   and emit Frame-OS ELF: `cc hello.c -o hello` from the shell. tcc is the right choice
   — small, single-pass, self-contained, designed for exactly this. ✅ **"compile
