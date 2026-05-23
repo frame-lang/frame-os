@@ -816,8 +816,18 @@ from it" are largely built; the gaps are input, a growable heap, and the toolcha
     `rsp` at `argc`. The shell (`ish`) packs the parsed tokens into that buffer, so typed
     arguments reach the program; `argtest` reads them via a tiny asm `_start` shim that
     hands the entry `rsp` to Rust. Validated by `console-test` (`/bin/argtest alpha beta`
-    → the program echoes `argv[1]=alpha`, `argv[2]=beta`). *Remaining B9: `envp`, file
-    syscalls (`lseek`, `stat`, write-to-fd, `getcwd`, `dup`).*
+    → the program echoes `argv[1]=alpha`, `argv[2]=beta`).
+  - **B9-3 — the file write path — done.** The fd API gained the syscalls a
+    libc/toolchain needs to write output and stat inputs: `open` (#5) takes a flags arg
+    (bit0: read/write, back-compatible), and new calls `write` (#12, to a file at the
+    fd's offset), `lseek` (#13, SET/CUR/END), `fstat` (#14, size), `stat` (#15, size by
+    path), and `dup` (#16, shared-offset descriptor). Backed by a new `fs::write_at`
+    (random-access write that allocates blocks + grows size) over the existing
+    `OpenFile` access-mode FSM (a read-only fd's writes are dropped, vice versa).
+    Validated by `fwtest` (creates `/tmp.txt`, writes, overwrites the middle via a seek,
+    fstat's, reopens and verifies — incl. a dup'd fd sharing the offset) + the
+    `file_write_roundtrip_b9` smoke test. *Deferred: `envp` and `getcwd` (need a real
+    cwd notion) — both land naturally with `frame-libc` (B10), which will own them.*
 - **B10 — userspace runtime: `frame-libc` + a `std` platform port.** A C/POSIX-ish
   library (malloc/free over `brk`, file I/O, string, stdio, `exit`) for tcc, **and** a
   Rust `std` backend (`std::sys::frameos`) on top, so framec (Rust + std) can be built

@@ -49,6 +49,12 @@ path = "src/brktest.rs"
 name = "argtest"
 path = "src/argtest.rs"
 
+# File write path (B9-3): creates /tmp.txt and exercises write, lseek, fstat,
+# dup, and read-back. Baked into the kernel; run by usermode::run.
+[[bin]]
+name = "fwtest"
+path = "src/fwtest.rs"
+
 # Scripted shell: cat /motd + exec /bin/hello from disk (B4 Step 4a).
 [[bin]]
 name = "shell"

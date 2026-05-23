@@ -30,6 +30,13 @@
 //  10 = brk(rdi = new_end)                    → grow/shrink heap; new break (B9)
 //  11 = exec_argv(rdi = buf, rsi = len,       → exec w/ argv; argv[0]=path (B9)
 //                 rdx = argc)                    buf = argc NUL-terminated args
+//   5 = open(rdi = path, rsi = len,           → fd; flags bit0: 0=read 1=write
+//            rdx = flags)                         (B9-3 extended #5 with flags)
+//  12 = write(rdi = fd, rsi = buf, rdx = len) → bytes written to a file (B9-3)
+//  13 = lseek(rdi = fd, rsi = off, rdx = wh)  → new offset; wh 0/1/2 (B9-3)
+//  14 = fstat(rdi = fd)                       → file size (B9-3)
+//  15 = stat(rdi = path, rsi = len)           → file size, or MAX (B9-3)
+//  16 = dup(rdi = fd)                         → new fd (B9-3)
 
 use core::arch::{asm, global_asm};
 
@@ -99,6 +106,8 @@ static USER_SPAWNER_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/user_
 static USER_WAITER_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/user_waiter.elf"));
 // `brktest` (B9-1) grows its heap by 1 MiB via `brk` and verifies the new memory.
 static USER_BRKTEST_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/user_brktest.elf"));
+// `fwtest` (B9-3) exercises the file write path: write/lseek/fstat/dup/read-back.
+static USER_FWTEST_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/user_fwtest.elf"));
 // `shell` (B4 Step 4a) cats `/motd` then execs `/bin/hello` from disk by path.
 static USER_SHELL_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/user_shell.elf"));
 // `frameshell` (B4 Step 4b) tokenizes command lines with the *same* parser.frs
@@ -307,7 +316,7 @@ fn proc_table() -> &'static mut ProcessTable {
 /// 0=write_char 1=exit 2=fork 3=exec(prog_id) 4=wait 5=open 6=read 7=close
 /// 8=exec(path). (B4 Step 4 added the file-I/O + exec-from-disk syscalls.)
 pub fn is_known_syscall(num: u64) -> bool {
-    num <= 11
+    num <= 16
 }
 
 /// Block until the console has a complete line, copy it into the user buffer
@@ -429,13 +438,18 @@ pub fn perform_syscall(num: u64, a0: u64, _a1: u64) -> u64 {
             0
         }
         5 => {
-            // open(path_ptr=a0, path_len=a1) → fd, or u64::MAX on failure.
+            // open(path_ptr=a0, path_len=a1, flags=rdx) → fd, or u64::MAX on
+            // failure. flags bit0: 0 = read (default; back-compat), 1 = write
+            // (create/truncate). B9-3 added the write mode.
             let mut path = [0u8; 256];
             let n = unsafe { copy_from_user(a0, _a1 as usize, &mut path) };
-            match crate::vfs::open_read(&path[..n]) {
-                Some(fd) => fd as u64,
-                None => u64::MAX,
-            }
+            let write = arg2() & 1 != 0;
+            let r = if write {
+                crate::vfs::open_write(&path[..n])
+            } else {
+                crate::vfs::open_read(&path[..n])
+            };
+            r.map_or(u64::MAX, |fd| fd as u64)
         }
         6 => {
             // read(fd=a0, buf_ptr=a1, len=rdx) → bytes read. The buffer is a
@@ -462,6 +476,30 @@ pub fn perform_syscall(num: u64, a0: u64, _a1: u64) -> u64 {
         }
         10 => do_brk(a0), // brk(new_end) → current/new program break (B9-1)
         11 => do_exec_argv(a0, _a1, arg2()), // exec with argv (B9-2)
+        12 => {
+            // write(fd=a0, buf=a1, len=rdx) → bytes written (B9-3). The buffer is
+            // a user VA mapped in the current address space.
+            let len = arg2() as usize;
+            let buf = unsafe { core::slice::from_raw_parts(_a1 as *const u8, len) };
+            crate::vfs::write(a0 as usize, buf) as u64
+        }
+        13 => {
+            // lseek(fd=a0, offset=a1, whence=rdx) → new offset, or u64::MAX (B9-3).
+            let off = _a1 as i64;
+            let whence = arg2() as u32;
+            crate::vfs::seek(a0 as usize, off, whence).map_or(u64::MAX, |p| p as u64)
+        }
+        14 => crate::vfs::fstat_size(a0 as usize).map_or(u64::MAX, |s| s as u64), // fstat(fd) → size
+        15 => {
+            // stat(path_ptr=a0, path_len=a1) → file size, or u64::MAX (B9-3).
+            let mut path = [0u8; 256];
+            let n = unsafe { copy_from_user(a0, _a1 as usize, &mut path) };
+            match crate::fs::namei(&path[..n]) {
+                Some(ino) if crate::fs::is_file(ino) => crate::fs::size_of(ino) as u64,
+                _ => u64::MAX,
+            }
+        }
+        16 => crate::vfs::dup(a0 as usize).map_or(u64::MAX, |fd| fd as u64), // dup(fd) → newfd
         _ => u64::MAX, // unreachable: validated by is_known_syscall
     }
 }
@@ -835,6 +873,10 @@ pub fn run() {
     // syscall and verifies the new memory — proving the kernel demand-maps real
     // per-process memory far beyond the fixed program-image heap.
     run_one(USER_BRKTEST_ELF, "brktest");
+
+    // B9-3: the file write path. `fwtest` creates /tmp.txt and round-trips
+    // write / lseek / fstat / dup / read through the on-disk filesystem.
+    run_one(USER_FWTEST_ELF, "fwtest");
 
     // B4 Step 4a: a scripted shell that uses the file-I/O syscalls (open/read/
     // close) to `cat /motd`, then `exec`s `/bin/hello` *from disk by path* —

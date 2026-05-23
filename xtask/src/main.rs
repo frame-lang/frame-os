@@ -1333,6 +1333,20 @@ const SMOKE_TESTS: &[SmokeTest] = &[
         timeout_secs: 20,
     },
     SmokeTest {
+        // B9-3: the file write path. `fwtest` opens /tmp.txt for writing
+        // (create+truncate), writes "Hello, Frame OS!", overwrites the middle
+        // via lseek (random-access write_at), fstat's the size, then reopens for
+        // reading and verifies the bytes — including a seek-and-read of the
+        // overwritten region and a dup'd descriptor sharing the offset. The
+        // "all ok" line only prints if write / lseek / fstat / dup / read all
+        // round-trip through the on-disk filesystem. These are the syscalls a
+        // libc/toolchain (B10+) needs to write its output and stat its inputs.
+        name: "file_write_roundtrip_b9",
+        expect_contains: &["fwtest: wrote 16 bytes, fstat=16", "fwtest: all ok"],
+        expect_absent: &["FAIL:", "KERNEL EXCEPTION", "KERNEL PANIC", "triple fault"],
+        timeout_secs: 20,
+    },
+    SmokeTest {
         // B4 Step 1: the virtio-blk driver + the post/drain deferred-event
         // pattern. The kernel inits the device, writes a known pattern to a
         // sector and reads it back — the completion IRQ `post`s, the kernel

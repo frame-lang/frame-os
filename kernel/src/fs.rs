@@ -258,6 +258,55 @@ pub fn write_file(ino: u32, data: &[u8]) -> bool {
     true
 }
 
+/// Write `data` into file `ino` starting at byte `offset` (B9-3), allocating
+/// data blocks as needed and growing the file's size if the write extends past
+/// the current end. Returns the number of bytes written (short if the file would
+/// exceed the direct-block capacity). The random-access write the `lseek`+`write`
+/// path and the toolchains (which seek around their output) need.
+pub fn write_at(ino: u32, offset: usize, data: &[u8]) -> usize {
+    let mut node = read_inode(ino);
+    let mut done = 0;
+    while done < data.len() {
+        let pos = offset + done;
+        let bi = pos / fs::BLOCK_SIZE;
+        if bi >= fs::NDIRECT {
+            break; // beyond the direct blocks (no indirect blocks yet)
+        }
+        if node.direct[bi] == 0 {
+            match alloc_block() {
+                Some(b) => node.direct[bi] = b,
+                None => break,
+            }
+        }
+        let within = pos % fs::BLOCK_SIZE;
+        let mut block = read_block(node.direct[bi]);
+        let n = (data.len() - done).min(fs::BLOCK_SIZE - within);
+        block[within..within + n].copy_from_slice(&data[done..done + n]);
+        write_block(node.direct[bi], &block);
+        done += n;
+    }
+    let new_end = offset + done;
+    if new_end > node.size as usize {
+        node.size = new_end as u32;
+    }
+    write_inode(ino, &node);
+    done
+}
+
+/// The size in bytes of file `ino` (B9-3) — backs `stat`/`fstat`.
+pub fn size_of(ino: u32) -> usize {
+    read_inode(ino).size as usize
+}
+
+/// Truncate file `ino` to zero length (B9-3, the open-for-write case). Leaves
+/// the data blocks linked in the inode so a subsequent `write_at` reuses them;
+/// only the size is reset, so reads see an empty file.
+pub fn truncate(ino: u32) {
+    let mut node = read_inode(ino);
+    node.size = 0;
+    write_inode(ino, &node);
+}
+
 /// Delete `name`: free its blocks + inode and clear its dirent.
 pub fn delete(name: &[u8]) -> bool {
     let Some(ino) = lookup(name) else {
