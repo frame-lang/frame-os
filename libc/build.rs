@@ -13,21 +13,24 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-// (module_name, source_filename in libc/frame). module_name is the generated
-// .rs stem in OUT_DIR; it must match the input stem.
-const FRAME_SYSTEMS: &[(&str, &str)] = &[("printf_scan", "printf_scan.frs")];
-
 fn main() {
     let manifest = PathBuf::from(env("CARGO_MANIFEST_DIR"));
-    let frame_dir = manifest.join("frame");
+    let workspace_root = manifest.parent().expect("libc crate has a parent");
     let out_dir = PathBuf::from(env("OUT_DIR"));
 
     println!("cargo:rerun-if-changed=build.rs");
 
-    for (module, source) in FRAME_SYSTEMS {
-        let input = frame_dir.join(source);
+    // (module stem, source .frs). `printf_scan` is libc-specific; `open_file` is
+    // the *same* FSM the kernel compiles (frame/open_file.frs) — frame-libc reuses
+    // it to gate FILE* read/write modes (one source, two targets, B10-3b).
+    let sources = [
+        ("printf_scan", manifest.join("frame").join("printf_scan.frs")),
+        ("open_file", workspace_root.join("frame").join("open_file.frs")),
+    ];
+
+    for (module, input) in &sources {
         let output = out_dir.join(format!("{module}.rs"));
-        compile_frame_source(&input, &out_dir, &output);
+        compile_frame_source(input, &out_dir, &output);
         println!("cargo:rerun-if-changed={}", input.display());
     }
 }

@@ -861,9 +861,12 @@ fn run_console_test() -> Result<()> {
             "cmain: d=-42 u=42 x=ff X=FF c=Q s=world p=0xdead pad=[    7][7    ][00007] pct=%",
             20,
         )?;
+        // B10-3b: buffered FILE* streams (fopen/fprintf/fwrite/fread/feof).
+        wait_for_output(&buf, "cmain: fprintf to stdout: 2+3=5", 20)?;
+        wait_for_output(&buf, "cmain: FILE* write/read/feof ok", 20)?;
         // B10-2: the libc heap (malloc/realloc/free over brk).
         wait_for_output(&buf, "cmain: malloc/realloc/free ok", 20)?;
-        eprintln!("console-test: frame-libc crt0+printf+malloc ok; typing `exit`");
+        eprintln!("console-test: frame-libc crt0+printf+stdio+malloc ok; typing `exit`");
         stdin.write_all(b"exit\n").context("write exit")?;
         stdin.flush().ok();
         Ok(())

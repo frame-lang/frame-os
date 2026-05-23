@@ -174,10 +174,14 @@ fn build_user_program(workspace_root: &Path, out_dir: &Path) -> Result<()> {
         "../libc/src/lib.rs",
         "../libc/src/malloc.rs",
         "../libc/src/printf.rs",
+        "../libc/src/stdio.rs",
         "../libc/src/frame_systems.rs",
         "../libc/build.rs",
         "../libc/frame/printf_scan.frs",
         "../libc/Cargo.toml",
+        // frame-libc reuses the kernel's OpenFile FSM (frame/open_file.frs) for
+        // FILE* mode gating; rebuild the staged programs if it changes.
+        "../frame/open_file.frs",
     ] {
         println!("cargo:rerun-if-changed={}", user_dir.join(f).display());
     }

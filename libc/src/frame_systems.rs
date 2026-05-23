@@ -33,3 +33,6 @@ pub fn is_conv(c: char) -> bool {
 }
 
 include!(concat!(env!("OUT_DIR"), "/printf_scan.rs"));
+// OpenFile (B10-3b): the *same* FSM the kernel's VFS uses (frame/open_file.frs),
+// reused here to gate a FILE*'s read/write mode — one source, two targets.
+include!(concat!(env!("OUT_DIR"), "/open_file.rs"));

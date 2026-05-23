@@ -872,8 +872,19 @@ from it" are largely built; the gaps are input, a growable heap, and the toolcha
     `mkfs` now writes single/double indirect, mirroring the kernel — so the host stages
     files up to ~8 MiB (tcc-scale). Validated by `console-test` (`/bin/cmain` prints
     `d=-42 u=42 x=ff X=FF c=Q s=world p=0xdead pad=[    7][7    ][00007] pct=%`).
-    *Next: B10-3b the `FILE*` lifecycle FSM + buffered streams, B10-4 file streams,
-    B10-5 the Rust `std` port.*
+  - **B10-3b — buffered `FILE*` streams — done.** The second Frame system, by
+    **reuse**: frame-libc compiles the kernel's own `frame/open_file.frs` to gate a
+    `FILE*`'s read/write mode (the *same* FSM the VFS uses — one source, two targets, a
+    lifecycle FSM this time, not just the parser). The eof/error indicators are native
+    sticky flags (a fixed property + two booleans, not a lifecycle), so `feof`/`ferror`/
+    `clearerr` are native while the mode gate is Frame. Real `extern "C"` stdio:
+    `fopen`/`fwrite`/`fread`/`fputs`/`fputc`/`fflush`/`fclose`/`feof`/`ferror`/`clearerr`
+    (non-variadic, so C-ABI now), plus `stdout`/`stderr` (console-backed) and a
+    `fprintf_args` driving the printf engine into a stream (the variadic `fprintf(f,
+    fmt, ...)` waits for B11). Validated by `console-test`: `/bin/cmain` fprintf's to the
+    console, writes `/gen.txt` via fprintf+fputs, reopens it, reads it back, and confirms
+    `feof`. *Next: B10-4 stdin/`fgets` (the read-side polish), B10-5 the Rust `std`
+    port.*
 - **B11 — on-device C toolchain (tcc).** Port **tcc** to build against `frame-libc`
   and emit Frame-OS ELF: `cc hello.c -o hello` from the shell. tcc is the right choice
   — small, single-pass, self-contained, designed for exactly this. ✅ **"compile

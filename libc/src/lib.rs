@@ -18,8 +18,13 @@ use core::arch::{asm, global_asm};
 mod frame_systems;
 mod malloc;
 mod printf;
+mod stdio;
 pub use malloc::{calloc, free, malloc, realloc};
 pub use printf::{print_fmt, vformat, Arg};
+pub use stdio::{
+    clearerr, fclose, feof, ferror, fflush, fopen, fprintf_args, fputc, fputs, fread, fwrite,
+    stderr, stdout, FileStream, FILE,
+};
 
 // The Frame-generated code (the printf scanner) and the printf engine use Rust
 // `alloc` (Vec/String/Rc/BTreeMap), so frame-libc registers its own global
@@ -120,6 +125,33 @@ pub fn write(fd: i32, buf: &[u8]) -> usize {
 /// `brk` in a process, so it owns the heap region above `USER_HEAP_BASE`.
 pub(crate) fn sys_brk(new_end: u64) -> u64 {
     unsafe { syscall3(10, new_end, 0, 0) }
+}
+
+/// open(path, flags) → fd, or None on failure (B9-3 syscall #5; flag bit0 = write).
+pub(crate) fn sys_open(path: &[u8], write: bool) -> Option<i32> {
+    let r = unsafe {
+        syscall3(
+            5,
+            path.as_ptr() as u64,
+            path.len() as u64,
+            if write { 1 } else { 0 },
+        )
+    };
+    if r == u64::MAX {
+        None
+    } else {
+        Some(r as i32)
+    }
+}
+
+/// read(fd, buf) → bytes read, 0 at EOF (syscall #6).
+pub(crate) fn sys_read(fd: i32, buf: &mut [u8]) -> usize {
+    unsafe { syscall3(6, fd as u64, buf.as_mut_ptr() as u64, buf.len() as u64) as usize }
+}
+
+/// close(fd) (syscall #7).
+pub(crate) fn sys_close(fd: i32) {
+    unsafe { syscall3(7, fd as u64, 0, 0) };
 }
 
 /// Terminate the process with status `code` (POSIX `_exit`). Never returns.

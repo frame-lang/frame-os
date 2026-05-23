@@ -11,7 +11,10 @@
 #![no_main]
 
 use core::panic::PanicInfo;
-use frame_os_libc::{exit, free, malloc, print_fmt, realloc, strlen, write, Arg};
+use frame_os_libc::{
+    exit, fclose, feof, fopen, fprintf_args, fputs, fread, free, malloc, print_fmt, realloc,
+    stdout, strlen, write, Arg,
+};
 
 // `main`, C-style: `int main(int argc, char **argv, char **envp)`. frame-libc's
 // crt0 calls this, then `exit`s with the returned code.
@@ -50,6 +53,41 @@ extern "C" fn main(argc: i32, argv: *const *const u8, _envp: *const *const u8) -
             Arg::Int(7),
         ],
     );
+
+    // B10-3b: buffered FILE* streams. fprintf to the console, then write a file
+    // with fprintf + fputs, close it, reopen it, read it back, and confirm feof.
+    fprintf_args(
+        stdout(),
+        "cmain: fprintf to stdout: %d+%d=%d\n",
+        &[Arg::Int(2), Arg::Int(3), Arg::Int(5)],
+    );
+    let f = unsafe { fopen(b"/gen.txt\0".as_ptr(), b"w\0".as_ptr()) };
+    if f.is_null() {
+        write(2, b"cmain: fopen(w) FAILED\n");
+        return 1;
+    }
+    fprintf_args(f, "result=%d\n", &[Arg::Int(42)]);
+    unsafe { fputs(b"second line\n\0".as_ptr(), f) };
+    unsafe { fclose(f) };
+
+    let g = unsafe { fopen(b"/gen.txt\0".as_ptr(), b"r\0".as_ptr()) };
+    if g.is_null() {
+        write(2, b"cmain: fopen(r) FAILED\n");
+        return 1;
+    }
+    let mut rb = [0u8; 64];
+    let n = unsafe { fread(rb.as_mut_ptr(), 1, rb.len(), g) };
+    let expected = b"result=42\nsecond line\n";
+    let content_ok = n == expected.len() && &rb[..n] == expected;
+    let mut tail = [0u8; 8];
+    let n2 = unsafe { fread(tail.as_mut_ptr(), 1, tail.len(), g) };
+    let eof_ok = n2 == 0 && unsafe { feof(g) } != 0;
+    unsafe { fclose(g) };
+    if content_ok && eof_ok {
+        write(1, b"cmain: FILE* write/read/feof ok\n");
+    } else {
+        write(1, b"cmain: FILE* MISMATCH\n");
+    }
 
     // B10-2: exercise the heap. 200 KiB forces the libc to grow the program
     // break past its initial 64 KiB chunk; realloc then grows the block further,
