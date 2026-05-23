@@ -828,6 +828,18 @@ from it" are largely built; the gaps are input, a growable heap, and the toolcha
     fstat's, reopens and verifies — incl. a dup'd fd sharing the offset) + the
     `file_write_roundtrip_b9` smoke test. *Deferred: `envp` and `getcwd` (need a real
     cwd notion) — both land naturally with `frame-libc` (B10), which will own them.*
+- **B9.5 — toolchain-ready filesystem — done.** Surfaced by B10: the first
+  libc-linked program (8.5 KB) blew past the old **7 KB** file cap (14 direct blocks ×
+  512). The FS got a scalable format: `INODE_SIZE` 64→128 with **28 direct + single +
+  double indirect** block pointers (max file **~8 MiB**), and a **multi-block bitmap**
+  derived from disk size (`Layout::for_total`, addressing up to ~2 TB). The kernel maps
+  any file block through `block_for` (direct → single → double indirect, lazily
+  allocating index blocks); the host `mkfs` writes the new layout (direct blocks only —
+  staging a binary >14 KB, e.g. tcc, will teach it indirect at B11). The classic Unix
+  insight applies: **geometric capacity from linear code** — each indirect tier is one
+  more bounded branch. The default test disk is bumped to 4 MiB (exercises the
+  multi-block bitmap); the format scales far beyond. Validated by a 128 KiB
+  double-indirect round-trip folded into `fs_file_roundtrip_b4`.
 - **B10 — userspace runtime: `frame-libc` + a `std` platform port.** A C/POSIX-ish
   library (malloc/free over `brk`, file I/O, string, stdio, `exit`) for tcc, **and** a
   Rust `std` backend (`std::sys::frameos`) on top, so framec (Rust + std) can be built

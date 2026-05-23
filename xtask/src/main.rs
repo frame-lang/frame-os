@@ -331,7 +331,12 @@ struct QemuArtifacts {
     qemu_dir: PathBuf,
 }
 
-const BLK_DISK_BLOCKS: u32 = 2048; // 1 MiB / 512
+// 4 MiB disk (B9.5). Big enough to exercise the multi-block bitmap (4 MiB /
+// 512 = 8192 blocks → 2 bitmap blocks) and to hold the big-file test that
+// spans double-indirect blocks, while staying small enough that copying the
+// template per smoke test stays fast. The on-disk *format* scales to ~2 TB;
+// this is just the default test image size.
+const BLK_DISK_BLOCKS: u32 = 8192; // 4 MiB / 512
 
 /// USB mass-storage backing image: 64 KiB (128 × 512-byte blocks), block 0
 /// stamped with an 8-byte magic ("FRAMEOS!") the SCSI READ(10) test checks.
@@ -400,25 +405,28 @@ const FS_FILES: &[(&str, &[u8])] = &[
 /// Supports one directory level: a path `/bin/info` creates a `/bin` directory.
 fn build_fs_image(total_blocks: u32, files: &[(&str, &[u8])]) -> Vec<u8> {
     use frame_os_shared::fs;
+    let layout = fs::Layout::for_total(total_blocks);
     let mut disk = vec![0u8; total_blocks as usize * fs::BLOCK_SIZE];
 
     let blk = |b: u32| {
         let s = b as usize * fs::BLOCK_SIZE;
         s..s + fs::BLOCK_SIZE
     };
-    fn set_used(disk: &mut [u8], b: u32) {
-        let byte = fs::BITMAP_BLOCK as usize * fs::BLOCK_SIZE + (b as usize / 8);
-        disk[byte] |= 1 << (b % 8);
-    }
+    // Mark block `b` used in the (possibly multi-block) bitmap.
+    let set_used = |disk: &mut [u8], b: u32| {
+        let (bm_block, byte, bit) = layout.bitmap_loc(b);
+        disk[bm_block as usize * fs::BLOCK_SIZE + byte] |= 1 << bit;
+    };
 
-    for b in 0..fs::DATA_START {
+    // Reserve the metadata region (superblock + bitmap + inode table).
+    for b in 0..layout.data_start {
         set_used(&mut disk, b);
     }
 
     // Directory registry: (name "" = root, inode, data block, running dirent
     // offset). Root is inode 1.
     let mut next_ino = fs::ROOT_INODE; // 1
-    let mut next_data = fs::DATA_START;
+    let mut next_data = layout.data_start;
     let alloc_dir = |next_ino: &mut u32, next_data: &mut u32, disk: &mut [u8]| -> (u32, u32) {
         let ino = *next_ino;
         *next_ino += 1;
@@ -459,6 +467,17 @@ fn build_fs_image(total_blocks: u32, files: &[(&str, &[u8])]) -> Vec<u8> {
         node.nlink = 1;
         node.size = data.len() as u32;
         let nb = data.len().div_ceil(fs::BLOCK_SIZE);
+        // The host mkfs writes files with direct blocks only (≤ 28 blocks =
+        // 14 KiB) — enough for every staged program today. Staging a larger
+        // binary (e.g. tcc at B11) will need the host to learn indirect blocks,
+        // which the *kernel* already does; fail loudly rather than truncate.
+        assert!(
+            nb <= fs::NDIRECT,
+            "mkfs: {} is {} blocks (> {} direct); host indirect-block staging is a B11 task",
+            path,
+            nb,
+            fs::NDIRECT
+        );
         for (i, item) in node.direct.iter_mut().enumerate().take(nb) {
             let b = next_data;
             next_data += 1;
@@ -469,7 +488,7 @@ fn build_fs_image(total_blocks: u32, files: &[(&str, &[u8])]) -> Vec<u8> {
             let r = blk(b);
             disk[r.start..r.start + (hi - lo)].copy_from_slice(&data[lo..hi]);
         }
-        let (iblk, ioff) = fs::inode_loc(ino);
+        let (iblk, ioff) = layout.inode_loc(ino);
         node.write(&mut disk[blk(iblk)], ioff);
 
         // Add the file's dirent to its parent directory.
@@ -485,7 +504,7 @@ fn build_fs_image(total_blocks: u32, files: &[(&str, &[u8])]) -> Vec<u8> {
         d.nlink = 1;
         d.direct[0] = dblk;
         d.size = off as u32;
-        let (iblk, ioff) = fs::inode_loc(ino);
+        let (iblk, ioff) = layout.inode_loc(ino);
         d.write(&mut disk[blk(iblk)], ioff);
     }
 
@@ -1373,8 +1392,15 @@ const SMOKE_TESTS: &[SmokeTest] = &[
             "[fs] /motd: Frame OS B4 filesystem online.",
             "[fs] create/write/read round-trip: ok",
             "[fs] delete: ok",
+            // B9.5: a 128 KiB file round-trips through the double-indirect tier.
+            "[fs] big file (128 KiB, double-indirect) round-trip: ok",
         ],
-        expect_absent: &["KERNEL EXCEPTION", "KERNEL PANIC", "triple fault"],
+        expect_absent: &[
+            "[fs] big file round-trip FAILED",
+            "KERNEL EXCEPTION",
+            "KERNEL PANIC",
+            "triple fault",
+        ],
         timeout_secs: 20,
     },
     SmokeTest {

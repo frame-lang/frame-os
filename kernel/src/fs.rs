@@ -63,29 +63,47 @@ fn write_block(b: u32, data: &Block) {
     c.data = *data;
 }
 
+// --- on-disk layout (cached at mount) --------------------------------------
+
+// The disk layout (bitmap/inode/data offsets) is derived from the superblock's
+// `total_blocks` and depends on disk size (the bitmap scales). Cache it at mount
+// so every helper agrees without re-deriving. Set by `check_superblock`.
+static mut LAYOUT: fs::Layout = fs::Layout {
+    total_blocks: 0,
+    bitmap_blocks: 0,
+    inode_start: 0,
+    data_start: 0,
+};
+
+fn layout() -> fs::Layout {
+    unsafe { (&raw const LAYOUT).read() }
+}
+
 // --- inode / bitmap / dirent helpers ---------------------------------------
 
 fn read_inode(ino: u32) -> fs::Inode {
-    let (blk, off) = fs::inode_loc(ino);
+    let (blk, off) = layout().inode_loc(ino);
     fs::Inode::parse(&read_block(blk), off)
 }
 
 fn write_inode(ino: u32, node: &fs::Inode) {
-    let (blk, off) = fs::inode_loc(ino);
+    let (blk, off) = layout().inode_loc(ino);
     let mut b = read_block(blk);
     node.write(&mut b, off);
     write_block(blk, &b);
 }
 
-/// Allocate a free data block (≥ DATA_START), marking it used in the bitmap.
+/// Allocate a free data block (≥ data_start), marking it used in the bitmap.
+/// The bitmap spans multiple blocks (B9.5); consecutive candidates share a
+/// bitmap block, so the buffer cache keeps this cheap.
 fn alloc_block() -> Option<u32> {
-    let mut bm = read_block(fs::BITMAP_BLOCK);
-    let total = fs::Superblock::parse(&read_block(fs::SB_BLOCK)).total_blocks;
-    for b in fs::DATA_START..total {
-        let (byte, bit) = ((b / 8) as usize, b % 8);
+    let l = layout();
+    for b in l.data_start..l.total_blocks {
+        let (bm_block, byte, bit) = l.bitmap_loc(b);
+        let mut bm = read_block(bm_block);
         if bm[byte] & (1 << bit) == 0 {
             bm[byte] |= 1 << bit;
-            write_block(fs::BITMAP_BLOCK, &bm);
+            write_block(bm_block, &bm);
             // Zero the freshly allocated block.
             write_block(b, &[0u8; fs::BLOCK_SIZE]);
             return Some(b);
@@ -95,10 +113,10 @@ fn alloc_block() -> Option<u32> {
 }
 
 fn free_block(b: u32) {
-    let mut bm = read_block(fs::BITMAP_BLOCK);
-    let (byte, bit) = ((b / 8) as usize, b % 8);
+    let (bm_block, byte, bit) = layout().bitmap_loc(b);
+    let mut bm = read_block(bm_block);
     bm[byte] &= !(1 << bit);
-    write_block(fs::BITMAP_BLOCK, &bm);
+    write_block(bm_block, &bm);
 }
 
 /// Allocate a free inode number (≥ 2).
@@ -106,11 +124,80 @@ fn alloc_inode() -> Option<u32> {
     (2..fs::INODE_COUNT).find(|&ino| read_inode(ino).kind == fs::T_FREE)
 }
 
+// --- block map: direct + single/double indirect (B9.5) ---------------------
+
+/// Read (or, with `alloc`, allocate) the `slot`-th pointer inside indirect block
+/// `iblk`, returning the block it points at. Without `alloc`, returns None for an
+/// empty slot. Writes the indirect block back when it allocates a pointer.
+fn indirect_slot(iblk: u32, slot: usize, alloc: bool) -> Option<u32> {
+    let mut blk = read_block(iblk);
+    let off = slot * 4;
+    let cur = u32::from_le_bytes([blk[off], blk[off + 1], blk[off + 2], blk[off + 3]]);
+    if cur != 0 {
+        return Some(cur);
+    }
+    if !alloc {
+        return None;
+    }
+    let new = alloc_block()?;
+    blk[off..off + 4].copy_from_slice(&new.to_le_bytes());
+    write_block(iblk, &blk);
+    Some(new)
+}
+
+/// Map file block index `bi` to its physical disk block. With `alloc`, lazily
+/// allocates data + the single/double-indirect index blocks as needed (mutating
+/// `node` — the caller must `write_inode` afterward); without, returns None for a
+/// hole / past the allocated extent. Tiers: 28 direct, then one indirect block
+/// (128 ptrs), then a double-indirect block (128×128 ptrs).
+fn block_for(node: &mut fs::Inode, bi: usize, alloc: bool) -> Option<u32> {
+    let ptrs = fs::PTRS_PER_BLOCK;
+    if bi < fs::NDIRECT {
+        if node.direct[bi] == 0 {
+            if !alloc {
+                return None;
+            }
+            node.direct[bi] = alloc_block()?;
+        }
+        return Some(node.direct[bi]);
+    }
+    let bi = bi - fs::NDIRECT;
+    if bi < ptrs {
+        if node.indirect == 0 {
+            if !alloc {
+                return None;
+            }
+            node.indirect = alloc_block()?;
+        }
+        return indirect_slot(node.indirect, bi, alloc);
+    }
+    let bi = bi - ptrs;
+    if bi >= ptrs * ptrs {
+        return None; // beyond the double-indirect extent (max file)
+    }
+    if node.double_indirect == 0 {
+        if !alloc {
+            return None;
+        }
+        node.double_indirect = alloc_block()?;
+    }
+    // First level selects a single-indirect block; second level the data block.
+    let mid = indirect_slot(node.double_indirect, bi / ptrs, alloc)?;
+    indirect_slot(mid, bi % ptrs, alloc)
+}
+
 // --- public FS API ---------------------------------------------------------
 
-/// Validate the on-disk superblock. The `Mount` Frame system gates on this.
+/// Validate the on-disk superblock and cache the disk layout (B9.5). The `Mount`
+/// Frame system gates on this; it runs before any inode/block access, so the
+/// cached `LAYOUT` is set before anything reads it.
 pub fn check_superblock() -> bool {
-    fs::Superblock::parse(&read_block(fs::SB_BLOCK)).magic == fs::MAGIC
+    let sb = fs::Superblock::parse(&read_block(fs::SB_BLOCK));
+    if sb.magic != fs::MAGIC {
+        return false;
+    }
+    unsafe { (&raw mut LAYOUT).write(fs::Layout::for_total(sb.total_blocks)) };
+    true
 }
 
 /// Look up `name` in directory inode `dir_ino`; returns its inode number.
@@ -160,7 +247,7 @@ pub fn namei(path: &[u8]) -> Option<u32> {
 /// Read up to `out.len()` bytes of file `ino` starting at byte `offset`.
 /// Returns bytes read (0 at or past EOF).
 pub fn read_at(ino: u32, offset: usize, out: &mut [u8]) -> usize {
-    let node = read_inode(ino);
+    let mut node = read_inode(ino);
     let size = node.size as usize;
     if offset >= size {
         return 0;
@@ -170,11 +257,11 @@ pub fn read_at(ino: u32, offset: usize, out: &mut [u8]) -> usize {
     while done < want {
         let pos = offset + done;
         let bi = pos / fs::BLOCK_SIZE;
-        if bi >= node.direct.len() || node.direct[bi] == 0 {
+        let Some(blk) = block_for(&mut node, bi, false) else {
             break;
-        }
+        };
         let within = pos % fs::BLOCK_SIZE;
-        let block = read_block(node.direct[bi]);
+        let block = read_block(blk);
         let n = (want - done).min(fs::BLOCK_SIZE - within);
         out[done..done + n].copy_from_slice(&block[within..within + n]);
         done += n;
@@ -189,23 +276,7 @@ pub fn is_file(ino: u32) -> bool {
 
 /// Read up to `out.len()` bytes of file `ino` into `out`. Returns bytes read.
 pub fn read_file(ino: u32, out: &mut [u8]) -> usize {
-    let node = read_inode(ino);
-    let size = node.size as usize;
-    let want = size.min(out.len());
-    let mut done = 0;
-    for &blk in node.direct.iter() {
-        if done >= want {
-            break;
-        }
-        if blk == 0 {
-            break;
-        }
-        let data = read_block(blk);
-        let n = (want - done).min(fs::BLOCK_SIZE);
-        out[done..done + n].copy_from_slice(&data[..n]);
-        done += n;
-    }
-    done
+    read_at(ino, 0, out)
 }
 
 /// Create an empty file `name` in the root directory; returns its inode.
@@ -233,63 +304,39 @@ pub fn create(name: &[u8]) -> Option<u32> {
     Some(ino)
 }
 
-/// Overwrite file `ino` with `data` (allocating data blocks as needed).
+/// Overwrite file `ino` with `data` (allocating blocks as needed).
 pub fn write_file(ino: u32, data: &[u8]) -> bool {
-    let mut node = read_inode(ino);
-    let nb = data.len().div_ceil(fs::BLOCK_SIZE);
-    if nb > fs::NDIRECT {
-        return false;
-    }
-    for (i, slot) in node.direct.iter_mut().enumerate().take(nb) {
-        if *slot == 0 {
-            match alloc_block() {
-                Some(b) => *slot = b,
-                None => return false,
-            }
-        }
-        let lo = i * fs::BLOCK_SIZE;
-        let hi = ((i + 1) * fs::BLOCK_SIZE).min(data.len());
-        let mut buf = [0u8; fs::BLOCK_SIZE];
-        buf[..hi - lo].copy_from_slice(&data[lo..hi]);
-        write_block(*slot, &buf);
-    }
-    node.size = data.len() as u32;
-    write_inode(ino, &node);
-    true
+    truncate(ino); // reset size; write_at reuses any blocks already linked
+    write_at(ino, 0, data) == data.len()
 }
 
 /// Write `data` into file `ino` starting at byte `offset` (B9-3), allocating
-/// data blocks as needed and growing the file's size if the write extends past
-/// the current end. Returns the number of bytes written (short if the file would
-/// exceed the direct-block capacity). The random-access write the `lseek`+`write`
-/// path and the toolchains (which seek around their output) need.
+/// data + indirect index blocks as needed (B9.5) and growing the file's size if
+/// the write extends past the current end. Returns the number of bytes written
+/// (short only on out-of-space or past the ~8 MiB max file). The random-access
+/// write the `lseek`+`write` path and the toolchains (which seek around their
+/// output) need.
 pub fn write_at(ino: u32, offset: usize, data: &[u8]) -> usize {
     let mut node = read_inode(ino);
     let mut done = 0;
     while done < data.len() {
         let pos = offset + done;
         let bi = pos / fs::BLOCK_SIZE;
-        if bi >= fs::NDIRECT {
-            break; // beyond the direct blocks (no indirect blocks yet)
-        }
-        if node.direct[bi] == 0 {
-            match alloc_block() {
-                Some(b) => node.direct[bi] = b,
-                None => break,
-            }
-        }
+        let Some(blk) = block_for(&mut node, bi, true) else {
+            break; // out of space, or past the max file size
+        };
         let within = pos % fs::BLOCK_SIZE;
-        let mut block = read_block(node.direct[bi]);
+        let mut block = read_block(blk);
         let n = (data.len() - done).min(fs::BLOCK_SIZE - within);
         block[within..within + n].copy_from_slice(&data[done..done + n]);
-        write_block(node.direct[bi], &block);
+        write_block(blk, &block);
         done += n;
     }
     let new_end = offset + done;
     if new_end > node.size as usize {
         node.size = new_end as u32;
     }
-    write_inode(ino, &node);
+    write_inode(ino, &node); // persists size + any newly-allocated indirect ptrs
     done
 }
 
@@ -307,19 +354,51 @@ pub fn truncate(ino: u32) {
     write_inode(ino, &node);
 }
 
+/// Free a single-indirect block: all the data blocks it points at, then itself.
+fn free_indirect(iblk: u32) {
+    let blk = read_block(iblk);
+    for slot in 0..fs::PTRS_PER_BLOCK {
+        let off = slot * 4;
+        let d = u32::from_le_bytes([blk[off], blk[off + 1], blk[off + 2], blk[off + 3]]);
+        if d != 0 {
+            free_block(d);
+        }
+    }
+    free_block(iblk);
+}
+
+/// Free every block a file owns: direct, single-indirect (+ its index block),
+/// and double-indirect (+ both index levels). (B9.5)
+fn free_all_blocks(node: &fs::Inode) {
+    for &b in node.direct.iter() {
+        if b != 0 {
+            free_block(b);
+        }
+    }
+    if node.indirect != 0 {
+        free_indirect(node.indirect);
+    }
+    if node.double_indirect != 0 {
+        let blk = read_block(node.double_indirect);
+        for slot in 0..fs::PTRS_PER_BLOCK {
+            let off = slot * 4;
+            let mid = u32::from_le_bytes([blk[off], blk[off + 1], blk[off + 2], blk[off + 3]]);
+            if mid != 0 {
+                free_indirect(mid);
+            }
+        }
+        free_block(node.double_indirect);
+    }
+}
+
 /// Delete `name`: free its blocks + inode and clear its dirent.
 pub fn delete(name: &[u8]) -> bool {
     let Some(ino) = lookup(name) else {
         return false;
     };
-    let mut node = read_inode(ino);
-    for &blk in node.direct.iter() {
-        if blk != 0 {
-            free_block(blk);
-        }
-    }
-    node = fs::Inode::empty(); // mark $free
-    write_inode(ino, &node);
+    let node = read_inode(ino);
+    free_all_blocks(&node);
+    write_inode(ino, &fs::Inode::empty()); // mark $free
 
     // Clear the dirent (set its inode to 0; lookup skips inode 0).
     let root = read_inode(fs::ROOT_INODE);
@@ -400,6 +479,50 @@ pub fn run_demo() {
         serial::writeln("[fs] delete: ok");
     } else {
         serial::writeln("[fs] delete FAILED");
+    }
+
+    // B9.5: a large-file round-trip that spans the double-indirect tier. 128 KiB
+    // = 256 blocks, past 28 direct + 128 single-indirect (~78 KiB), so the tail
+    // exercises double-indirect. Written + verified in 512-byte chunks (no big
+    // kernel buffer); `delete` then frees all three tiers.
+    {
+        const BIG: usize = 128 * 1024;
+        if let Some(bino) = create(b"big") {
+            let mut ok = true;
+            let mut chunk = [0u8; fs::BLOCK_SIZE];
+            let mut pos = 0;
+            while pos < BIG {
+                for (i, b) in chunk.iter_mut().enumerate() {
+                    *b = ((pos + i) as u8) ^ 0x3C;
+                }
+                if write_at(bino, pos, &chunk) != chunk.len() {
+                    ok = false;
+                    break;
+                }
+                pos += chunk.len();
+            }
+            let mut rpos = 0;
+            while ok && rpos < BIG {
+                let mut rb = [0u8; fs::BLOCK_SIZE];
+                if read_at(bino, rpos, &mut rb) != rb.len() {
+                    ok = false;
+                    break;
+                }
+                for (i, &b) in rb.iter().enumerate() {
+                    if b != (((rpos + i) as u8) ^ 0x3C) {
+                        ok = false;
+                        break;
+                    }
+                }
+                rpos += rb.len();
+            }
+            if ok && size_of(bino) == BIG {
+                serial::writeln("[fs] big file (128 KiB, double-indirect) round-trip: ok");
+            } else {
+                serial::writeln("[fs] big file round-trip FAILED");
+            }
+            delete(b"big");
+        }
     }
 
     // Persistence across reboot: the first boot creates a marker file; a later
