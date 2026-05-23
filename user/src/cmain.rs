@@ -11,7 +11,7 @@
 #![no_main]
 
 use core::panic::PanicInfo;
-use frame_os_libc::{exit, strlen, write};
+use frame_os_libc::{exit, free, malloc, realloc, strlen, write};
 
 // `main`, C-style: `int main(int argc, char **argv, char **envp)`. frame-libc's
 // crt0 calls this, then `exit`s with the returned code.
@@ -31,6 +31,43 @@ extern "C" fn main(argc: i32, argv: *const *const u8, _envp: *const *const u8) -
         write(1, s);
         write(1, b"\n");
         i += 1;
+    }
+
+    // B10-2: exercise the heap. 200 KiB forces the libc to grow the program
+    // break past its initial 64 KiB chunk; realloc then grows the block further,
+    // and the original bytes must survive the copy.
+    const N: usize = 200_000;
+    let p = unsafe { malloc(N) };
+    if p.is_null() {
+        write(2, b"cmain: malloc FAILED\n");
+        return 1;
+    }
+    for i in 0..N {
+        unsafe { *p.add(i) = (i as u8) ^ 0x5A };
+    }
+    let mut ok = true;
+    for i in 0..N {
+        if unsafe { *p.add(i) } != (i as u8) ^ 0x5A {
+            ok = false;
+            break;
+        }
+    }
+    let q = unsafe { realloc(p, N + 100_000) };
+    if q.is_null() {
+        write(2, b"cmain: realloc FAILED\n");
+        return 1;
+    }
+    for i in 0..N {
+        if unsafe { *q.add(i) } != (i as u8) ^ 0x5A {
+            ok = false;
+            break;
+        }
+    }
+    unsafe { free(q) };
+    if ok {
+        write(1, b"cmain: malloc/realloc/free ok (200 KiB via brk)\n");
+    } else {
+        write(1, b"cmain: heap VERIFY MISMATCH\n");
     }
     0
 }

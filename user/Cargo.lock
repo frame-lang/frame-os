@@ -5,6 +5,9 @@ version = 4
 [[package]]
 name = "frame-os-libc"
 version = "0.1.0"
+dependencies = [
+ "linked_list_allocator",
+]
 
 [[package]]
 name = "frame-os-user-hello"

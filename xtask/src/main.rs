@@ -826,7 +826,9 @@ fn run_console_test() -> Result<()> {
         stdin.flush().ok();
         wait_for_output(&buf, "cmain: hello from frame-libc; argc=3", 20)?;
         wait_for_output(&buf, "argv[2]=two", 20)?;
-        eprintln!("console-test: frame-libc crt0+main ok; typing `exit`");
+        // B10-2: the libc heap (malloc/realloc/free over brk).
+        wait_for_output(&buf, "cmain: malloc/realloc/free ok", 20)?;
+        eprintln!("console-test: frame-libc crt0+malloc ok; typing `exit`");
         stdin.write_all(b"exit\n").context("write exit")?;
         stdin.flush().ok();
         Ok(())

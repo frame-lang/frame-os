@@ -852,8 +852,14 @@ from it" are largely built; the gaps are input, a growable heap, and the toolcha
     `strlen`. The `cmain` test program is `#![no_main]` and pulls `_start` from the libc
     — exactly the entry path a tcc-compiled C program will take. Validated by
     `console-test` (`/bin/cmain one two` → crt0 → `main` echoes `argc=3`, `argv[2]=two`).
-    *Next: B10-2 malloc over `brk`, B10-3 stdio + printf (the `FILE*` + format-scanner
-    FSMs), B10-4 file streams, B10-5 the Rust `std` port.*
+  - **B10-2 — `malloc`/`free`/`calloc`/`realloc` over `brk` — done.** The libc heap
+    grows the program break (syscall #10) on demand and runs first-fit over it
+    (`linked_list_allocator`); a 16-byte size header makes C `free(ptr)` work without a
+    caller-supplied size, and `realloc` preserves contents. Validated by `cmain`
+    allocating 200 KiB (forcing a `brk`-grow past the initial 64 KiB chunk), writing +
+    verifying a pattern, `realloc`-growing it, and freeing — asserted by `console-test`.
+    *Next: B10-3 stdio + printf (the `FILE*` + format-scanner FSMs), B10-4 file streams,
+    B10-5 the Rust `std` port.*
 - **B11 — on-device C toolchain (tcc).** Port **tcc** to build against `frame-libc`
   and emit Frame-OS ELF: `cc hello.c -o hello` from the shell. tcc is the right choice
   — small, single-pass, self-contained, designed for exactly this. ✅ **"compile

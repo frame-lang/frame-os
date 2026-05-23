@@ -14,3 +14,10 @@ edition = "2021"
 [lib]
 name = "frame_os_libc"
 path = "src/lib.rs"
+
+[dependencies]
+# Free-list bookkeeping behind malloc/free. The C ABI (free takes no size) is
+# handled by a size-tracking header we add in src/malloc.rs; this crate just
+# does the underlying first-fit allocation over the brk-grown region. Same
+# allocator the kernel and user crates already use.
+linked_list_allocator = "0.10"

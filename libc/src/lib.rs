@@ -12,6 +12,9 @@
 
 use core::arch::{asm, global_asm};
 
+mod malloc;
+pub use malloc::{calloc, free, malloc, realloc};
+
 // crt0 — the program entry. At process start `rsp` points at the System V
 // x86-64 initial stack the kernel built (argc, argv[], NULL, envp[], NULL,
 // auxv) — see the kernel's `exec_argv` path (B9-2). Hand that pointer to
@@ -80,6 +83,13 @@ pub fn write(fd: i32, buf: &[u8]) -> usize {
     } else {
         unsafe { syscall3(12, fd as u64, buf.as_ptr() as u64, buf.len() as u64) as usize }
     }
+}
+
+/// Set the program break to `new_end` (0 = query), returning the resulting
+/// break (B9-1 syscall #10). The libc's heap (`malloc`) is the sole user of
+/// `brk` in a process, so it owns the heap region above `USER_HEAP_BASE`.
+pub(crate) fn sys_brk(new_end: u64) -> u64 {
+    unsafe { syscall3(10, new_end, 0, 0) }
 }
 
 /// Terminate the process with status `code` (POSIX `_exit`). Never returns.
