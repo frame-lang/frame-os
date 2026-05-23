@@ -1302,6 +1302,26 @@ const SMOKE_TESTS: &[SmokeTest] = &[
         timeout_secs: 20,
     },
     SmokeTest {
+        // B9-1: the growable heap. `brktest` queries its program break, then
+        // grows the heap by 1 MiB via the `brk` syscall (#10) — the kernel
+        // demand-maps fresh USER|WRITABLE pages into the process's own address
+        // space, well beyond the fixed 64 KiB program-image heap. The program
+        // then writes a distinct value to every u64 across the new megabyte and
+        // reads it all back; the "write/read-back ok" line only prints if every
+        // freshly mapped page is real, writable, private memory. This is the
+        // keystone for the on-device toolchains (B10+), which need MBs of heap.
+        name: "brk_growable_heap_b9",
+        expect_contains: &["brk: base 0x", "grew heap by 1024 KiB, write/read-back ok"],
+        expect_absent: &[
+            "brk: grow FAILED",
+            "brk: VERIFY MISMATCH",
+            "KERNEL EXCEPTION",
+            "KERNEL PANIC",
+            "triple fault",
+        ],
+        timeout_secs: 20,
+    },
+    SmokeTest {
         // B4 Step 1: the virtio-blk driver + the post/drain deferred-event
         // pattern. The kernel inits the device, writes a known pattern to a
         // sector and reads it back — the completion IRQ `post`s, the kernel

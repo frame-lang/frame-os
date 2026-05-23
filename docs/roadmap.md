@@ -798,6 +798,16 @@ from it" are largely built; the gaps are input, a growable heap, and the toolcha
   syscall + the kernel grows the process address space — toolchains need MBs, not the
   current 64 KiB static), `argv`/`envp` through `exec`, and the missing syscalls
   (`lseek`, `stat`, write-to-fd, `getcwd`, `dup`). *Bounded but substantial.*
+  - **B9-1 — growable heap via `brk` — done.** Syscall #10 `brk(new_end)`:
+    query (`0`), grow (the kernel demand-maps fresh zeroed `USER|WRITABLE` pages over
+    `[break, new_end)` into the process's own address space), or shrink (unmap + free).
+    The break is per-process (`Tcb::heap_brk`), starting at a dedicated VA region
+    (`sched::USER_HEAP_BASE = 0x3000_0000`, clear of the image at `0x1000_0000` and the
+    stack at `0x2000_0000`); a `fork`ed child inherits it (the heap pages are copied with
+    the rest of the user half), and `exec` resets it (fresh image ⇒ empty heap). Heap
+    pages are reclaimed by the existing `free_address_space` teardown on reap. Validated
+    by `brktest` (grows its heap 1 MiB, writes + verifies a pattern across every page) +
+    the `brk_growable_heap_b9` smoke test. *Remaining B9: `argv`/`envp`, file syscalls.*
 - **B10 — userspace runtime: `frame-libc` + a `std` platform port.** A C/POSIX-ish
   library (malloc/free over `brk`, file I/O, string, stdio, `exit`) for tcc, **and** a
   Rust `std` backend (`std::sys::frameos`) on top, so framec (Rust + std) can be built

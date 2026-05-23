@@ -49,6 +49,7 @@ struct Tcb {
     kstack_top: u64, // ring-0 stack top for TSS.RSP0 + the syscall path
     pid: u32,        // the owning Process's pid (0 if none)
     parent_pid: u32, // the pid that forked this one (0 if none) — for wait()
+    heap_brk: u64,   // program break: end of this process's brk heap (B9-1)
 }
 
 const TCB_INIT: Tcb = Tcb {
@@ -58,7 +59,14 @@ const TCB_INIT: Tcb = Tcb {
     kstack_top: 0,
     pid: 0,
     parent_pid: 0,
+    heap_brk: 0,
 };
+
+/// Base VA of a user process's `brk` heap (B9-1). Sits well above the program
+/// image (0x1000_0000) and the user stack (0x2000_0000), so growing the heap
+/// upward never collides with either. Within PML4 index 0 (the user half), so a
+/// `fork` copies the heap along with the rest of the user address space.
+pub const USER_HEAP_BASE: u64 = 0x0000_0000_3000_0000;
 
 static mut TCBS: [Tcb; MAX_THREADS] = [TCB_INIT; MAX_THREADS];
 static mut N: usize = 0; // total TCBs incl. boot (slot 0)
@@ -290,6 +298,7 @@ pub unsafe fn spawn_user(pml4: u64, entry: u64, user_rsp: u64, pid: u32) {
     (*t.add(n)).pml4 = pml4;
     (*t.add(n)).kstack_top = kstack_top;
     (*t.add(n)).pid = pid;
+    (*t.add(n)).heap_brk = USER_HEAP_BASE; // fresh process: empty brk heap
     (&raw mut N).write(n + 1);
     with_sched(|s| s.task_ready());
 }
@@ -319,6 +328,9 @@ pub unsafe fn spawn_user_from_frame(
     (*t.add(n)).kstack_top = kstack_top;
     (*t.add(n)).pid = pid;
     (*t.add(n)).parent_pid = parent_pid;
+    // The child inherits the parent's program break — fork_address_space copied
+    // the parent's heap pages (PML4 index 0), so the heap contents carry over.
+    (*t.add(n)).heap_brk = brk_of_pid(parent_pid).unwrap_or(USER_HEAP_BASE);
     (&raw mut N).write(n + 1);
     with_sched(|s| s.task_ready());
 }
@@ -417,8 +429,42 @@ pub fn has_children(parent_pid: u32) -> bool {
 pub unsafe fn exec_into(new_pml4: u64) {
     let cur = (&raw const CURRENT).read();
     (*tcbs().add(cur)).pml4 = new_pml4;
+    (*tcbs().add(cur)).heap_brk = USER_HEAP_BASE; // new image ⇒ fresh, empty brk heap
     paging::switch(new_pml4);
     (&raw mut LAST_PML4).write(new_pml4);
+}
+
+/// The current process's program break (B9-1). The `brk` syscall reads this to
+/// answer a query and to know where to start growing.
+pub fn current_heap_brk() -> u64 {
+    unsafe {
+        let cur = (&raw const CURRENT).read();
+        (*tcbs().add(cur)).heap_brk
+    }
+}
+
+/// Set the current process's program break (B9-1), after the `brk` syscall has
+/// mapped/unmapped the heap pages between the old and new break.
+pub fn set_current_heap_brk(brk: u64) {
+    unsafe {
+        let cur = (&raw const CURRENT).read();
+        (*tcbs().add(cur)).heap_brk = brk;
+    }
+}
+
+/// The program break of the process with pid `pid` (used to let a `fork`ed child
+/// inherit its parent's break). `None` if no live TCB has that pid.
+fn brk_of_pid(pid: u32) -> Option<u64> {
+    unsafe {
+        let t = tcbs();
+        let n = (&raw const N).read();
+        for i in 0..n {
+            if (*t.add(i)).pid == pid && (*t.add(i)).state != RunState::Free {
+                return Some((*t.add(i)).heap_brk);
+            }
+        }
+        None
+    }
 }
 
 /// Initialize the scheduler: create the Frame `Scheduler`, reserve the boot

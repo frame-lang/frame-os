@@ -37,6 +37,12 @@ path = "src/spawner.rs"
 name = "waiter"
 path = "src/waiter.rs"
 
+# Growable heap: grows its heap by 1 MiB via the brk syscall, then writes and
+# verifies a pattern across it (B9-1). Allocator-free — calls brk directly.
+[[bin]]
+name = "brktest"
+path = "src/brktest.rs"
+
 # Scripted shell: cat /motd + exec /bin/hello from disk (B4 Step 4a).
 [[bin]]
 name = "shell"

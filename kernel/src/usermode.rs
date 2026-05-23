@@ -26,11 +26,13 @@
 //   6 = read(rdi = fd, rsi = buf, rdx = len)  → bytes read, 0 = EOF (B4 Step 4)
 //   7 = close(rdi = fd)                       → (B4 Step 4)
 //   8 = exec(rdi = path_ptr, rsi = path_len)  → replace image from disk (B4 4)
+//   9 = read_line(rdi = buf, rsi = len)       → bytes read; blocks (B8)
+//  10 = brk(rdi = new_end)                    → grow/shrink heap; new break (B9)
 
 use core::arch::{asm, global_asm};
 
 use crate::frame_systems::{ElfLoader, ProcessTable, SyscallDispatcher};
-use crate::{paging, sched, serial};
+use crate::{frames, paging, sched, serial};
 
 // The syscall dispatcher HSM (B3 Step 2). Driven synchronously from the
 // syscall entry; single instance, single-core.
@@ -93,6 +95,8 @@ static USER_FORKER_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/user_f
 static USER_SPAWNER_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/user_spawner.elf"));
 // `waiter` (B3 Step 5d) forks a child and wait()s to reap it.
 static USER_WAITER_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/user_waiter.elf"));
+// `brktest` (B9-1) grows its heap by 1 MiB via `brk` and verifies the new memory.
+static USER_BRKTEST_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/user_brktest.elf"));
 // `shell` (B4 Step 4a) cats `/motd` then execs `/bin/hello` from disk by path.
 static USER_SHELL_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/user_shell.elf"));
 // `frameshell` (B4 Step 4b) tokenizes command lines with the *same* parser.frs
@@ -294,7 +298,7 @@ fn proc_table() -> &'static mut ProcessTable {
 /// 0=write_char 1=exit 2=fork 3=exec(prog_id) 4=wait 5=open 6=read 7=close
 /// 8=exec(path). (B4 Step 4 added the file-I/O + exec-from-disk syscalls.)
 pub fn is_known_syscall(num: u64) -> bool {
-    num <= 9
+    num <= 10
 }
 
 /// Block until the console has a complete line, copy it into the user buffer
@@ -328,6 +332,63 @@ unsafe fn copy_from_user(ptr: u64, len: usize, out: &mut [u8]) -> usize {
     let n = len.min(out.len());
     core::ptr::copy_nonoverlapping(ptr as *const u8, out.as_mut_ptr(), n);
     n
+}
+
+/// `brk(new_end)`: grow or shrink the calling process's heap (B9-1). A growable
+/// heap is what real toolchains need — the program-image heap is a fixed static.
+///   - `new_end == 0` → a *query*: return the current program break unchanged.
+///   - `new_end > break` → grow: map fresh, zeroed USER|WRITABLE pages over the
+///     gap `[break, new_end)` into the process's address space.
+///   - `new_end < break` → shrink: unmap + free the pages over `[new_end, break)`.
+/// Returns the new break, or the *unchanged* break on out-of-memory (so the
+/// caller's allocator sees the request was refused). `new_end` is rounded up to
+/// a page boundary; the heap lives in its own VA region (`sched::USER_HEAP_BASE`)
+/// that never overlaps the image or the stack. A syscall runs in the caller's
+/// address space (CR3 unchanged), so mapping here targets the right space.
+fn do_brk(new_end: u64) -> u64 {
+    const PAGE: u64 = 4096;
+    let cur = sched::current_heap_brk();
+    if new_end == 0 {
+        return cur; // query
+    }
+    // Round the requested break up to a whole page.
+    let target = (new_end + PAGE - 1) & !(PAGE - 1);
+    let pml4 = paging::current_pml4();
+    if target > cur {
+        // Grow: map a fresh zeroed frame for each page in [cur, target).
+        let mut va = cur;
+        while va < target {
+            let Some(frame) = frames::alloc_frame() else {
+                // Out of memory: roll back the pages we just mapped and refuse.
+                let mut undo = cur;
+                while undo < va {
+                    if let Some(phys) = paging::translate(undo) {
+                        unsafe { paging::unmap(undo) };
+                        frames::free_frame(phys);
+                    }
+                    undo += PAGE;
+                }
+                return cur;
+            };
+            unsafe {
+                core::ptr::write_bytes(frames::phys_to_virt(frame), 0, PAGE as usize);
+                paging::map_in(pml4, va, frame, paging::USER | paging::WRITABLE);
+            }
+            va += PAGE;
+        }
+    } else if target < cur {
+        // Shrink: unmap + free each page in [target, cur).
+        let mut va = target;
+        while va < cur {
+            if let Some(phys) = paging::translate(va) {
+                unsafe { paging::unmap(va) };
+                frames::free_frame(phys);
+            }
+            va += PAGE;
+        }
+    }
+    sched::set_current_heap_brk(target);
+    target
 }
 
 /// Perform a (validated) syscall, called by the dispatcher's `$Executing`
@@ -390,6 +451,7 @@ pub fn perform_syscall(num: u64, a0: u64, _a1: u64) -> u64 {
             }
             0
         }
+        10 => do_brk(a0), // brk(new_end) → current/new program break (B9-1)
         _ => u64::MAX, // unreachable: validated by is_known_syscall
     }
 }
@@ -653,6 +715,11 @@ pub fn run() {
     run_one(USER_FORKER_ELF, "forker");
     run_one(USER_SPAWNER_ELF, "spawner");
     run_one(USER_WAITER_ELF, "waiter");
+
+    // B9-1: the growable heap. `brktest` grows its heap by 1 MiB via the `brk`
+    // syscall and verifies the new memory — proving the kernel demand-maps real
+    // per-process memory far beyond the fixed program-image heap.
+    run_one(USER_BRKTEST_ELF, "brktest");
 
     // B4 Step 4a: a scripted shell that uses the file-I/O syscalls (open/read/
     // close) to `cat /motd`, then `exec`s `/bin/hello` *from disk by path* —
