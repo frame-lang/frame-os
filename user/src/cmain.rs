@@ -10,16 +10,17 @@
 #![no_std]
 #![no_main]
 
-use core::panic::PanicInfo;
 use frame_os_libc::{
-    exit, fclose, feof, fgets, fopen, fprintf_args, fputs, fread, free, malloc, print_fmt, realloc,
+    fclose, feof, fgets, fopen, fprintf_args, fputs, fread, free, malloc, print_fmt, realloc,
     stdout, strlen, write, Arg, FILE,
 };
 
 // The C-ABI variadic printf/fprintf frame-libc provides (B11-1). *Calling* a
 // variadic extern is stable Rust, so this exercises the real C ABI path a
 // tcc-compiled program takes — the args go through registers/stack exactly as a
-// C compiler would emit, and frame-libc's naked trampoline reads them.
+// C compiler would emit, and frame-libc's naked trampoline reads them. (FILE is
+// an opaque handle passed only by pointer, so the ctypes lint is a non-issue.)
+#[allow(improper_ctypes)]
 extern "C" {
     fn printf(fmt: *const u8, ...) -> i32;
     fn fprintf(f: *mut FILE, fmt: *const u8, ...) -> i32;
@@ -176,8 +177,4 @@ extern "C" fn main(argc: i32, argv: *const *const u8, _envp: *const *const u8) -
     }
     0
 }
-
-#[panic_handler]
-fn panic(_info: &PanicInfo) -> ! {
-    exit(127)
-}
+// No #[panic_handler] here: frame-libc provides it (cmain links the libc).

@@ -14,13 +14,16 @@ FROM debian:bookworm-slim
 
 ENV DEBIAN_FRONTEND=noninteractive
 
-# Toolchain: C build deps (for framec/native crates), QEMU + UEFI firmware +
-# FAT tools (the ESP image), GraphViz (diagrams), and iproute2/ping for the TAP
-# networking tests.
+# Toolchain: C build deps, QEMU + UEFI firmware + FAT tools (the ESP image),
+# GraphViz (diagrams), iproute2/ping for the TAP networking tests, and an
+# x86_64 cross C toolchain (the container is arm64 on Apple Silicon, so native
+# gcc/ld target arm64 — B11 cross-compiles C programs *for* the x86_64 Frame OS
+# target with x86_64-linux-gnu-gcc / -ld).
 RUN apt-get update && apt-get install -y --no-install-recommends \
         build-essential curl ca-certificates git pkg-config libssl-dev \
         qemu-system-x86 ovmf mtools dosfstools graphviz \
         iproute2 iputils-ping \
+        gcc-x86-64-linux-gnu binutils-x86-64-linux-gnu \
     && rm -rf /var/lib/apt/lists/*
 
 # Rust (stable) + the bare-metal target + lint/format components.

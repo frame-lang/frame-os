@@ -23,7 +23,7 @@ pub use malloc::{calloc, free, malloc, realloc};
 pub use printf::{print_fmt, vformat, Arg};
 pub use stdio::{
     clearerr, fclose, feof, ferror, fflush, fgetc, fgets, fopen, fprintf_args, fputc, fputs, fread,
-    fwrite, getchar, stderr, stdin, stdout, FileStream, FILE,
+    fwrite, getchar, putchar, puts, stderr, stdin, stdout, FileStream, FILE,
 };
 
 // The Frame-generated code (the printf scanner) and the printf engine use Rust
@@ -160,8 +160,9 @@ pub(crate) fn sys_read_line(buf: &mut [u8]) -> usize {
     unsafe { syscall3(9, buf.as_mut_ptr() as u64, buf.len() as u64, 0) as usize }
 }
 
-/// Terminate the process with status `code` (POSIX `_exit`). Never returns.
-pub fn exit(code: i32) -> ! {
+/// Terminate the process with status `code` (POSIX `exit`). Never returns.
+#[no_mangle]
+pub extern "C" fn exit(code: i32) -> ! {
     unsafe { syscall3(1, code as u64, 0, 0) };
     loop {
         core::hint::spin_loop();
@@ -172,10 +173,19 @@ pub fn exit(code: i32) -> ! {
 ///
 /// # Safety
 /// `s` must point at a NUL-terminated byte string.
-pub unsafe fn strlen(s: *const u8) -> usize {
+#[no_mangle]
+pub unsafe extern "C" fn strlen(s: *const u8) -> usize {
     let mut n = 0;
     while *s.add(n) != 0 {
         n += 1;
     }
     n
+}
+
+// frame-libc owns the panic handler: a program linking it (a Rust bin like
+// `cmain`, or a C program linking the staticlib) gets one without defining its
+// own. panic=abort on this target, so this just exits — no unwinding.
+#[panic_handler]
+fn panic(_info: &core::panic::PanicInfo) -> ! {
+    exit(127)
 }

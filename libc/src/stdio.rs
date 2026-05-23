@@ -235,6 +235,25 @@ pub unsafe extern "C" fn fputc(c: i32, f: *mut FILE) -> i32 {
     }
 }
 
+/// `puts(s)` — write a string + a trailing newline to stdout (POSIX). Returns a
+/// non-negative value on success, EOF (-1) on failure. (gcc lowers a bare
+/// `printf("...\n")` to `puts`, so a C program needs this even if it never
+/// writes `puts` itself.)
+#[no_mangle]
+pub unsafe extern "C" fn puts(s: *const u8) -> i32 {
+    let f = stdout();
+    if fputs(s, f) < 0 {
+        return -1;
+    }
+    fputc(b'\n' as i32, f)
+}
+
+/// `putchar(c)` — write one byte to stdout; returns it or EOF.
+#[no_mangle]
+pub unsafe extern "C" fn putchar(c: i32) -> i32 {
+    unsafe { fputc(c, stdout()) }
+}
+
 /// `fflush(f)` — write any buffered output to the fd. Returns 0.
 #[no_mangle]
 pub unsafe extern "C" fn fflush(f: *mut FILE) -> i32 {

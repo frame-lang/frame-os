@@ -1,0 +1,14 @@
+# Standalone build config for frame-os-libc as a staticlib (B11-2).
+#
+# Only used when building IN libc/ (cargo finds the nearest .cargo/config by
+# walking up from the cwd) — i.e. when producing libframe_os_libc.a for linking
+# C programs. When the `user` crate builds frame-os-libc as a dependency, the
+# invocation uses user/.cargo/config instead, so this doesn't affect that path.
+#
+# static relocation (non-PIE) matches the user programs; no linker script — a
+# staticlib is archived, not linked.
+[build]
+target = "x86_64-unknown-none"
+
+[target.x86_64-unknown-none]
+rustflags = ["-C", "relocation-model=static"]

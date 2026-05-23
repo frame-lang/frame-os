@@ -14,6 +14,10 @@ edition = "2021"
 [lib]
 name = "frame_os_libc"
 path = "src/lib.rs"
+# rlib: linked by the Rust user programs (e.g. cmain) as a dependency.
+# staticlib: a `.a` of the extern "C" surface + crt0, for linking C programs
+# compiled by gcc/tcc against frame-libc (B11). Built standalone from libc/.
+crate-type = ["rlib", "staticlib"]
 
 [dependencies]
 # Free-list bookkeeping behind malloc/free. The C ABI (free takes no size) is

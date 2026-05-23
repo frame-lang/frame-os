@@ -370,10 +370,13 @@ fn prepare_qemu_artifacts_features(workspace: &Path, interactive: bool) -> Resul
     let hello_elf = build_user_disk_elf(workspace, "hello")?;
     let argtest_elf = build_user_disk_elf(workspace, "argtest")?;
     let cmain_elf = build_user_disk_elf(workspace, "cmain")?;
+    // B11-2: a C program cross-compiled (gcc + ld) against frame-libc.
+    let chello_elf = build_c_disk_elf(workspace, "hello")?;
     let mut files: Vec<(&str, &[u8])> = FS_FILES.to_vec();
     files.push(("/bin/hello", &hello_elf));
     files.push(("/bin/argtest", &argtest_elf));
     files.push(("/bin/cmain", &cmain_elf));
+    files.push(("/bin/chello", &chello_elf));
     let image = build_fs_image(BLK_DISK_BLOCKS, &files);
     std::fs::write(&blk_template, &image)
         .with_context(|| format!("failed to write {}", blk_template.display()))?;
@@ -576,6 +579,94 @@ fn build_user_disk_elf(workspace: &Path, bin: &str) -> Result<Vec<u8>> {
         .join("release")
         .join(bin);
     std::fs::read(&elf).with_context(|| format!("failed to read user ELF {}", elf.display()))
+}
+
+/// Cross-compile a C program in `csrc/<name>.c` against frame-libc and return
+/// the Frame-OS ELF bytes (B11-2). Three steps, all in the container:
+///   1. build frame-os-libc as a staticlib (`libframe_os_libc.a`);
+///   2. `gcc -ffreestanding -nostdlib …` compile the C to an object;
+///   3. `ld` link the object + the `.a` with the user linker script (ENTRY
+///      `_start` comes from the libc's crt0) into a non-PIE ET_EXEC.
+/// This is exactly the toolchain flow tcc will perform on-device at B11-3.
+fn build_c_disk_elf(workspace: &Path, name: &str) -> Result<Vec<u8>> {
+    let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".into());
+
+    // 1. frame-os-libc staticlib (libc/.cargo/config sets the target + reloc).
+    let libc_dir = workspace.join("libc");
+    let lib_target = target_dir(workspace).join("libc-staticlib");
+    let status = Command::new(&cargo)
+        .current_dir(&libc_dir)
+        .env("CARGO_TARGET_DIR", &lib_target)
+        .env_remove("RUSTFLAGS")
+        .env_remove("CARGO_ENCODED_RUSTFLAGS")
+        .env_remove("CARGO_BUILD_RUSTFLAGS")
+        .env_remove("RUSTC_WORKSPACE_WRAPPER")
+        .env_remove("RUSTC_WRAPPER")
+        .args(["build", "--release"])
+        .status()
+        .context("failed to invoke cargo for the frame-os-libc staticlib")?;
+    if !status.success() {
+        bail!("frame-os-libc staticlib build failed");
+    }
+    let lib_a = lib_target
+        .join("x86_64-unknown-none")
+        .join("release")
+        .join("libframe_os_libc.a");
+
+    let out_dir = target_dir(workspace).join("csrc");
+    std::fs::create_dir_all(&out_dir)?;
+    let obj = out_dir.join(format!("{name}.o"));
+    let elf = out_dir.join(format!("{name}.elf"));
+    let src = workspace.join("csrc").join(format!("{name}.c"));
+    let include = libc_dir.join("include");
+
+    // 2. Compile: freestanding, no builtins (don't lower printf→puts behind our
+    //    back), non-PIE (matches the static-reloc layout the linker script wants).
+    //    The container is arm64, so use the x86_64 cross compiler.
+    let status = Command::new("x86_64-linux-gnu-gcc")
+        .args([
+            "-ffreestanding",
+            "-fno-builtin",
+            "-fno-stack-protector",
+            "-fno-pie",
+            "-fno-pic",
+            "-O2",
+            "-c",
+        ])
+        .arg("-I")
+        .arg(&include)
+        .arg(&src)
+        .arg("-o")
+        .arg(&obj)
+        .status()
+        .context("failed to invoke gcc")?;
+    if !status.success() {
+        bail!("gcc compile of csrc/{name}.c failed");
+    }
+
+    // 3. Link with the Frame OS user linker script; gc unused .a sections.
+    //    x86_64 cross ld (the .a + the linker script's OUTPUT_FORMAT are x86-64).
+    let linker_script = workspace.join("user").join("linker.ld");
+    let status = Command::new("x86_64-linux-gnu-ld")
+        .arg("-T")
+        .arg(&linker_script)
+        // gc unused .a sections. NOTE: `--strip-all` produces a byte-identical
+        // PT_LOAD image (verified) yet makes the loaded program fault in-kernel —
+        // an unexplained interaction (the ELF loader reads only program headers,
+        // so stripping sections "shouldn't" matter). Left unstripped until that's
+        // understood; the ELF is larger (symtab rides along) but correct.
+        .args(["-z", "max-page-size=0x1000", "--gc-sections"])
+        .arg("-o")
+        .arg(&elf)
+        .arg(&obj)
+        .arg(&lib_a)
+        .status()
+        .context("failed to invoke ld")?;
+    if !status.success() {
+        bail!("ld link of {name} failed");
+    }
+
+    std::fs::read(&elf).with_context(|| format!("failed to read linked ELF {}", elf.display()))
 }
 
 /// Produce a fresh copy of the virtio-blk disk for one QEMU invocation.
@@ -871,7 +962,15 @@ fn run_console_test() -> Result<()> {
         wait_for_output(&buf, "cmain: fgets line-by-line ok", 20)?;
         // B10-2: the libc heap (malloc/realloc/free over brk).
         wait_for_output(&buf, "cmain: malloc/realloc/free ok", 20)?;
-        eprintln!("console-test: frame-libc crt0+printf+stdio+malloc ok; typing `exit`");
+        // B11-2: a real C program (gcc-compiled, linked against frame-libc) runs.
+        eprintln!("console-test: typing `/bin/chello`");
+        stdin.write_all(b"/bin/chello\n").context("write chello")?;
+        stdin.flush().ok();
+        wait_for_output(&buf, "chello: hello from C on Frame OS! argc=1", 20)?;
+        wait_for_output(&buf, "chello: malloc buf = ABCDEFGHIJ", 20)?;
+        wait_for_output(&buf, "chello: read back: C wrote this: 1234", 20)?;
+        wait_for_output(&buf, "chello: done", 20)?;
+        eprintln!("console-test: C program ran on Frame OS; typing `exit`");
         stdin.write_all(b"exit\n").context("write exit")?;
         stdin.flush().ok();
         Ok(())
