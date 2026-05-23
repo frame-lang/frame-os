@@ -43,6 +43,12 @@ path = "src/waiter.rs"
 name = "brktest"
 path = "src/brktest.rs"
 
+# Echoes its argv (B9-2): an asm `_start` shim hands the entry rsp to Rust, which
+# walks the SysV stack the kernel built. Disk-only (the shell loads /bin/argtest).
+[[bin]]
+name = "argtest"
+path = "src/argtest.rs"
+
 # Scripted shell: cat /motd + exec /bin/hello from disk (B4 Step 4a).
 [[bin]]
 name = "shell"

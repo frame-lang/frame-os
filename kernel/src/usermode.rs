@@ -28,6 +28,8 @@
 //   8 = exec(rdi = path_ptr, rsi = path_len)  → replace image from disk (B4 4)
 //   9 = read_line(rdi = buf, rsi = len)       → bytes read; blocks (B8)
 //  10 = brk(rdi = new_end)                    → grow/shrink heap; new break (B9)
+//  11 = exec_argv(rdi = buf, rsi = len,       → exec w/ argv; argv[0]=path (B9)
+//                 rdx = argc)                    buf = argc NUL-terminated args
 
 use core::arch::{asm, global_asm};
 
@@ -112,6 +114,13 @@ static USER_ISH_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/user_ish.
 // (IF=0 in syscalls, one process exec'ing at a time), so one buffer is safe.
 // 64 KiB comfortably holds the freestanding user programs.
 static mut ELF_BUF: [u8; 64 * 1024] = [0u8; 64 * 1024];
+
+// Scratch buffer for `exec_argv` (B9-2): the packed argv (argc NUL-terminated
+// strings, argv[0] = path) is copied here from user memory, then the strings are
+// laid onto the new program's initial stack. Single-flight like ELF_BUF.
+const ARGV_BUF_SIZE: usize = 1024;
+const MAX_ARGS: usize = 32;
+static mut ARGV_BUF: [u8; ARGV_BUF_SIZE] = [0u8; ARGV_BUF_SIZE];
 
 global_asm!(
     // syscall entry: rcx=user RIP, r11=user RFLAGS, rax=num, rdi/rsi=args.
@@ -298,7 +307,7 @@ fn proc_table() -> &'static mut ProcessTable {
 /// 0=write_char 1=exit 2=fork 3=exec(prog_id) 4=wait 5=open 6=read 7=close
 /// 8=exec(path). (B4 Step 4 added the file-I/O + exec-from-disk syscalls.)
 pub fn is_known_syscall(num: u64) -> bool {
-    num <= 10
+    num <= 11
 }
 
 /// Block until the console has a complete line, copy it into the user buffer
@@ -452,6 +461,7 @@ pub fn perform_syscall(num: u64, a0: u64, _a1: u64) -> u64 {
             0
         }
         10 => do_brk(a0), // brk(new_end) → current/new program break (B9-1)
+        11 => do_exec_argv(a0, _a1, arg2()), // exec with argv (B9-2)
         _ => u64::MAX, // unreachable: validated by is_known_syscall
     }
 }
@@ -545,6 +555,111 @@ fn do_exec_path(path_ptr: u64, path_len: u64) -> u64 {
     serial::write_u32_decimal(elf.len() as u32);
     serial::writeln(" bytes)");
     exec_image(elf)
+}
+
+/// `exec_argv(buf_ptr, buf_len, argc)` — exec a program *with arguments* (B9-2).
+/// `buf` is `argc` NUL-terminated strings concatenated; `argv[0]` is the path to
+/// load (so `argv[0]` is the program name, the Unix convention). Reads the ELF
+/// off disk like `do_exec_path`, then loads it with the argv laid onto the new
+/// program's initial stack. Returns `u64::MAX` on a bad path / load failure.
+fn do_exec_argv(buf_ptr: u64, buf_len: u64, argc: u64) -> u64 {
+    let n = (buf_len as usize).min(ARGV_BUF_SIZE);
+    let argc = (argc as usize).min(MAX_ARGS);
+    let argv: &'static [u8] = unsafe {
+        let ptr = (&raw mut ARGV_BUF) as *mut u8;
+        let dst = core::slice::from_raw_parts_mut(ptr, n);
+        let copied = copy_from_user(buf_ptr, n, dst);
+        core::slice::from_raw_parts(ptr as *const u8, copied)
+    };
+    // argv[0] is the path: the first NUL-terminated string.
+    let path_end = argv.iter().position(|&b| b == 0).unwrap_or(argv.len());
+    let path = &argv[..path_end];
+    let Some(ino) = crate::fs::namei(path) else {
+        return u64::MAX;
+    };
+    if !crate::fs::is_file(ino) {
+        return u64::MAX;
+    }
+    let elf: &'static [u8] = unsafe {
+        let buf = &raw mut ELF_BUF;
+        let len = crate::fs::read_file(ino, &mut *buf);
+        let full: &'static [u8] = &*buf;
+        &full[..len]
+    };
+    exec_image_args(elf, argv, argc)
+}
+
+/// Build a System V x86-64 initial process stack on the (now-current, post-
+/// `exec_into`) user stack and return the new `rsp` (B9-2). Layout, low → high:
+/// `argc`, `argv[0..argc]`, NULL, `envp` NULL, `auxv` AT_NULL — with the argv
+/// string bytes copied to the top of the page and the pointers aimed at them.
+/// `rsp` is left 16-aligned, as the ABI requires at program entry.
+///
+/// # Safety
+/// The current CR3 must be the new program's address space with its one-page
+/// user stack mapped writable; `top` is that stack's top (from the loader).
+unsafe fn build_initial_stack(top: u64, argv: &[u8], argc: usize) -> u64 {
+    // 1. Copy the packed argv strings to the top of the user stack (8-aligned).
+    let strings_len = argv.len();
+    let strings_base = (top - strings_len as u64) & !0x7;
+    core::ptr::copy_nonoverlapping(argv.as_ptr(), strings_base as *mut u8, strings_len);
+
+    // 2. Record each argv string's address within the copied block.
+    let mut ptrs = [0u64; MAX_ARGS];
+    let mut idx = 0usize;
+    let mut off = 0usize;
+    while idx < argc && off < strings_len {
+        ptrs[idx] = strings_base + off as u64;
+        while off < strings_len && *((strings_base + off as u64) as *const u8) != 0 {
+            off += 1;
+        }
+        off += 1; // step past the NUL
+        idx += 1;
+    }
+
+    // 3. The pointer block sits below the strings: argc, argv[], NULL, envp NULL,
+    //    auxv (AT_NULL only). 16-align the final rsp (at argc), per the ABI.
+    let n_words = 1 + argc + 1 + 1 + 2; // argc + argv + argvNULL + envpNULL + auxv(2)
+    let rsp = (strings_base - (n_words as u64) * 8) & !0xF;
+    let w = rsp as *mut u64;
+    *w.add(0) = argc as u64;
+    let mut i = 0usize;
+    while i < argc {
+        *w.add(1 + i) = ptrs[i];
+        i += 1;
+    }
+    *w.add(1 + argc) = 0; // argv terminator
+    *w.add(2 + argc) = 0; // envp terminator (no env yet)
+    *w.add(3 + argc) = 0; // auxv: AT_NULL type
+    *w.add(4 + argc) = 0; // auxv: AT_NULL value
+    rsp
+}
+
+/// Like `exec_image`, but lays `argv` onto the new program's initial stack
+/// (B9-2). The process enters the new program with `rsp` pointing at `argc`.
+fn exec_image_args(elf: &'static [u8], argv: &[u8], argc: usize) -> u64 {
+    let new_pml4 = unsafe { paging::new_address_space() };
+    crate::elf::prepare(elf, new_pml4);
+    let mut loader = ElfLoader::__create();
+    if loader.is_failed() {
+        return u64::MAX;
+    }
+    let entry = loader.entry();
+    let top = loader.user_stack_top();
+    unsafe {
+        sched::exec_into(new_pml4); // CR3 = new space; the user stack is now mapped
+        let new_rsp = build_initial_stack(top, argv, argc);
+        let f = &mut *(&raw const CURRENT_TRAP_FRAME).read();
+        *f = TrapFrame {
+            rip: entry,
+            rsp: new_rsp,
+            cs: 0x23,      // USER_CODE | 3
+            ss: 0x1b,      // USER_DATA | 3
+            rflags: 0x202, // IF=1
+            ..core::mem::zeroed()
+        };
+    }
+    0
 }
 
 /// Replace the current process's image with `elf`: load it into a fresh address

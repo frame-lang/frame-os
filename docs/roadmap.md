@@ -807,7 +807,17 @@ from it" are largely built; the gaps are input, a growable heap, and the toolcha
     the rest of the user half), and `exec` resets it (fresh image ⇒ empty heap). Heap
     pages are reclaimed by the existing `free_address_space` teardown on reap. Validated
     by `brktest` (grows its heap 1 MiB, writes + verifies a pattern across every page) +
-    the `brk_growable_heap_b9` smoke test. *Remaining B9: `argv`/`envp`, file syscalls.*
+    the `brk_growable_heap_b9` smoke test.
+  - **B9-2 — `argv` through `exec` — done.** Syscall #11 `exec_argv(buf, len, argc)`:
+    `buf` is `argc` NUL-terminated strings, `argv[0]` is the program path (the Unix
+    convention). The kernel loads the ELF from disk, then writes a System V x86-64
+    initial stack — `argc`, `argv[]`, NULL, `envp` NULL, `auxv` AT_NULL, with the string
+    bytes copied to the top of the page — onto the new program's stack, entering it with
+    `rsp` at `argc`. The shell (`ish`) packs the parsed tokens into that buffer, so typed
+    arguments reach the program; `argtest` reads them via a tiny asm `_start` shim that
+    hands the entry `rsp` to Rust. Validated by `console-test` (`/bin/argtest alpha beta`
+    → the program echoes `argv[1]=alpha`, `argv[2]=beta`). *Remaining B9: `envp`, file
+    syscalls (`lseek`, `stat`, write-to-fd, `getcwd`, `dup`).*
 - **B10 — userspace runtime: `frame-libc` + a `std` platform port.** A C/POSIX-ish
   library (malloc/free over `brk`, file I/O, string, stdio, `exit`) for tcc, **and** a
   Rust `std` backend (`std::sys::frameos`) on top, so framec (Rust + std) can be built

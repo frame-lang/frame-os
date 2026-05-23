@@ -77,8 +77,10 @@ fn read(fd: u64, buf: &mut [u8]) -> u64 {
 fn close(fd: u64) {
     unsafe { syscall3(7, fd, 0, 0) };
 }
-fn exec_path(path: &[u8]) -> u64 {
-    unsafe { syscall3(8, path.as_ptr() as u64, path.len() as u64, 0) }
+/// exec with arguments (B9-2): `buf` is `argc` NUL-terminated strings, `argv[0]`
+/// is the program path. Only returns on failure (a bad path / load error).
+fn exec_argv(buf: &[u8], argc: u64) -> u64 {
+    unsafe { syscall3(11, buf.as_ptr() as u64, buf.len() as u64, argc) }
 }
 fn read_line(buf: &mut [u8]) -> usize {
     unsafe { syscall3(9, buf.as_mut_ptr() as u64, buf.len() as u64, 0) as usize }
@@ -104,30 +106,32 @@ fn cat(path: &str) {
     close(fd);
 }
 
-/// Run an external program: resolve `prog` to a disk path (`/bin/<prog>` unless
-/// it's already absolute), then fork — the child execs it from disk, the parent
-/// waits. The shell survives because exec replaces the *child's* image.
-fn run_external(prog: &str) {
-    let mut path = [0u8; 128];
-    let resolved: &[u8] = if prog.starts_with('/') {
-        prog.as_bytes()
-    } else {
-        const PREFIX: &[u8] = b"/bin/";
-        let pb = prog.as_bytes();
-        let n = PREFIX.len() + pb.len();
-        if n > path.len() {
-            print(b"ish: path too long\n");
-            return;
-        }
-        path[..PREFIX.len()].copy_from_slice(PREFIX);
-        path[PREFIX.len()..n].copy_from_slice(pb);
-        &path[..n]
-    };
+/// Run an external program with its arguments. Build a packed argv — `argv[0]`
+/// is the resolved disk path (`/bin/<cmd>` unless `cmd` is already absolute),
+/// followed by the remaining tokens verbatim, each NUL-terminated — then fork:
+/// the child execs it from disk with that argv, the parent waits. The shell
+/// survives because exec replaces the *child's* image.
+fn run_external(toks: &[String]) {
+    let cmd = toks[0].as_str();
+    // argv[0]: the resolved path (the program name, Unix-style).
+    let mut argv: Vec<u8> = Vec::new();
+    if !cmd.starts_with('/') {
+        argv.extend_from_slice(b"/bin/");
+    }
+    argv.extend_from_slice(cmd.as_bytes());
+    argv.push(0);
+    // argv[1..]: the remaining tokens, verbatim.
+    for t in &toks[1..] {
+        argv.extend_from_slice(t.as_bytes());
+        argv.push(0);
+    }
+    let argc = toks.len() as u64;
+
     if fork() == 0 {
         // Child: become the program loaded from disk. exec only returns on failure.
-        exec_path(resolved);
+        exec_argv(&argv, argc);
         print(b"ish: command not found: ");
-        print(prog.as_bytes());
+        print(cmd.as_bytes());
         write_char(b'\n');
         exit(127);
     } else {
@@ -151,14 +155,14 @@ fn run_line(line: &str) {
         "exit" => exit(0),
         "help" => {
             print(b"ish builtins: help, exit, cat <path>...\n");
-            print(b"anything else runs /bin/<cmd> from disk (fork+exec+wait)\n");
+            print(b"anything else runs /bin/<cmd> <args...> from disk (fork+exec+wait)\n");
         }
         "cat" => {
             for path in &toks[1..] {
                 cat(path);
             }
         }
-        prog => run_external(prog),
+        _ => run_external(&toks),
     }
 }
 

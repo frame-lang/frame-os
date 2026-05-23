@@ -362,9 +362,11 @@ fn prepare_qemu_artifacts_features(workspace: &Path, interactive: bool) -> Resul
     // which the userspace shell `exec`s from disk (B4 Step 4). Each invocation
     // copies the template.
     let blk_template = qemu_dir.join("blk-template.img");
-    let hello_elf = build_user_disk_elf(workspace)?;
+    let hello_elf = build_user_disk_elf(workspace, "hello")?;
+    let argtest_elf = build_user_disk_elf(workspace, "argtest")?;
     let mut files: Vec<(&str, &[u8])> = FS_FILES.to_vec();
     files.push(("/bin/hello", &hello_elf));
+    files.push(("/bin/argtest", &argtest_elf));
     let image = build_fs_image(BLK_DISK_BLOCKS, &files);
     std::fs::write(&blk_template, &image)
         .with_context(|| format!("failed to write {}", blk_template.display()))?;
@@ -500,7 +502,7 @@ fn build_fs_image(total_blocks: u32, files: &[(&str, &[u8])]) -> Vec<u8> {
 /// disk). Mirrors the kernel build.rs nested-cargo invocation: own target dir,
 /// scrubbed RUSTFLAGS + rustc wrapper so the outer build's link args / clippy
 /// can't leak into the user link.
-fn build_user_disk_elf(workspace: &Path) -> Result<Vec<u8>> {
+fn build_user_disk_elf(workspace: &Path, bin: &str) -> Result<Vec<u8>> {
     let user_dir = workspace.join("user");
     let user_target = target_dir(workspace).join("user-disk-elf");
 
@@ -512,17 +514,17 @@ fn build_user_disk_elf(workspace: &Path) -> Result<Vec<u8>> {
         .env_remove("CARGO_BUILD_RUSTFLAGS")
         .env_remove("RUSTC_WORKSPACE_WRAPPER")
         .env_remove("RUSTC_WRAPPER")
-        .args(["build", "--release", "--bin", "hello"])
+        .args(["build", "--release", "--bin", bin])
         .status()
         .with_context(|| format!("failed to invoke cargo for user crate at {}", user_dir.display()))?;
     if !status.success() {
-        bail!("user `hello` build failed");
+        bail!("user `{bin}` build failed");
     }
 
     let elf = user_target
         .join("x86_64-unknown-none")
         .join("release")
-        .join("hello");
+        .join(bin);
     std::fs::read(&elf).with_context(|| format!("failed to read user ELF {}", elf.display()))
 }
 
@@ -784,7 +786,16 @@ fn run_console_test() -> Result<()> {
         stdin.write_all(b"/bin/hello\n").context("write hello")?;
         stdin.flush().ok();
         wait_for_output(&buf, "hello from ELF", 20)?;
-        eprintln!("console-test: hello ran; typing `exit`");
+        // B9-2: argv reaches the program. Type a command WITH arguments; argtest
+        // echoes argc + each argv string, so we can assert the args arrived.
+        eprintln!("console-test: typing `/bin/argtest alpha beta`");
+        stdin
+            .write_all(b"/bin/argtest alpha beta\n")
+            .context("write argtest")?;
+        stdin.flush().ok();
+        wait_for_output(&buf, "argv[1]=alpha", 20)?;
+        wait_for_output(&buf, "argv[2]=beta", 20)?;
+        eprintln!("console-test: argv arrived; typing `exit`");
         stdin.write_all(b"exit\n").context("write exit")?;
         stdin.flush().ok();
         Ok(())
