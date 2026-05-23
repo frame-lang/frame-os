@@ -22,12 +22,20 @@
 
 #![no_std]
 #![no_main]
+// The `interactive` build boots straight to a shell and deliberately skips the
+// B0–B7 self-test demos (see `kmain`), so the scaffolding those demos use — the
+// SMP stress statics/helpers, the cross-core post machinery, FS write-path and
+// allocator-introspection helpers, etc. — is unused *in that build only*. None
+// of it is dead in the default (smoke-tested) build; rather than pepper dozens of
+// `#[cfg]` gates across modules, scope a single dead-code allowance to the feature.
+#![cfg_attr(feature = "interactive", allow(dead_code))]
 
 extern crate alloc;
 
 use core::panic::PanicInfo;
 
 mod allocator;
+mod console;
 mod context;
 mod crosscore;
 mod elf;
@@ -228,6 +236,11 @@ unsafe extern "C" fn kmain() -> ! {
     // per-CPU block, then launch each AP (stashing its index in `extra`) and wait
     // for it to report online. The APs park; the rest of kmain's demos run on the
     // BSP. (Per-CPU scheduling across cores lands in B7 Step 2.)
+    //
+    // Skipped in the `interactive` build: the SMP stress demos run billion-iteration
+    // spin-bounded waits that take minutes under TCG, and the shell runs single-core
+    // on the BSP — an interactive build boots straight to a prompt (see below).
+    #[cfg(not(feature = "interactive"))]
     {
         use core::sync::atomic::Ordering;
         if let Some(mp) = MP_REQUEST.get_response() {
@@ -483,6 +496,10 @@ unsafe extern "C" fn kmain() -> ! {
         }
     }
 
+    // The B0–B6 self-test demos. Skipped in the `interactive` build, which boots
+    // straight to a shell (its minimal init is the `#[cfg(feature=…)]` block below).
+    #[cfg(not(feature = "interactive"))]
+    {
     // B2 Step 1: physical frame allocator. As of Step 5 the allocator is
     // initialized by the boot HSM's $InitMemory phase (during __create
     // above), so kmain only runs the self-test: two distinct page-aligned
@@ -666,15 +683,50 @@ unsafe extern "C" fn kmain() -> ! {
         // Transport through the UsbMsd Frame system.
         xhci::run_msd();
     }
+    } // end of the B0–B6 self-test demos (default build only)
 
     // B2 Step 3 (fatal path): deliberately fault on an unmapped, non-lazy
     // address. The PageFaultHandler classifies it $Fatal, reports it, and
     // halts — a clean fatal, not a silent triple-fault. This is the last
-    // thing kmain does.
-    serial::writeln("[#PF] triggering a deliberate fatal fault...");
-    unsafe {
-        let bad = 0x0000_6000_0000_0000 as *const u64;
-        let _ = bad.read_volatile(); // → #PF → $Fatal → halt (never returns)
+    // thing kmain does in the default build.
+    #[cfg(not(feature = "interactive"))]
+    {
+        serial::writeln("[#PF] triggering a deliberate fatal fault...");
+        unsafe {
+            let bad = 0x0000_6000_0000_0000 as *const u64;
+            let _ = bad.read_volatile(); // → #PF → $Fatal → halt (never returns)
+        }
+    }
+
+    // B8 (interactive build): boot straight to the interactive shell. We run only
+    // the minimal init the shell needs — the page-fault handler (so a user fault
+    // is caught, not fatal), the virtio-blk disk, and the mounted FS (the shell
+    // loads `/bin/<cmd>` from disk). `ish` then reads live console input and
+    // fork+exec+waits the programs you type, returning here only when you type
+    // `exit`. Gated by the `interactive` feature so the default boot + smoke suite
+    // is unaffected; the heavy B0–B7 self-test demos above are skipped.
+    #[cfg(feature = "interactive")]
+    {
+        // The BSP's per-CPU block (GS base) MUST be initialized before any user
+        // process runs: the scheduler calls `gdt::set_rsp0` on every switch into a
+        // ring-3 process, and that reads this core's index via `gs:[0]`. `gdt::init`
+        // zeroed the GS base (its `mov gs, kdata`), so without this the read hits
+        // virtual address 0 → #PF. The default build does this inside the SMP
+        // bring-up block (skipped here), so the interactive build must do it itself.
+        let bsp = MP_REQUEST.get_response().map_or(0, |mp| mp.bsp_lapic_id());
+        percpu::init_this_cpu(0, bsp);
+
+        vm::init(); // PageFaultHandler: a user fault kills the process, not the kernel
+        if !virtio_blk::init() {
+            serial::writeln("[ish] WARNING: no virtio-blk disk — /bin programs unavailable");
+        }
+        if !fs::mount() {
+            serial::writeln("[ish] WARNING: FS mount failed — /bin programs unavailable");
+        } else {
+            serial::writeln("[fs] mounted");
+        }
+        usermode::run_interactive_shell();
+        serial::writeln("[ish] shell exited; halting");
     }
 
     halt_forever();

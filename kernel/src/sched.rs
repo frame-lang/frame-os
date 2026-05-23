@@ -345,6 +345,31 @@ pub fn block_current() {
     }
 }
 
+/// Wake the (Blocked) task whose process pid is `pid`, marking it Runnable so the
+/// scheduler will pick it again. Single-writer-ish (called from the device IRQ to
+/// wake a process blocked on I/O, or from a waker); a no-op if no such Blocked
+/// task exists. Pure native — safe to call from an interrupt handler.
+pub fn wake_pid(pid: u32) {
+    unsafe {
+        let t = tcbs();
+        let n = (&raw const N).read();
+        for i in 0..n {
+            if (*t.add(i)).pid == pid && (*t.add(i)).state == RunState::Blocked {
+                (*t.add(i)).state = RunState::Runnable;
+                return;
+            }
+        }
+    }
+}
+
+/// Whether preemptive scheduling is active (a user process is running under the
+/// scheduler). Drivers use this to choose blocking I/O (yield + wake) over a
+/// busy-wait: during early boot (before `run_until_idle`) it's false, so the
+/// busy-wait path is taken; once processes run, true → block-and-wake.
+pub fn is_preemption_active() -> bool {
+    ACTIVE.load(Ordering::Relaxed)
+}
+
 /// Reap one *dead* (exited) child of `parent_pid`: free its scheduler slot and
 /// return its pid + PML4 so the caller can tear down the address space + the
 /// `Process`. Returns `None` if the parent has no exited-unreaped child.

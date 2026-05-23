@@ -49,6 +49,12 @@ path = "src/shell.rs"
 name = "frameshell"
 path = "src/frameshell.rs"
 
+# Interactive shell: a real REPL reading live input via read_line (B8), with
+# fork+exec+wait so it survives running programs. Reuses the Parser FSM + heap.
+[[bin]]
+name = "ish"
+path = "src/ish.rs"
+
 # Heap allocator for the Frame-generated code (Vec/String/Rc/BTreeMap).
 # Only `frameshell` pulls it in (via `mod mem`); the other bins stay
 # allocator-free. Same crate + version the kernel uses.

@@ -11,6 +11,12 @@ description = "Frame OS — bare-metal kernel"
 name = "frame-os-kernel"
 path = "src/main.rs"
 
+[features]
+# `interactive` (B8): replace the boot's fatal-fault demo tail with an
+# interactive shell (`ish`) reading live serial-console input. Off by default —
+# the smoke suite builds the default kernel, this feature builds the typeable one.
+interactive = []
+
 # This crate is excluded from the workspace's `default-members` because it
 # needs a bare-metal target (`x86_64-unknown-none`) and won't build on the
 # host. Build via xtask:

@@ -133,6 +133,7 @@ fn build_user_program(workspace_root: &Path, out_dir: &Path) -> Result<()> {
         ("waiter", "user_waiter.elf"),
         ("shell", "user_shell.elf"),
         ("frameshell", "user_frameshell.elf"),
+        ("ish", "user_ish.elf"),
     ] {
         let elf = release.join(bin);
         if !elf.exists() {
@@ -157,6 +158,7 @@ fn build_user_program(workspace_root: &Path, out_dir: &Path) -> Result<()> {
         "src/waiter.rs",
         "src/shell.rs",
         "src/frameshell.rs",
+        "src/ish.rs",
         "src/frame_systems.rs",
         "src/mem.rs",
         "build.rs",

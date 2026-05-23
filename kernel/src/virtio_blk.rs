@@ -12,10 +12,10 @@
 // `write_sector`'s wait loop), reading the used ring and driving the
 // `BlockRequest` Frame system to $Complete/$Error.
 
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use crate::frame_systems::BlockRequest;
-use crate::{frames, interrupts, io, pci, pic, serial};
+use crate::{frames, interrupts, io, pci, pic, sched, serial};
 
 const VIRTIO_VENDOR: u16 = 0x1AF4;
 const VIRTIO_BLK_DEVICE: u16 = 0x1001; // legacy/transitional virtio-blk
@@ -200,13 +200,23 @@ pub fn init() -> bool {
 
 // --- the post/drain I/O path (B4 Step 1c) ----------------------------------
 
-/// IRQ post: ack the device ISR and flag a pending completion. Native and
-/// interrupt-safe — no Frame dispatch here (that's `drain`'s job).
+/// The process pid blocked on a disk completion (0 = none / busy-wait path). The
+/// IRQ handler wakes it. Single outstanding request (single-flight I/O).
+static DISK_WAITER: AtomicU32 = AtomicU32::new(0);
+
+/// IRQ post: ack the device ISR, flag the pending completion, and — if a process
+/// is blocked on this read/write — wake it (B8 blocking I/O). Native and
+/// interrupt-safe: no Frame dispatch here (that's `drain`'s job); `wake_pid` only
+/// flips a TCB state.
 pub fn on_irq() {
     let d = dev();
     if d.present {
         let _ = io::inb(d.io_base + R_ISR); // read-to-ack
         IRQ_PENDING.store(true, Ordering::SeqCst);
+        let waiter = DISK_WAITER.swap(0, Ordering::SeqCst);
+        if waiter != 0 {
+            sched::wake_pid(waiter);
+        }
     }
 }
 
@@ -252,11 +262,21 @@ unsafe fn submit(sector: u64, write: bool) {
 /// used ring and read the device status byte (0 = OK).
 fn wait_and_drain() -> u8 {
     IRQ_PENDING.store(false, Ordering::SeqCst);
-    interrupts::enable();
-    while !IRQ_PENDING.load(Ordering::SeqCst) {
-        interrupts::wait_for_interrupt();
+    let pid = sched::current_pid();
+    if sched::is_preemption_active() && pid != 0 {
+        // B8 blocking I/O: a scheduled process blocks (yields the CPU) until the
+        // completion IRQ wakes it (`on_irq` → `wake_pid`), instead of busy-waiting.
+        DISK_WAITER.store(pid, Ordering::SeqCst);
+        sched::block_current();
+        DISK_WAITER.store(0, Ordering::SeqCst);
+    } else {
+        // Boot / non-process context (no scheduler yet): busy-wait, interrupts on.
+        interrupts::enable();
+        while !IRQ_PENDING.load(Ordering::SeqCst) {
+            interrupts::wait_for_interrupt();
+        }
+        interrupts::disable();
     }
-    interrupts::disable();
     let d = dev();
     // Advance our used cursor past the completion(s).
     let used_idx = unsafe { (used_base().add(2) as *const u16).read() };

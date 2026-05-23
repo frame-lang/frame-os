@@ -745,11 +745,117 @@ B5-7/B6/B7's crates.io CI is red because the kernel uses typed-context framec
 typed-context framec (the transpiler team's call), then green the GitHub CI matrix
 to match the locally-green dev container.
 
-### Out of scope unless expanded
+## V1.0 self-hosting track (B8–B13)
 
-- **"B8" — AArch64 / Raspberry Pi port.** A plausible later track (the README lists
-  Pi Pico / Pi 4/5 as intended runtime targets), not committed. Would be its own
-  milestone with a port-contract + portability story.
+**The V1.0 north star:** *run framec on Frame OS to compile a hello-world program in
+both C and Rust, and run them from an interactive shell.* This is the
+self-hosting milestone — the OS hosts its own toolchain.
+
+**The architectural key — funnel every language to one on-device C compiler.** A
+full `rustc`+LLVM port is a multi-year, Redox-scale effort (LLVM assumes threads,
+mmap, a host linker, a filesystem). Instead, make every path transpile down to one
+native C compiler:
+
+```
+Frame ──framec──▶ C    ──tcc──▶ ELF                 (C path)
+Frame ──framec──▶ Rust ──mrustc──▶ C ──tcc──▶ ELF   (Rust path, no LLVM)
+```
+
+`mrustc` (Rust→C) dodges LLVM entirely: once `tcc` is on-device, "Rust on Frame OS"
+becomes "port mrustc," not "port LLVM."
+
+**Foundation already in place:** a writable filesystem (`fs::create`/`write_file`),
+a ring-3 Frame-driven shell skeleton that tokenizes with the `Parser` FSM
+(`user/frameshell.rs`, currently baked-script), a userspace heap (fixed 64 KiB
+today), and `fork`/`exec_path`/`wait` + the ELF loader. The shell and "run a program
+from it" are largely built; the gaps are input, a growable heap, and the toolchains.
+
+- **B8 — interactive console — done.** Serial RX
+  (`serial::rx_byte` + IRQ4 → `console.rs` line discipline: echo, backspace, a byte
+  FIFO), a blocking `read_line` syscall (#9; yields via `block_current` until a
+  newline), and a real ring-3 REPL `ish` (`user/ish.rs`): prompt → `read_line` →
+  tokenize with the same `Parser` FSM the hosted shell uses → builtins (`help`,
+  `exit`, `cat`) or fork+exec a program from disk (`/bin/<cmd>`). Gated behind the
+  `interactive` cargo feature so the default kernel + the 45-test suite are untouched;
+  validated by `cargo xtask console-test` (boots the interactive kernel over
+  `-serial stdio`, types `/bin/hello`, asserts it runs from disk, types `exit`).
+  **You can type `/bin/hello` at a `frameos$` prompt and a disk-loaded program runs,
+  then the shell returns to the prompt.** Three substrate-level (not Frame) bugs were
+  found and fixed to get here:
+  - A **blocking-I/O bug** — virtio-blk reads busy-`hlt`'d for the completion IRQ
+    instead of yielding; now a scheduled process blocks (`block_current`) and is woken
+    on the IRQ (`sched::wake_pid`). This is also what lets a *forked child's* disk read
+    complete: it yields the CPU so the IRQ can be delivered and serviced.
+  - An **interactive build booted too slowly** — it re-ran the entire B0–B7 self-test
+    suite (billion-iteration SMP spin loops) before reaching the prompt. An interactive
+    build now boots *straight to a shell*; the self-tests are gated to the default build.
+  - A **`#PF` at address 0** on the first switch into a ring-3 process — `gdt::set_rsp0`
+    reads this core's index via `gs:[0]`, but the BSP's per-CPU GS base was still zero
+    because its init (`percpu::init_this_cpu`) lived *inside the SMP demo block* the
+    interactive build skips. The interactive path now initializes BSP per-CPU state
+    explicitly before running any user process.
+- **B9 — process/OS services the toolchains need.** A **growable heap** (`brk`/`mmap`
+  syscall + the kernel grows the process address space — toolchains need MBs, not the
+  current 64 KiB static), `argv`/`envp` through `exec`, and the missing syscalls
+  (`lseek`, `stat`, write-to-fd, `getcwd`, `dup`). *Bounded but substantial.*
+- **B10 — userspace runtime: `frame-libc` + a `std` platform port.** A C/POSIX-ish
+  library (malloc/free over `brk`, file I/O, string, stdio, `exit`) for tcc, **and** a
+  Rust `std` backend (`std::sys::frameos`) on top, so framec (Rust + std) can be built
+  for the OS. The Redox model. *Large — the "real program-hosting OS" milestone.*
+- **B11 — on-device C toolchain (tcc).** Port **tcc** to build against `frame-libc`
+  and emit Frame-OS ELF: `cc hello.c -o hello` from the shell. tcc is the right choice
+  — small, single-pass, self-contained, designed for exactly this. ✅ **"compile
+  hello-world in C and run it from the shell"** (framec emits C → tcc → ELF → run).
+- **B12 — framec on-device.** Cross-compile framec (Rust + std) for the Frame OS
+  target — possible because B10 ported std. `framec hello.frs -l c` runs on the OS.
+  *Large, but framec is a big Rust program, not a toolchain — and it dogfoods itself
+  (58 Frame systems).*
+- **B13 — on-device Rust path (mrustc → tcc).** Port **mrustc** (Rust→C) so
+  framec-emitted Rust → mrustc → tcc → ELF, all on-device, no LLVM. ✅ **"compile
+  hello-world in Rust and run it from the shell."** *The hardest port (mrustc is large
+  C++, pinned to a specific Rust version) — but the only realistic on-device Rust.*
+
+**Feasibility, honestly.** B8–B11 (shell → libc → tcc) is a long but tractable
+sequence; C-on-device is real. B12 (framec on-device) is achievable once std is
+ported. B13 (Rust on-device via mrustc) is the wall — easily as much work as
+B8–B11 combined — but the mrustc+tcc chain makes it *possible* without LLVM. Total
+scope exceeds all of B0–B7 combined; it decomposes cleanly, each milestone
+independently demonstrable with a serial-console smoke test.
+
+**The Frame angle.** The shell REPL and a `make`/`cc`-like **build driver**
+orchestrating `framec → mrustc → tcc → link` (a pipeline FSM with a `$Failed` sink)
+are textbook Frame: a compiler toolchain whose driver is written in the language it
+compiles.
+
+### Portability / other forward tracks (post-V1.0, not committed)
+
+- **P1 — HAL extraction (`arch/` boundary).** *Prerequisite for any port; valuable on
+  its own.* Today the kernel is monolithically x86_64 — ~17 modules carry x86-only
+  machine mechanics (`gdt` segmentation, `interrupts` IDT + naked `iretq` stubs,
+  `usermode` syscall/sysret, `paging` CR3, `percpu` `IA32_GS_BASE`, `pic`/`pit`/LAPIC,
+  port-I/O in `serial`/`io`/`pci`, the `context` switch). Carve these behind an
+  `arch::` boundary using **module-swap + an enforcing trait** (the Linux/Redox
+  pattern, plus a `trait Arch`/`Mmu`/`InterruptController`/`Timer`/`Console` so the
+  compiler checks each arch provides the contract; compile-time `cfg` selection ⇒ zero
+  runtime cost). Two phases:
+  - **P1.0 — extract `arch/x86_64/` with no second arch.** A pure refactor: move the
+    machine modules behind `arch::`, route the rest through it, keep all smoke tests
+    green. Extracting the boundary is how the real interface is *discovered*, and it
+    makes the project's thesis literal in the tree: **the `arch::` line is exactly the
+    Frame/native line** — everything above (the 26 FSMs + high-level Rust) is already
+    arch-neutral and ports for free; everything below is per-arch. Valuable as
+    documentation/structure even if no port ever ships.
+  - **P1.1+ — implement a second arch backend** (`arch/aarch64/` or `arch/riscv64/`)
+    against that interface. Note the structural differences a HAL must absorb, not just
+    different constants: ARM/RISC-V have **no segmentation** (GDT/TSS vanish), an
+    **exception-vector table** instead of an IDT, **MMIO-only** I/O (no port I/O — so
+    the legacy 8259/8254/16550-via-ports drivers are x86-only; ARM brings GIC + generic
+    timer + PL011 + ECAM behind the same HAL interfaces). Naked trap-entry stubs and the
+    context switch stay per-arch asm by nature.
+- **AArch64 / Raspberry Pi port.** The concrete instance of P1.1 (the README lists Pi
+  Pico / Pi 4/5 as intended runtime targets). Limine already supports x86_64, AArch64,
+  and RISC-V, so the boot handoff is portable; serial/UART-first console (B8) is the
+  natural bring-up path on those boards. Not committed.
 - A device/power state-machine showcase (ACPI sleep states) — a *possible* future
   Frame demonstration, not committed.
 

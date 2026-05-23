@@ -289,21 +289,30 @@ pub fn delete(name: &[u8]) -> bool {
     true
 }
 
-// --- B4 Step 2 demo --------------------------------------------------------
+// --- mount -----------------------------------------------------------------
 
-/// Mount the FS (via the `Mount` HSM), read a pre-populated file, then run a
-/// create → write → read → delete round-trip.
-pub fn run_demo() {
+/// Mount the FS by driving the `Mount` HSM ($Unmounted → $Mounting → $Mounted)
+/// past a superblock check. Returns whether the mount succeeded. Shared by the
+/// B4 demo and the interactive build (which mounts without running the demo).
+pub fn mount() -> bool {
     let mut mount = crate::frame_systems::Mount::__create();
     mount.begin_mount(); // $Unmounted → $Mounting
     if check_superblock() {
         mount.mounted_ok(); // → $Mounted
     } else {
         mount.mount_failed();
-        serial::writeln("[fs] mount failed: bad superblock");
-        return;
+        return false;
     }
-    if !mount.is_mounted() {
+    mount.is_mounted()
+}
+
+// --- B4 Step 2 demo --------------------------------------------------------
+
+/// Mount the FS (via the `Mount` HSM), read a pre-populated file, then run a
+/// create → write → read → delete round-trip.
+pub fn run_demo() {
+    if !mount() {
+        serial::writeln("[fs] mount failed: bad superblock");
         return;
     }
     serial::writeln("[fs] mounted");
@@ -365,7 +374,4 @@ pub fn run_demo() {
             }
         }
     }
-
-    mount.begin_unmount();
-    mount.unmounted();
 }

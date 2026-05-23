@@ -24,6 +24,8 @@ use crate::serial;
 const TIMER_VECTOR: usize = crate::pic::PIC1_OFFSET as usize;
 /// virtio-blk is on IRQ11 (slave PIC) → vector 0x20 + 11 (B4).
 const VIRTIO_BLK_VECTOR: usize = crate::pic::PIC1_OFFSET as usize + 11;
+/// COM1 serial RX is on IRQ4 (master PIC) → vector 0x20 + 4 (B8).
+const SERIAL_VECTOR: usize = crate::pic::PIC1_OFFSET as usize + 4;
 /// LAPIC timer vector (B7 Step 4) — the APs' per-core periodic timer. Must match
 /// `crate::lapic::TIMER_VECTOR`.
 const LAPIC_TIMER_VECTOR: usize = 0x40;
@@ -166,6 +168,32 @@ global_asm!(
     "  push r10",
     "  push r11",
     "  call virtio_blk_irq",
+    "  pop r11",
+    "  pop r10",
+    "  pop r9",
+    "  pop r8",
+    "  pop rdi",
+    "  pop rsi",
+    "  pop rdx",
+    "  pop rcx",
+    "  pop rax",
+    "  iretq",
+    // Serial RX IRQ (B8, IRQ4 → vector 0x24). Same minimal post shape: save
+    // caller-saved GPRs, call the Rust half (drain the UART FIFO into the console
+    // line buffer + echo, EOI the PIC), restore + iretq. No Frame dispatch — only
+    // `post` (the console line buffer); the `read_line` syscall drains it.
+    ".global isr_serial",
+    "isr_serial:",
+    "  push rax",
+    "  push rcx",
+    "  push rdx",
+    "  push rsi",
+    "  push rdi",
+    "  push r8",
+    "  push r9",
+    "  push r10",
+    "  push r11",
+    "  call serial_irq",
     "  pop r11",
     "  pop r10",
     "  pop r9",
@@ -371,6 +399,19 @@ extern "C" {
     fn isr_spurious();
     fn isr_tlb_shootdown();
     fn isr_double_fault();
+    fn isr_serial();
+}
+
+/// Rust half of the serial RX ISR (B8). Drains every byte the UART has buffered
+/// into the console line discipline (which echoes + accumulates lines), then EOIs
+/// the PIC. Pure native — only `post`s into the console buffer; the `read_line`
+/// syscall drains it. (IRQ4 is on the master PIC.)
+#[no_mangle]
+extern "C" fn serial_irq() {
+    while let Some(b) = crate::serial::rx_byte() {
+        crate::console::feed(b);
+    }
+    crate::pic::eoi_master();
 }
 
 /// Rust half of the #DF handler (R5b). Runs on this core's IST1 stack. A double
@@ -523,6 +564,8 @@ pub fn init() {
         (*idt)[TIMER_VECTOR].set(timer, cs);
         // virtio-blk IRQ (B4).
         (*idt)[VIRTIO_BLK_VECTOR].set(isr_virtio_blk as *const () as usize as u64, cs);
+        // COM1 serial RX (B8) — the interactive console's input IRQ.
+        (*idt)[SERIAL_VECTOR].set(isr_serial as *const () as usize as u64, cs);
         // LAPIC timer (B7 Step 4) — the APs' per-core timer; the spurious vector
         // gets a present (no-op) gate so a withdrawn IRQ can't fault.
         (*idt)[LAPIC_TIMER_VECTOR].set(isr_lapic_timer as *const () as usize as u64, cs);

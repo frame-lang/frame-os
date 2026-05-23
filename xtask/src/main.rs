@@ -72,6 +72,12 @@ enum SubCmd {
     /// with `TAP=1 docker/run.sh "cargo xtask qemu-tap"`). Sets up `tap0`,
     /// boots QEMU with `-netdev tap`, pings the guest, and asserts a reply.
     QemuTap,
+
+    /// B8: boot the `interactive`-feature kernel and drive its serial console
+    /// non-interactively — wait for the shell prompt, type `/bin/hello`, then
+    /// `exit`, and assert the program ran. (`cargo xtask qemu` with the
+    /// interactive kernel is the human-typeable version.)
+    ConsoleTest,
 }
 
 fn main() -> Result<()> {
@@ -84,6 +90,7 @@ fn main() -> Result<()> {
         SubCmd::Qemu => run_qemu(),
         SubCmd::QemuTest => run_qemu_test(),
         SubCmd::QemuTap => run_qemu_tap(),
+        SubCmd::ConsoleTest => run_console_test(),
     }
 }
 
@@ -338,7 +345,11 @@ fn build_usb_disk_image() -> Vec<u8> {
 }
 
 fn prepare_qemu_artifacts(workspace: &Path) -> Result<QemuArtifacts> {
-    let kernel_elf = build_kernel(workspace)?;
+    prepare_qemu_artifacts_features(workspace, false)
+}
+
+fn prepare_qemu_artifacts_features(workspace: &Path, interactive: bool) -> Result<QemuArtifacts> {
+    let kernel_elf = build_kernel_features(workspace, interactive)?;
     let limine_dir = ensure_limine_binaries(workspace)?;
     let esp_img = build_esp_image(workspace, &kernel_elf, &limine_dir)?;
 
@@ -691,6 +702,132 @@ fn run_qemu() -> Result<()> {
     if !status.success() && status.code() != Some(33) {
         bail!("qemu exited with status: {status}");
     }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// `cargo xtask console-test` — drive the interactive shell over serial (B8)
+//
+// Boots the `interactive`-feature kernel with `-serial stdio`, then scripts a
+// session over QEMU's stdin/stdout: wait for the shell prompt, type a command,
+// read the program's output, type `exit`. A reader thread drains stdout into a
+// shared buffer so we can wait for prompts without blocking the writer.
+// ---------------------------------------------------------------------------
+
+/// Wait until `needle` appears in the shared capture buffer, or time out.
+fn wait_for_output(
+    buf: &std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+    needle: &str,
+    secs: u64,
+) -> Result<()> {
+    use std::time::{Duration, Instant};
+    let deadline = Instant::now() + Duration::from_secs(secs);
+    loop {
+        if String::from_utf8_lossy(&buf.lock().unwrap()).contains(needle) {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            bail!(
+                "console-test: timed out waiting for {:?}. Captured so far:\n---\n{}\n---",
+                needle,
+                String::from_utf8_lossy(&buf.lock().unwrap())
+            );
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+fn run_console_test() -> Result<()> {
+    use std::io::{Read, Write};
+    use std::sync::{Arc, Mutex};
+    use std::time::{Duration, Instant};
+
+    let workspace = workspace_root()?;
+    let artifacts = prepare_qemu_artifacts_features(&workspace, true)?;
+    let ovmf_vars = fresh_ovmf_vars(&artifacts, "console")?;
+    let blk_disk = fresh_blk_disk(&artifacts, "console")?;
+
+    let mut cmd = qemu_base_command(
+        &artifacts,
+        &ovmf_vars,
+        &blk_disk,
+        &NetMode::Slirp { guestfwd: false },
+    );
+    cmd.args(["-serial", "stdio"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+
+    eprintln!("console-test: booting interactive kernel...");
+    let mut child = cmd.spawn().context("failed to spawn qemu")?;
+    let mut stdin = child.stdin.take().context("no qemu stdin")?;
+    let mut stdout = child.stdout.take().context("no qemu stdout")?;
+
+    // Reader thread: drain QEMU stdout into a shared buffer until EOF.
+    let buf = Arc::new(Mutex::new(Vec::<u8>::new()));
+    let reader_buf = Arc::clone(&buf);
+    let reader = std::thread::spawn(move || {
+        let mut chunk = [0u8; 1024];
+        loop {
+            match stdout.read(&mut chunk) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => reader_buf.lock().unwrap().extend_from_slice(&chunk[..n]),
+            }
+        }
+    });
+
+    // Drive the session as a fallible block: prompt → run hello → exit. Any
+    // failure is captured (not `?`-propagated) so QEMU is always cleaned up below.
+    let drive: Result<()> = (|| {
+        wait_for_output(&buf, "frameos$ ", 45)?;
+        eprintln!("console-test: prompt is up; typing `/bin/hello`");
+        stdin.write_all(b"/bin/hello\n").context("write hello")?;
+        stdin.flush().ok();
+        wait_for_output(&buf, "hello from ELF", 20)?;
+        eprintln!("console-test: hello ran; typing `exit`");
+        stdin.write_all(b"exit\n").context("write exit")?;
+        stdin.flush().ok();
+        Ok(())
+    })();
+
+    // Bounded wait for QEMU to exit (the shell's `exit` → halt → isa-debug-exit).
+    // Polls `try_wait` so this NEVER hangs: on a drive failure or a timeout we
+    // kill QEMU rather than block forever.
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let mut status = None;
+    loop {
+        match child.try_wait() {
+            Ok(Some(s)) => {
+                status = Some(s);
+                break;
+            }
+            Ok(None) => {}
+            Err(_) => break,
+        }
+        if drive.is_err() || Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let _ = reader.join();
+    let captured = String::from_utf8_lossy(&buf.lock().unwrap()).into_owned();
+
+    // Surface a drive failure (its message includes the capture) after cleanup.
+    drive?;
+
+    if !captured.contains("hello from ELF") {
+        bail!("console-test: missing hello output. Captured:\n---\n{captured}\n---");
+    }
+    match status {
+        Some(s) if s.success() || s.code() == Some(33) => {}
+        Some(s) => bail!("console-test: qemu exited with status {s}"),
+        None => bail!(
+            "console-test: qemu did not exit after `exit` (killed). Captured:\n---\n{captured}\n---"
+        ),
+    }
+    eprintln!("console-test: PASS — typed a command and ran a program from the shell");
     Ok(())
 }
 
@@ -2080,16 +2217,23 @@ fn run_smoke_test(
 
 /// Build kernel.elf via `cargo build -p frame-os-kernel --target x86_64-unknown-none`.
 /// Returns the path to the built ELF.
-fn build_kernel(workspace: &Path) -> Result<PathBuf> {
+/// Build the kernel, optionally with the `interactive` feature (B8). The output
+/// path is the same; cargo rebuilds when the feature set changes.
+fn build_kernel_features(workspace: &Path, interactive: bool) -> Result<PathBuf> {
+    let mut args = vec![
+        "build",
+        "-p",
+        "frame-os-kernel",
+        "--target",
+        "x86_64-unknown-none",
+    ];
+    if interactive {
+        args.push("--features");
+        args.push("interactive");
+    }
     let status = Command::new("cargo")
         .current_dir(workspace)
-        .args([
-            "build",
-            "-p",
-            "frame-os-kernel",
-            "--target",
-            "x86_64-unknown-none",
-        ])
+        .args(&args)
         .status()
         .context("failed to invoke cargo for kernel build")?;
     if !status.success() {

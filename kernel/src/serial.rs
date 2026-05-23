@@ -33,6 +33,14 @@ const COM1_LINE_STATUS: u16 = COM1_BASE + 5; // line status (THRE etc.)
 /// THRE (Transmitter Holding Register Empty) bit in the Line Status
 /// Register. Set when the UART can accept another byte to transmit.
 const LSR_THRE: u8 = 0x20;
+/// Data Ready bit in the Line Status Register: a received byte is waiting (B8).
+const LSR_DATA_READY: u8 = 0x01;
+/// Interrupt Enable Register: received-data-available interrupt (B8).
+#[cfg(feature = "interactive")]
+const IER_RX_AVAIL: u8 = 0x01;
+/// Modem Control Register OUT2: gates the UART's IRQ line to the PIC (B8).
+#[cfg(feature = "interactive")]
+const MCR_OUT2: u8 = 0x08;
 
 /// Write a byte to an x86 I/O port.
 fn outb(port: u16, val: u8) {
@@ -89,6 +97,25 @@ pub fn write_byte(b: u8) {
         core::hint::spin_loop();
     }
     outb(COM1_DATA, b);
+}
+
+/// Read one received byte if the UART has data waiting (polled RX), else `None`
+/// (B8). The RX interrupt handler drains the FIFO by calling this in a loop.
+pub fn rx_byte() -> Option<u8> {
+    if inb(COM1_LINE_STATUS) & LSR_DATA_READY != 0 {
+        Some(inb(COM1_DATA))
+    } else {
+        None
+    }
+}
+
+/// Enable the COM1 received-data-available interrupt (delivered as IRQ4) and
+/// route the UART's IRQ line to the PIC by asserting OUT2 (B8). TX stays polled.
+/// Call after the IDT + PIC are up — this is what makes the console interactive.
+#[cfg(feature = "interactive")]
+pub fn enable_rx_interrupt() {
+    outb(COM1_INT_ENABLE, IER_RX_AVAIL);
+    outb(COM1_MODEM_CTRL, 0x03 | MCR_OUT2); // DTR + RTS + OUT2
 }
 
 /// Write a string to COM1, byte by byte (UTF-8 bytes).

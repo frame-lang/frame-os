@@ -74,6 +74,13 @@ static mut PENDING_EXIT: i64 = -1;
 // block + reap happens in `syscall_dispatch` after the dispatch completes.
 static mut PENDING_WAIT: bool = false;
 
+// `read_line` (B8) likewise BLOCKS until the user types a newline — which must
+// not happen inside the dispatcher handler. The handler records the user buffer
+// pointer (0 = none) + length; the blocking line read happens in
+// `syscall_dispatch` afterward, writing the byte count into the caller's frame.
+static mut PENDING_READLINE_BUF: u64 = 0;
+static mut PENDING_READLINE_LEN: u64 = 0;
+
 // The freestanding user programs (B3 Step 4), built by kernel/build.rs from
 // the `user/` crate and baked into the kernel image. `hello` prints "hello
 // from ELF" and exit(42)s; `faulter` reads kernel memory to trigger the
@@ -91,6 +98,10 @@ static USER_SHELL_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/user_sh
 // `frameshell` (B4 Step 4b) tokenizes command lines with the *same* parser.frs
 // the hosted shell uses — the "one source, two targets" demonstration.
 static USER_FRAMESHELL_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/user_frameshell.elf"));
+// `ish` (B8) is the interactive shell: a REPL reading live console input
+// (read_line) that fork+exec+waits programs — so it survives running them.
+#[cfg(feature = "interactive")]
+static USER_ISH_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/user_ish.elf"));
 
 // Scratch buffer for `exec`-from-disk: the ELF is read off the filesystem into
 // this static, then handed to the loader as a `'static` slice. Single-flight
@@ -249,6 +260,17 @@ extern "C" fn syscall_dispatch(frame: *mut TrapFrame) {
         f.rax = do_wait_loop();
     }
 
+    // Honor a pending read_line AFTER the dispatcher settles (B8): block until a
+    // console line is ready, copy it into the caller's buffer, return the length.
+    let rl_buf = unsafe { (&raw const PENDING_READLINE_BUF).read() };
+    if rl_buf != 0 {
+        let rl_len = unsafe { (&raw const PENDING_READLINE_LEN).read() };
+        unsafe {
+            (&raw mut PENDING_READLINE_BUF).write(0);
+        }
+        f.rax = do_read_line_loop(rl_buf, rl_len);
+    }
+
     // Honor a pending exit AFTER the dispatcher has returned to $Validating —
     // diverging inside the handler would leave it stuck in $Executing.
     let pending = unsafe { (&raw const PENDING_EXIT).read() };
@@ -272,7 +294,24 @@ fn proc_table() -> &'static mut ProcessTable {
 /// 0=write_char 1=exit 2=fork 3=exec(prog_id) 4=wait 5=open 6=read 7=close
 /// 8=exec(path). (B4 Step 4 added the file-I/O + exec-from-disk syscalls.)
 pub fn is_known_syscall(num: u64) -> bool {
-    num <= 8
+    num <= 9
+}
+
+/// Block until the console has a complete line, copy it into the user buffer
+/// `buf` (up to `len`), and return the byte count (B8). Runs in syscall context
+/// after the dispatcher settles. Waits interrupt-enabled so the serial RX IRQ
+/// can fill the line (and the timer can preempt); the user buffer is a VA mapped
+/// in the current address space (CR3 unchanged during a syscall).
+fn do_read_line_loop(buf: u64, len: u64) -> u64 {
+    let len = len as usize;
+    loop {
+        let dst = unsafe { core::slice::from_raw_parts_mut(buf as *mut u8, len) };
+        if let Some(n) = crate::console::take_line(dst) {
+            crate::interrupts::disable();
+            return n as u64;
+        }
+        crate::interrupts::wait_for_interrupt_enabled(); // sti + hlt; RX IRQ fills the line
+    }
 }
 
 /// The third syscall argument (rdx), read from the current trap frame. The
@@ -341,6 +380,16 @@ pub fn perform_syscall(num: u64, a0: u64, _a1: u64) -> u64 {
             0
         }
         8 => do_exec_path(a0, _a1),
+        9 => {
+            // read_line(buf_ptr=a0, len=a1) → bytes read (B8). Blocks until a
+            // line is typed; like wait, the actual block happens in
+            // syscall_dispatch after the dispatcher returns to $Validating.
+            unsafe {
+                (&raw mut PENDING_READLINE_BUF).write(a0);
+                (&raw mut PENDING_READLINE_LEN).write(_a1);
+            }
+            0
+        }
         _ => u64::MAX, // unreachable: validated by is_known_syscall
     }
 }
@@ -616,4 +665,24 @@ pub fn run() {
     // (no_std + a bump heap). It cats a quoted path (`cat "/motd"`, exercising
     // the Parser's $InQuotedString state in userspace) then execs `/bin/hello`.
     run_one(USER_FRAMESHELL_ELF, "frameshell");
+}
+
+/// Launch the interactive shell (B8). Sets up the syscall path + process table,
+/// enables the serial console's RX interrupt (IRQ4), then runs `ish` as a
+/// process. `ish` loops reading lines (its `read_line` syscall blocks in the
+/// kernel until the serial RX IRQ delivers a newline) and fork+exec+waits the
+/// programs you type; it returns here only when you type `exit`. Gated behind the
+/// `interactive` cargo feature so the default boot (and the smoke suite) is
+/// unaffected — see `kmain`.
+#[cfg(feature = "interactive")]
+pub fn run_interactive_shell() {
+    init();
+    unsafe {
+        let p = &raw mut PROC_TABLE;
+        *p = Some(ProcessTable::__create(MAX_PROCS));
+    }
+    // Turn on console input now that the IDT + PIC are up.
+    crate::serial::enable_rx_interrupt();
+    crate::pic::unmask_irq(4);
+    run_one(USER_ISH_ELF, "ish");
 }
