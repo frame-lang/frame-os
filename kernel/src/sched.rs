@@ -500,9 +500,9 @@ pub unsafe fn exec_into(new_pml4: u64) {
     let cur = (&raw const CURRENT).read();
     (*tcbs().add(cur)).pml4 = new_pml4;
     (*tcbs().add(cur)).heap_brk = USER_HEAP_BASE; // new image ⇒ fresh, empty brk heap
-    // New image ⇒ fresh FPU: reset both the live registers and the saved area to
-    // the clean template, so the old image's x87/SSE state (esp. MXCSR) can't
-    // leak into the new program before its first context switch (B11-3a).
+                                                  // New image ⇒ fresh FPU: reset both the live registers and the saved area to
+                                                  // the clean template, so the old image's x87/SSE state (esp. MXCSR) can't
+                                                  // leak into the new program before its first context switch (B11-3a).
     let c = fpu::clean();
     fpu_area(cur).write(c);
     fpu::restore(fpu_area(cur));

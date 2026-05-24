@@ -237,7 +237,14 @@ pub fn init() -> bool {
     for i in 0..NUM_RX_BUFS {
         let buf_phys = rx_bufs_phys + (i as u64) * BUF_SIZE as u64;
         unsafe {
-            set_desc(d.rx.virt, i, buf_phys, BUF_SIZE as u32, VRING_DESC_F_WRITE, 0);
+            set_desc(
+                d.rx.virt,
+                i,
+                buf_phys,
+                BUF_SIZE as u32,
+                VRING_DESC_F_WRITE,
+                0,
+            );
             avail_push(&mut d.rx, i);
         }
     }

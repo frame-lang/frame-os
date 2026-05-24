@@ -55,9 +55,9 @@ mod paging;
 mod pci;
 mod pcsched;
 mod percpu;
-mod reactor;
 mod pic;
 mod pit;
+mod reactor;
 mod rtc;
 mod sched;
 mod sched_demo;
@@ -144,7 +144,7 @@ unsafe extern "C" fn ap_entry(cpu: &limine::mp::Cpu) -> ! {
     gdt::load_on_ap(index);
     percpu::init_this_cpu(index, cpu.lapic_id);
     fpu::init_this_cpu(); // enable SSE/x87 + fninit on this AP (B11-3a)
-    // R5b: confirm this core loaded its own per-CPU TSS (so #DF uses its IST stack).
+                          // R5b: confirm this core loaded its own per-CPU TSS (so #DF uses its IST stack).
     if gdt::current_tr() == gdt::tss_selector(index) {
         AP_TSS_OK.fetch_add(1, Ordering::SeqCst);
     }
@@ -504,189 +504,189 @@ unsafe extern "C" fn kmain() -> ! {
     // straight to a shell (its minimal init is the `#[cfg(feature=…)]` block below).
     #[cfg(not(feature = "interactive"))]
     {
-    // B2 Step 1: physical frame allocator. As of Step 5 the allocator is
-    // initialized by the boot HSM's $InitMemory phase (during __create
-    // above), so kmain only runs the self-test: two distinct page-aligned
-    // frames, free restores the count, realloc after free works.
-    serial::write_str("[frames] usable frames: ");
-    serial::write_u32_decimal(frames::free_count() as u32);
-    serial::writeln("");
-    {
-        let before = frames::free_count();
-        let f1 = frames::alloc_frame().expect("frame alloc");
-        let f2 = frames::alloc_frame().expect("frame alloc");
-        if f1 != f2 && f1 % 4096 == 0 && f2 % 4096 == 0 && frames::free_count() == before - 2 {
-            serial::writeln("[frames] alloc two distinct frames: ok");
+        // B2 Step 1: physical frame allocator. As of Step 5 the allocator is
+        // initialized by the boot HSM's $InitMemory phase (during __create
+        // above), so kmain only runs the self-test: two distinct page-aligned
+        // frames, free restores the count, realloc after free works.
+        serial::write_str("[frames] usable frames: ");
+        serial::write_u32_decimal(frames::free_count() as u32);
+        serial::writeln("");
+        {
+            let before = frames::free_count();
+            let f1 = frames::alloc_frame().expect("frame alloc");
+            let f2 = frames::alloc_frame().expect("frame alloc");
+            if f1 != f2 && f1 % 4096 == 0 && f2 % 4096 == 0 && frames::free_count() == before - 2 {
+                serial::writeln("[frames] alloc two distinct frames: ok");
+            }
+            frames::free_frame(f1);
+            frames::free_frame(f2);
+            if frames::free_count() == before {
+                serial::writeln("[frames] free restores count: ok");
+            }
+            let f3 = frames::alloc_frame().expect("frame alloc");
+            frames::free_frame(f3);
+            serial::writeln("[frames] realloc after free: ok");
         }
-        frames::free_frame(f1);
-        frames::free_frame(f2);
-        if frames::free_count() == before {
-            serial::writeln("[frames] free restores count: ok");
-        }
-        let f3 = frames::alloc_frame().expect("frame alloc");
-        frames::free_frame(f3);
-        serial::writeln("[frames] realloc after free: ok");
-    }
 
-    // B2 Step 2: paging. Map a fresh frame at an unmapped test VA, write a
-    // pattern through the mapping, confirm it lands in the right physical
-    // frame (cross-checked via the HHDM), then translate and unmap.
-    {
-        const TEST_VA: u64 = 0x0000_4000_0000_0000; // 64 TiB, unmapped lower-half
-        const PATTERN: u64 = 0xDEAD_BEEF_CAFE_F00D;
-        let frame = frames::alloc_frame().expect("frame alloc");
-        unsafe {
-            paging::map(TEST_VA, frame, paging::WRITABLE);
-            let p = TEST_VA as *mut u64;
-            p.write_volatile(PATTERN);
-            let via_va = p.read_volatile();
-            let via_hhdm = (frames::phys_to_virt(frame) as *const u64).read_volatile();
-            if via_va == PATTERN && via_hhdm == PATTERN {
-                serial::writeln("[paging] map + write + read-back: ok");
+        // B2 Step 2: paging. Map a fresh frame at an unmapped test VA, write a
+        // pattern through the mapping, confirm it lands in the right physical
+        // frame (cross-checked via the HHDM), then translate and unmap.
+        {
+            const TEST_VA: u64 = 0x0000_4000_0000_0000; // 64 TiB, unmapped lower-half
+            const PATTERN: u64 = 0xDEAD_BEEF_CAFE_F00D;
+            let frame = frames::alloc_frame().expect("frame alloc");
+            unsafe {
+                paging::map(TEST_VA, frame, paging::WRITABLE);
+                let p = TEST_VA as *mut u64;
+                p.write_volatile(PATTERN);
+                let via_va = p.read_volatile();
+                let via_hhdm = (frames::phys_to_virt(frame) as *const u64).read_volatile();
+                if via_va == PATTERN && via_hhdm == PATTERN {
+                    serial::writeln("[paging] map + write + read-back: ok");
+                }
+            }
+            if paging::translate(TEST_VA) == Some(frame) {
+                serial::writeln("[paging] translate matches frame: ok");
+            }
+            unsafe {
+                paging::unmap(TEST_VA);
+            }
+            if paging::translate(TEST_VA).is_none() {
+                serial::writeln("[paging] unmap clears mapping: ok");
+            }
+            frames::free_frame(frame);
+        }
+
+        // B2 Step 4: per-process address spaces (the primitive B3 needs). Build
+        // a fresh PML4 (kernel higher-half mirrored), map a page in it that is
+        // NOT mapped in the current space, switch to it, read the page back
+        // (proving the new space's mapping is live AND the kernel survived the
+        // CR3 load), switch back, and confirm the mapping was isolated to the
+        // new space.
+        {
+            const AS_VA: u64 = 0x0000_3000_0000_0000;
+            const AS_PATTERN: u64 = 0x0bad_c0de_1337_d00d;
+            let saved = paging::current_pml4();
+            let frame = frames::alloc_frame().expect("frame alloc");
+            unsafe {
+                // Seed the frame via the HHDM (address-space independent).
+                (frames::phys_to_virt(frame) as *mut u64).write_volatile(AS_PATTERN);
+                let new_as = paging::new_address_space();
+                paging::map_in(new_as, AS_VA, frame, paging::WRITABLE);
+                paging::switch(new_as);
+                let got = (AS_VA as *const u64).read_volatile();
+                paging::switch(saved); // back to the original space
+                if got == AS_PATTERN {
+                    serial::writeln("[vm] address-space switch sees its mapping: ok");
+                }
+            }
+            // AS_VA was mapped only in the new space; the original has no such
+            // mapping → per-address-space isolation.
+            if paging::translate(AS_VA).is_none() {
+                serial::writeln("[vm] mapping isolated to its address space: ok");
+            }
+            frames::free_frame(frame);
+        }
+
+        // B1 Step 3a: prove the interrupt path with a software breakpoint. The
+        // IDT was installed by the boot HSM's $InitIDT phase; the handler prints
+        // "[int3 ok]" and `iretq`s, and "[idt] survived int3" proves we returned.
+        serial::write_str("[idt] firing int3: ");
+        interrupts::test_breakpoint();
+        serial::writeln("\n[idt] survived int3");
+
+        // B2 Step 3: demand paging via the PageFaultHandler HSM. Register a
+        // lazy region, then touch it: the access faults (#PF), the HSM
+        // classifies it $LazyFault, maps a fresh frame, and the instruction
+        // retries successfully — all driven from inside the exception handler.
+        vm::init();
+        {
+            const LAZY_VA: u64 = 0x0000_5000_0000_0000;
+            const PATTERN: u64 = 0x1234_5678_9abc_def0;
+            vm::register_lazy_region(LAZY_VA, 4096);
+            unsafe {
+                let p = LAZY_VA as *mut u64;
+                p.write_volatile(PATTERN); // first touch → #PF → demand-mapped → retry
+                if p.read_volatile() == PATTERN {
+                    serial::writeln("[#PF] demand fault recovered: ok");
+                }
             }
         }
-        if paging::translate(TEST_VA) == Some(frame) {
-            serial::writeln("[paging] translate matches frame: ok");
+
+        // B1 Step 3b: the PIC was remapped + the PIT started by the boot HSM's
+        // $InitTimer phase. Enable interrupts and wait for ~20 ticks (reaching
+        // "elapsed" proves IRQ0 fires; otherwise the hlt loop blocks forever and
+        // the smoke test times out), then disable before the cooperative demo.
+        interrupts::enable();
+        serial::writeln("[timer] waiting for ticks...");
+        let target = interrupts::ticks() + 20;
+        while interrupts::ticks() < target {
+            interrupts::wait_for_interrupt();
         }
-        unsafe {
-            paging::unmap(TEST_VA);
+        serial::writeln("[timer] 20 ticks elapsed");
+        interrupts::disable();
+
+        // B1 Step 2: demonstrate the native cooperative context switch — two
+        // kernel threads ping-pong on independent stacks and hand control back.
+        // Transitional; superseded by the preemptive scheduler below.
+        sched_demo::run();
+
+        // B1 Step 3c: real preemption. Two threads busy-loop and print without
+        // ever yielding; the timer ISR preempts them round-robin. Both digits
+        // appearing proves preemption works.
+        sched::run();
+
+        // B4 Step 1: init virtio-blk and round-trip a sector (write → IRQ → post →
+        // drain → BlockRequest), exercising the deferred-event path.
+        virtio_blk::run_demo();
+
+        // B4 Step 2: mount the FS, read a baked file, and create/write/read/delete
+        // round-trip — over the buffer cache + the Mount HSM.
+        fs::run_demo();
+
+        // B4 Step 3: open files by path through the VFS (incl. a nested directory)
+        // and exercise the OpenFile lifecycle.
+        vfs::run_demo();
+
+        // B3 Step 1b: the user/kernel boundary. Enter ring 3 running a tiny
+        // hand-crafted program that writes "AB" via syscalls and exits(42); the
+        // exit syscall longjmps back to the kernel.
+        usermode::run();
+
+        // B5 Step 1/2a: bring up virtio-net (NIC init + TX + RX + post/drain), then
+        // resolve the slirp gateway's MAC through the `ArpResolver` Frame system —
+        // the first networking Frame system + the retransmit-timer-via-enter-handler
+        // pattern.
+        net::run_demo();
+
+        // R2a: measure Frame's per-event allocation at scale — spin up 16
+        // TcpConnection FSM instances on the real kernel heap, drive each through a
+        // full lifecycle, and report allocations per dispatch.
+        tcp::scale_stress();
+
+        // B6 Step 1: bring up the xHCI USB host controller (PCI discovery + MMIO +
+        // reset + DCBAA/command-ring/event-ring setup + Run), then report any device
+        // connected on a port.
+        if xhci::init() {
+            // B6 Step 2: drive the connected port through the HubPort Frame system —
+            // connect → reset (a timed transition) → enabled, readying the device
+            // for enumeration.
+            xhci::run_port_lifecycle();
+            // B6 Step 3 / R3a: enumerate every attached device concurrently through
+            // the UsbEnumeration Frame system — Enable Slot → Address Device →
+            // GET_DESCRIPTOR → SET_CONFIGURATION, one instance per device.
+            xhci::run_enumeration();
+            // R3b: read each device's configuration descriptor and classify it (HID
+            // keyboard/mouse, mass storage), so the class-specific drivers below
+            // route by class rather than table index.
+            xhci::classify_devices();
+            // B6 Step 4: configure the keyboard's interrupt endpoint and complete one
+            // transfer (a HID key report) through the UsbTransfer Frame system.
+            xhci::run_transfer();
+            // R3b: drive the mass-storage device's SCSI commands over Bulk-Only
+            // Transport through the UsbMsd Frame system.
+            xhci::run_msd();
         }
-        if paging::translate(TEST_VA).is_none() {
-            serial::writeln("[paging] unmap clears mapping: ok");
-        }
-        frames::free_frame(frame);
-    }
-
-    // B2 Step 4: per-process address spaces (the primitive B3 needs). Build
-    // a fresh PML4 (kernel higher-half mirrored), map a page in it that is
-    // NOT mapped in the current space, switch to it, read the page back
-    // (proving the new space's mapping is live AND the kernel survived the
-    // CR3 load), switch back, and confirm the mapping was isolated to the
-    // new space.
-    {
-        const AS_VA: u64 = 0x0000_3000_0000_0000;
-        const AS_PATTERN: u64 = 0x0bad_c0de_1337_d00d;
-        let saved = paging::current_pml4();
-        let frame = frames::alloc_frame().expect("frame alloc");
-        unsafe {
-            // Seed the frame via the HHDM (address-space independent).
-            (frames::phys_to_virt(frame) as *mut u64).write_volatile(AS_PATTERN);
-            let new_as = paging::new_address_space();
-            paging::map_in(new_as, AS_VA, frame, paging::WRITABLE);
-            paging::switch(new_as);
-            let got = (AS_VA as *const u64).read_volatile();
-            paging::switch(saved); // back to the original space
-            if got == AS_PATTERN {
-                serial::writeln("[vm] address-space switch sees its mapping: ok");
-            }
-        }
-        // AS_VA was mapped only in the new space; the original has no such
-        // mapping → per-address-space isolation.
-        if paging::translate(AS_VA).is_none() {
-            serial::writeln("[vm] mapping isolated to its address space: ok");
-        }
-        frames::free_frame(frame);
-    }
-
-    // B1 Step 3a: prove the interrupt path with a software breakpoint. The
-    // IDT was installed by the boot HSM's $InitIDT phase; the handler prints
-    // "[int3 ok]" and `iretq`s, and "[idt] survived int3" proves we returned.
-    serial::write_str("[idt] firing int3: ");
-    interrupts::test_breakpoint();
-    serial::writeln("\n[idt] survived int3");
-
-    // B2 Step 3: demand paging via the PageFaultHandler HSM. Register a
-    // lazy region, then touch it: the access faults (#PF), the HSM
-    // classifies it $LazyFault, maps a fresh frame, and the instruction
-    // retries successfully — all driven from inside the exception handler.
-    vm::init();
-    {
-        const LAZY_VA: u64 = 0x0000_5000_0000_0000;
-        const PATTERN: u64 = 0x1234_5678_9abc_def0;
-        vm::register_lazy_region(LAZY_VA, 4096);
-        unsafe {
-            let p = LAZY_VA as *mut u64;
-            p.write_volatile(PATTERN); // first touch → #PF → demand-mapped → retry
-            if p.read_volatile() == PATTERN {
-                serial::writeln("[#PF] demand fault recovered: ok");
-            }
-        }
-    }
-
-    // B1 Step 3b: the PIC was remapped + the PIT started by the boot HSM's
-    // $InitTimer phase. Enable interrupts and wait for ~20 ticks (reaching
-    // "elapsed" proves IRQ0 fires; otherwise the hlt loop blocks forever and
-    // the smoke test times out), then disable before the cooperative demo.
-    interrupts::enable();
-    serial::writeln("[timer] waiting for ticks...");
-    let target = interrupts::ticks() + 20;
-    while interrupts::ticks() < target {
-        interrupts::wait_for_interrupt();
-    }
-    serial::writeln("[timer] 20 ticks elapsed");
-    interrupts::disable();
-
-    // B1 Step 2: demonstrate the native cooperative context switch — two
-    // kernel threads ping-pong on independent stacks and hand control back.
-    // Transitional; superseded by the preemptive scheduler below.
-    sched_demo::run();
-
-    // B1 Step 3c: real preemption. Two threads busy-loop and print without
-    // ever yielding; the timer ISR preempts them round-robin. Both digits
-    // appearing proves preemption works.
-    sched::run();
-
-    // B4 Step 1: init virtio-blk and round-trip a sector (write → IRQ → post →
-    // drain → BlockRequest), exercising the deferred-event path.
-    virtio_blk::run_demo();
-
-    // B4 Step 2: mount the FS, read a baked file, and create/write/read/delete
-    // round-trip — over the buffer cache + the Mount HSM.
-    fs::run_demo();
-
-    // B4 Step 3: open files by path through the VFS (incl. a nested directory)
-    // and exercise the OpenFile lifecycle.
-    vfs::run_demo();
-
-    // B3 Step 1b: the user/kernel boundary. Enter ring 3 running a tiny
-    // hand-crafted program that writes "AB" via syscalls and exits(42); the
-    // exit syscall longjmps back to the kernel.
-    usermode::run();
-
-    // B5 Step 1/2a: bring up virtio-net (NIC init + TX + RX + post/drain), then
-    // resolve the slirp gateway's MAC through the `ArpResolver` Frame system —
-    // the first networking Frame system + the retransmit-timer-via-enter-handler
-    // pattern.
-    net::run_demo();
-
-    // R2a: measure Frame's per-event allocation at scale — spin up 16
-    // TcpConnection FSM instances on the real kernel heap, drive each through a
-    // full lifecycle, and report allocations per dispatch.
-    tcp::scale_stress();
-
-    // B6 Step 1: bring up the xHCI USB host controller (PCI discovery + MMIO +
-    // reset + DCBAA/command-ring/event-ring setup + Run), then report any device
-    // connected on a port.
-    if xhci::init() {
-        // B6 Step 2: drive the connected port through the HubPort Frame system —
-        // connect → reset (a timed transition) → enabled, readying the device
-        // for enumeration.
-        xhci::run_port_lifecycle();
-        // B6 Step 3 / R3a: enumerate every attached device concurrently through
-        // the UsbEnumeration Frame system — Enable Slot → Address Device →
-        // GET_DESCRIPTOR → SET_CONFIGURATION, one instance per device.
-        xhci::run_enumeration();
-        // R3b: read each device's configuration descriptor and classify it (HID
-        // keyboard/mouse, mass storage), so the class-specific drivers below
-        // route by class rather than table index.
-        xhci::classify_devices();
-        // B6 Step 4: configure the keyboard's interrupt endpoint and complete one
-        // transfer (a HID key report) through the UsbTransfer Frame system.
-        xhci::run_transfer();
-        // R3b: drive the mass-storage device's SCSI commands over Bulk-Only
-        // Transport through the UsbMsd Frame system.
-        xhci::run_msd();
-    }
     } // end of the B0–B6 self-test demos (default build only)
 
     // B2 Step 3 (fatal path): deliberately fault on an unmapped, non-lazy

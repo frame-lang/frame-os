@@ -55,10 +55,10 @@ const USBSTS_CNR: u32 = 1 << 11; // Controller Not Ready
 const PORTSC_CCS: u32 = 1 << 0; // Current Connect Status
 const PORTSC_PED: u32 = 1 << 1; // Port Enabled/Disabled
 const PORTSC_PR: u32 = 1 << 4; // Port Reset
-// PORTSC change bits (17–23: CSC, PEC, WRC, OCC, PRC, PLC, CEC) are write-1-to-
-// clear. They must be written as 0 when we want to *preserve* them, and PED
-// (also write-1-to-disable) written as 0 so a register write doesn't disable the
-// port. This mask is the set we steer around / clear explicitly.
+                               // PORTSC change bits (17–23: CSC, PEC, WRC, OCC, PRC, PLC, CEC) are write-1-to-
+                               // clear. They must be written as 0 when we want to *preserve* them, and PED
+                               // (also write-1-to-disable) written as 0 so a register write doesn't disable the
+                               // port. This mask is the set we steer around / clear explicitly.
 const PORTSC_CHANGES: u32 = 0x00FE_0000;
 
 /// Reset-settle cap, in PIT ticks (100 Hz). QEMU completes a port reset in a
@@ -80,7 +80,7 @@ const RING_TRBS: usize = 256; // TRBs per ring segment (one page: 256 * 16 = 409
 pub struct Xhci {
     #[allow(dead_code)]
     base: *mut u8, // MMIO BAR base (capability registers)
-    op: *mut u8,   // operational registers (base + CAPLENGTH)
+    op: *mut u8, // operational registers (base + CAPLENGTH)
     #[allow(dead_code)]
     runtime: *mut u8, // runtime registers (base + RTSOFF); used by later B6 steps
     #[allow(dead_code)]
@@ -459,7 +459,7 @@ fn write_link_trb(ring_phys: u64, target: u64) {
     unsafe {
         write_volatile(last as *mut u64, target); // ring segment pointer
         write_volatile(last.add(8) as *mut u32, 0); // status
-        // TRB type 6 (Link) << 10, Toggle Cycle (bit 1), Cycle (bit 0).
+                                                    // TRB type 6 (Link) << 10, Toggle Cycle (bit 1), Cycle (bit 0).
         write_volatile(last.add(12) as *mut u32, (6 << 10) | (1 << 1) | 1);
     }
 }
@@ -514,7 +514,10 @@ impl Xhci {
         if self.cmd_enqueue >= RING_TRBS - 1 {
             let link = unsafe { ring.add((RING_TRBS - 1) * TRB_SIZE) };
             unsafe {
-                write_volatile(link.add(12) as *mut u32, (6 << 10) | (1 << 1) | self.cmd_pcs)
+                write_volatile(
+                    link.add(12) as *mut u32,
+                    (6 << 10) | (1 << 1) | self.cmd_pcs,
+                )
             };
             self.cmd_enqueue = 0;
             self.cmd_pcs ^= 1;
@@ -588,7 +591,9 @@ impl Xhci {
     /// Number of connected ports (for the bring-up smoke oracle).
     #[allow(dead_code)]
     pub fn connected_count(&self) -> u32 {
-        (1..=self.max_ports).filter(|&p| self.port_connected(p)).count() as u32
+        (1..=self.max_ports)
+            .filter(|&p| self.port_connected(p))
+            .count() as u32
     }
 }
 
@@ -762,16 +767,22 @@ pub fn address_device(slot: u8) {
     let cs = if x.ctx_64 { 64usize } else { 32 };
 
     // Output device context → DCBAA[slot].
-    let Some(devctx) = alloc_zeroed_page() else { return };
+    let Some(devctx) = alloc_zeroed_page() else {
+        return;
+    };
     let dcbaa = frames::phys_to_virt(x.dcbaa_phys) as *mut u64;
     unsafe { write_volatile(dcbaa.add(slot as usize), devctx) };
 
     // EP0 transfer ring (with a Link TRB back to its start).
-    let Some(ep0) = alloc_zeroed_page() else { return };
+    let Some(ep0) = alloc_zeroed_page() else {
+        return;
+    };
     write_link_trb(ep0, ep0);
 
     // Input context: Input Control Context + Slot Context + EP0 Context.
-    let Some(ictx) = alloc_zeroed_page() else { return };
+    let Some(ictx) = alloc_zeroed_page() else {
+        return;
+    };
     let v = frames::phys_to_virt(ictx);
     unsafe {
         // Input Control Context: Add Context flags A0 (slot) | A1 (EP0).
@@ -862,7 +873,12 @@ pub fn get_device_descriptor(slot: u8) {
     let d1 = 18 << 16; // wIndex=0, wLength=18
     enqueue_ep0(d0, d1, 8, (TRB_SETUP_STAGE << 10) | TRB_IDT | TRT_IN);
     // Data Stage (IN): the 18-byte descriptor into `buf`.
-    enqueue_ep0(buf as u32, (buf >> 32) as u32, 18, (TRB_DATA_STAGE << 10) | TRB_DIR_IN);
+    enqueue_ep0(
+        buf as u32,
+        (buf >> 32) as u32,
+        18,
+        (TRB_DATA_STAGE << 10) | TRB_DIR_IN,
+    );
     // Status Stage (OUT for an IN data stage), interrupt on completion.
     enqueue_ep0(0, 0, 0, (TRB_STATUS_STAGE << 10) | TRB_IOC);
 
@@ -895,7 +911,7 @@ pub fn set_configuration(slot: u8) {
     // (SET_CONFIGURATION), wValue=1 (configuration value), wLength=0.
     let d0 = (9 << 8) | (1 << 16);
     enqueue_ep0(d0, 0, 8, (TRB_SETUP_STAGE << 10) | TRB_IDT); // TRT = No Data
-    // Status Stage (IN when there's no data stage), interrupt on completion.
+                                                              // Status Stage (IN when there's no data stage), interrupt on completion.
     enqueue_ep0(0, 0, 0, (TRB_STATUS_STAGE << 10) | TRB_DIR_IN | TRB_IOC);
 
     if let Some(x) = controller() {
@@ -927,7 +943,9 @@ fn configure_endpoint(slot: u8) {
     let speed = (x.portsc(port) >> 10) & 0xF;
     let cs = if x.ctx_64 { 64usize } else { 32 };
 
-    let Some(ep1) = alloc_zeroed_page() else { return };
+    let Some(ep1) = alloc_zeroed_page() else {
+        return;
+    };
     write_link_trb(ep1, ep1);
     unsafe {
         let d = curdev();
@@ -936,7 +954,9 @@ fn configure_endpoint(slot: u8) {
         (*d).ep1_pcs = 1;
     }
 
-    let Some(ictx) = alloc_zeroed_page() else { return };
+    let Some(ictx) = alloc_zeroed_page() else {
+        return;
+    };
     let v = frames::phys_to_virt(ictx);
     unsafe {
         // Input Control Context: Add A0 (slot — to bump Context Entries) + A3
@@ -1000,8 +1020,11 @@ pub fn queue_interrupt_in() {
         write_volatile(trb as *mut u32, buf as u32);
         write_volatile(trb.add(4) as *mut u32, (buf >> 32) as u32);
         write_volatile(trb.add(8) as *mut u32, 8); // TRB Transfer Length
-        // Normal, Interrupt-On-Completion (1<<5), Interrupt-on-Short-Packet (1<<2).
-        write_volatile(trb.add(12) as *mut u32, (TRB_NORMAL << 10) | (1 << 5) | (1 << 2) | pcs);
+                                                   // Normal, Interrupt-On-Completion (1<<5), Interrupt-on-Short-Packet (1<<2).
+        write_volatile(
+            trb.add(12) as *mut u32,
+            (TRB_NORMAL << 10) | (1 << 5) | (1 << 2) | pcs,
+        );
     }
     unsafe {
         (*d).ep1_enqueue = enq + 1;
@@ -1291,7 +1314,8 @@ fn classify_device(i: usize) -> bool {
     // class/protocol (class 0 is the "not yet seen" sentinel — never a real
     // interface class) and any bulk endpoint addresses.
     let v = frames::phys_to_virt(buf);
-    let total = (unsafe { read_volatile(v.add(2) as *const u16) } as usize).min(CONFIG_DESC_LEN as usize);
+    let total =
+        (unsafe { read_volatile(v.add(2) as *const u16) } as usize).min(CONFIG_DESC_LEN as usize);
     let mut off = unsafe { read_volatile(v) } as usize; // skip the config descriptor itself
     while off + 2 <= total {
         let blen = unsafe { read_volatile(v.add(off)) } as usize;
@@ -1447,8 +1471,12 @@ fn configure_bulk_endpoints(i: usize) {
     let out_dci = dci_of(out_ep);
     let max_dci = in_dci.max(out_dci);
 
-    let Some(in_ring) = alloc_zeroed_page() else { return };
-    let Some(out_ring) = alloc_zeroed_page() else { return };
+    let Some(in_ring) = alloc_zeroed_page() else {
+        return;
+    };
+    let Some(out_ring) = alloc_zeroed_page() else {
+        return;
+    };
     write_link_trb(in_ring, in_ring);
     write_link_trb(out_ring, out_ring);
     unsafe {
@@ -1461,7 +1489,9 @@ fn configure_bulk_endpoints(i: usize) {
         (*d).bulk_out_pcs = 1;
     }
 
-    let Some(ictx) = alloc_zeroed_page() else { return };
+    let Some(ictx) = alloc_zeroed_page() else {
+        return;
+    };
     let v = frames::phys_to_virt(ictx);
     unsafe {
         // Input Control Context: Add A0 (slot) | A(in_dci) | A(out_dci).
@@ -1510,7 +1540,11 @@ fn enqueue_bulk(is_in: bool, buf: u64, len: u32) {
         if is_in {
             ((*d).bulk_in_ring_phys, (*d).bulk_in_enq, (*d).bulk_in_pcs)
         } else {
-            ((*d).bulk_out_ring_phys, (*d).bulk_out_enq, (*d).bulk_out_pcs)
+            (
+                (*d).bulk_out_ring_phys,
+                (*d).bulk_out_enq,
+                (*d).bulk_out_pcs,
+            )
         }
     };
     let ring = frames::phys_to_virt(ring_phys);
@@ -1527,7 +1561,10 @@ fn enqueue_bulk(is_in: bool, buf: u64, len: u32) {
         write_volatile(trb as *mut u32, buf as u32);
         write_volatile(trb.add(4) as *mut u32, (buf >> 32) as u32);
         write_volatile(trb.add(8) as *mut u32, len);
-        write_volatile(trb.add(12) as *mut u32, (TRB_NORMAL << 10) | (1 << 5) | isp | pcs);
+        write_volatile(
+            trb.add(12) as *mut u32,
+            (TRB_NORMAL << 10) | (1 << 5) | isp | pcs,
+        );
     }
     unsafe {
         if is_in {
@@ -1546,9 +1583,11 @@ pub fn msd_send_cbw(cmd: u8) {
     // Allocate the BOT DMA buffers once (per device).
     unsafe {
         if (*curdev()).cbw_buf_phys == 0 {
-            let (Some(c), Some(dbuf), Some(s)) =
-                (alloc_zeroed_page(), alloc_zeroed_page(), alloc_zeroed_page())
-            else {
+            let (Some(c), Some(dbuf), Some(s)) = (
+                alloc_zeroed_page(),
+                alloc_zeroed_page(),
+                alloc_zeroed_page(),
+            ) else {
                 return;
             };
             (*curdev()).cbw_buf_phys = c;

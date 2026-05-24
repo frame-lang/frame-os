@@ -100,7 +100,11 @@ impl PciDevice {
     /// 3 bytes of the class-code dword).
     pub fn class_code(&self) -> (u8, u8, u8) {
         let v = self.read_u32(0x08);
-        (((v >> 24) & 0xFF) as u8, ((v >> 16) & 0xFF) as u8, ((v >> 8) & 0xFF) as u8)
+        (
+            ((v >> 24) & 0xFF) as u8,
+            ((v >> 16) & 0xFF) as u8,
+            ((v >> 8) & 0xFF) as u8,
+        )
     }
 }
 

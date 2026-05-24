@@ -57,7 +57,7 @@ static mut BUF: [u8; REASM_MAX] = [0; REASM_MAX]; // reassembled payload
 static mut COVERAGE: [u8; REASM_MAX / 8] = [0; REASM_MAX / 8]; // 1 bit per payload byte
 static mut SAVED_HDR: [u8; ETH_HDR + IP_HDR] = [0; ETH_HDR + IP_HDR]; // first fragment's Eth+IP header
 static mut CUR_PAYLOAD: [u8; REASM_MAX] = [0; REASM_MAX]; // current fragment's payload, for store()
-// The reconstructed full Ethernet frame (Eth + IP + payload) handed to net.
+                                                          // The reconstructed full Ethernet frame (Eth + IP + payload) handed to net.
 static mut FULL_FRAME: [u8; ETH_HDR + IP_HDR + REASM_MAX] = [0; ETH_HDR + IP_HDR + REASM_MAX];
 
 fn reasm() -> &'static mut IpReassembly {
@@ -216,7 +216,8 @@ pub fn store(frag: Fragment) {
 /// total length is known) and every payload byte `[0, total)` has arrived.
 pub fn is_complete() -> bool {
     unsafe {
-        (&raw const TOTAL_KNOWN).read() && (&raw const COVERED).read() == (&raw const TOTAL_LEN).read()
+        (&raw const TOTAL_KNOWN).read()
+            && (&raw const COVERED).read() == (&raw const TOTAL_LEN).read()
     }
 }
 

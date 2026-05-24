@@ -620,7 +620,12 @@ fn build_user_disk_elf(workspace: &Path, bin: &str) -> Result<Vec<u8>> {
         .env_remove("RUSTC_WRAPPER")
         .args(["build", "--release", "--bin", bin])
         .status()
-        .with_context(|| format!("failed to invoke cargo for user crate at {}", user_dir.display()))?;
+        .with_context(|| {
+            format!(
+                "failed to invoke cargo for user crate at {}",
+                user_dir.display()
+            )
+        })?;
     if !status.success() {
         bail!("user `{bin}` build failed");
     }
@@ -640,7 +645,10 @@ fn build_user_disk_elf(workspace: &Path, bin: &str) -> Result<Vec<u8>> {
 fn build_libc_cshims(workspace: &Path, include: &Path, out_dir: &Path) -> Result<Vec<PathBuf>> {
     let csrc = workspace.join("libc").join("csrc");
     let mut objs = Vec::new();
-    for name in ["strtold"] {
+    // C shims that complete the frame-libc surface (currently just `strtold`,
+    // which Rust can't express). A slice so the set can grow without churn.
+    const SHIMS: &[&str] = &["strtold"];
+    for name in SHIMS {
         let src = csrc.join(format!("{name}.c"));
         let obj = out_dir.join(format!("libc_{name}.o"));
         let status = Command::new("x86_64-linux-gnu-gcc")
@@ -667,13 +675,6 @@ fn build_libc_cshims(workspace: &Path, include: &Path, out_dir: &Path) -> Result
     Ok(objs)
 }
 
-/// Cross-compile a C program in `csrc/<name>.c` against frame-libc and return
-/// the Frame-OS ELF bytes (B11-2). Three steps, all in the container:
-///   1. build frame-os-libc as a staticlib (`libframe_os_libc.a`);
-///   2. `gcc -ffreestanding -nostdlib …` compile the C to an object;
-///   3. `ld` link the object + the `.a` with the user linker script (ENTRY
-///      `_start` comes from the libc's crt0) into a non-PIE ET_EXEC.
-/// This is exactly the toolchain flow tcc will perform on-device at B11-3.
 /// Build frame-os-libc as a staticlib and return the path to its
 /// `libframe_os_libc.a`. Shared by every C program build (chello, tcc): the `.a`
 /// is the C/POSIX runtime + crt0 they link against. The nested cargo scrubs the
@@ -725,6 +726,14 @@ fn build_libc_staticlib_features(workspace: &Path, subdir: &str, crt0: bool) -> 
         .join("libframe_os_libc.a"))
 }
 
+/// Cross-compile a C program in `csrc/<name>.c` against frame-libc and return
+/// the Frame-OS ELF bytes (B11-2). Three steps, all in the container:
+///   1. build frame-os-libc as a staticlib (`libframe_os_libc.a`);
+///   2. `gcc -ffreestanding -nostdlib …` compile the C to an object;
+///   3. `ld` link the object + the `.a` with the user linker script (ENTRY
+///      `_start` comes from the libc's crt0) into a non-PIE ET_EXEC.
+///
+/// This is exactly the toolchain flow tcc will perform on-device at B11-3.
 fn build_c_disk_elf(workspace: &Path, name: &str) -> Result<Vec<u8>> {
     // 1. frame-os-libc staticlib (shared with the tcc build).
     let libc_dir = workspace.join("libc");
@@ -888,7 +897,10 @@ fn build_tcc_disk_elf(workspace: &Path) -> Result<Vec<u8>> {
     for shim in &shims {
         ld.arg(shim);
     }
-    let status = ld.arg(&lib_a).status().context("failed to invoke ld for tcc")?;
+    let status = ld
+        .arg(&lib_a)
+        .status()
+        .context("failed to invoke ld for tcc")?;
     if !status.success() {
         bail!("ld link of tcc failed");
     }
@@ -1063,8 +1075,8 @@ fn build_fhello_c(workspace: &Path) -> Result<Vec<u8>> {
         bail!("framec -l c failed for frame/hello.frs");
     }
     let gen = out_dir.join("hello.c");
-    let mut c = std::fs::read(&gen)
-        .with_context(|| format!("framec did not produce {}", gen.display()))?;
+    let mut c =
+        std::fs::read(&gen).with_context(|| format!("framec did not produce {}", gen.display()))?;
     // Append the C main harness (concatenated, so it uses the generated prefix).
     let main_c = workspace.join("csrc").join("fhello_main.c");
     c.push(b'\n');
@@ -1419,7 +1431,11 @@ fn run_console_test() -> Result<()> {
         stdin.flush().ok();
         // No-arg buildc defaults to /hello.c; output path is now derived
         // (/hello.c -> /hello.elf), proving the BuildDriver pipeline end to end.
-        wait_for_output(&buf, "[build] pipeline ok; /hello.elf exited with code 7", 90)?;
+        wait_for_output(
+            &buf,
+            "[build] pipeline ok; /hello.elf exited with code 7",
+            90,
+        )?;
         // B11-3 follow-up: `buildc <src>` takes the source path from argv. Build
         // a *different* source (/hi.c -> /hi.elf, exit 3) to prove it's argv, not
         // a hardcoded /hello.c.
@@ -1435,7 +1451,11 @@ fn run_console_test() -> Result<()> {
         eprintln!("console-test: typing `/bin/fhello`  (Frame→Rust)");
         stdin.write_all(b"/bin/fhello\n").context("write fhello")?;
         stdin.flush().ok();
-        wait_for_output(&buf, "fhello: hello from a Frame system, transpiled to Rust!", 20)?;
+        wait_for_output(
+            &buf,
+            "fhello: hello from a Frame system, transpiled to Rust!",
+            20,
+        )?;
         // (2) The C half: buildc compiles /fhello.c — the SAME hello.frs run
         // through `framec -l c` — with the on-device tcc, then runs it. Its
         // message proves the framec-generated C compiled + ran; buildc reports the
@@ -1445,8 +1465,16 @@ fn run_console_test() -> Result<()> {
             .write_all(b"/bin/buildc /fhello.c\n")
             .context("write buildc /fhello.c")?;
         stdin.flush().ok();
-        wait_for_output(&buf, "fhello: hello from a Frame system, transpiled to C!", 120)?;
-        wait_for_output(&buf, "[build] pipeline ok; /fhello.elf exited with code 0", 120)?;
+        wait_for_output(
+            &buf,
+            "fhello: hello from a Frame system, transpiled to C!",
+            120,
+        )?;
+        wait_for_output(
+            &buf,
+            "[build] pipeline ok; /fhello.elf exited with code 0",
+            120,
+        )?;
         // B11-3 follow-up: assert() is a real abort, not a no-op. Compile and run
         // /assert.c (a deliberately-false assert); __assert_fail prints the
         // diagnostic to the console and abort()s before the program's printf, so
@@ -1457,7 +1485,11 @@ fn run_console_test() -> Result<()> {
             .write_all(b"/bin/tcc -B/usr/lib/tcc -static /assert.c -o /assert.elf\n/assert.elf\n")
             .context("write tcc assert compile + run")?;
         stdin.flush().ok();
-        wait_for_output(&buf, "/assert.c:15: main: Assertion `answer == 42' failed.", 90)?;
+        wait_for_output(
+            &buf,
+            "/assert.c:15: main: Assertion `answer == 42' failed.",
+            90,
+        )?;
         eprintln!("console-test: C program ran on Frame OS; typing `exit`");
         stdin.write_all(b"exit\n").context("write exit")?;
         stdin.flush().ok();
@@ -1565,7 +1597,9 @@ fn run_qemu_tap() -> Result<()> {
     let serial_path = artifacts.qemu_dir.join("serial-tap.txt");
     let _ = std::fs::remove_file(&serial_path);
 
-    tap_setup().context("TAP setup failed — run via `TAP=1 docker/run.sh` (needs NET_ADMIN + /dev/net/tun)")?;
+    tap_setup().context(
+        "TAP setup failed — run via `TAP=1 docker/run.sh` (needs NET_ADMIN + /dev/net/tun)",
+    )?;
     // Ensure the TAP device is torn down no matter how we exit below.
     let result = run_qemu_tap_inner(&artifacts, &ovmf_vars, &blk_disk, &serial_path);
     tap_teardown();
@@ -1606,7 +1640,11 @@ fn run_qemu_tap_inner(
     let mut frag_ping = false;
     let deadline = Instant::now() + Duration::from_secs(45);
     loop {
-        if child.try_wait().context("failed to poll qemu process")?.is_some() {
+        if child
+            .try_wait()
+            .context("failed to poll qemu process")?
+            .is_some()
+        {
             break; // kernel halted (serve window closed)
         }
         if !small_ping {
@@ -2251,11 +2289,7 @@ const SMOKE_TESTS: &[SmokeTest] = &[
         // the oracle — it's logged only when the guest completes the handshake.
         name: "tcp_handshake_b5",
         expect_contains: &["[tcp] listening on :7", "[tcp] established"],
-        expect_absent: &[
-            "KERNEL EXCEPTION",
-            "KERNEL PANIC",
-            "triple fault",
-        ],
+        expect_absent: &["KERNEL EXCEPTION", "KERNEL PANIC", "triple fault"],
         // The serve loop waits a few seconds for the client; give it headroom.
         timeout_secs: 30,
     },
@@ -2266,11 +2300,7 @@ const SMOKE_TESTS: &[SmokeTest] = &[
         // harness reading it, gated in run_qemu_once); then the kernel actively
         // closes, driving $FinWait1 → $TimeWait → (2·MSL timer) → $Closed.
         name: "tcp_echo_b5",
-        expect_contains: &[
-            "[tcp] established",
-            "[tcp] echoed 18 bytes",
-            "[tcp] closed",
-        ],
+        expect_contains: &["[tcp] established", "[tcp] echoed 18 bytes", "[tcp] closed"],
         expect_absent: &["KERNEL EXCEPTION", "KERNEL PANIC", "triple fault"],
         timeout_secs: 30,
     },
@@ -2322,10 +2352,7 @@ const SMOKE_TESTS: &[SmokeTest] = &[
         // it, stands up the DCBAA/command-ring/event-ring, sets Run, and detects
         // the attached usb-kbd connected on a port.
         name: "usb_controller_b6",
-        expect_contains: &[
-            "[usb] xHCI running",
-            "[usb] device connected on port",
-        ],
+        expect_contains: &["[usb] xHCI running", "[usb] device connected on port"],
         expect_absent: &["KERNEL EXCEPTION", "KERNEL PANIC", "triple fault"],
         timeout_secs: 30,
     },
@@ -2334,10 +2361,7 @@ const SMOKE_TESTS: &[SmokeTest] = &[
         // connect → reset (a timed transition: PORTSC.PR + a settle deadline) →
         // enabled. The keyboard lands on port 5 in this qemu-xhci/q35 config.
         name: "usb_port_reset_b6",
-        expect_contains: &[
-            "[usb] resetting port 5",
-            "[usb] port 5 enabled",
-        ],
+        expect_contains: &["[usb] resetting port 5", "[usb] port 5 enabled"],
         expect_absent: &["KERNEL EXCEPTION", "KERNEL PANIC", "triple fault"],
         timeout_secs: 30,
     },
@@ -2770,10 +2794,7 @@ fn run_qemu_once(
                 let serving = std::fs::read_to_string(serial_path)
                     .map(|s| s.contains("[tcp] listening on :7"))
                     .unwrap_or(false);
-                if matches!(tcp_probe, TcpProbe::Handshake | TcpProbe::Echo)
-                    && !probed
-                    && serving
-                {
+                if matches!(tcp_probe, TcpProbe::Handshake | TcpProbe::Echo) && !probed && serving {
                     let addr = std::net::SocketAddr::from(([127, 0, 0, 1], TCP_PROBE_PORT));
                     if let Ok(mut stream) =
                         std::net::TcpStream::connect_timeout(&addr, Duration::from_millis(500))
@@ -2813,9 +2834,10 @@ fn run_qemu_once(
                         let mut streams: Vec<std::net::TcpStream> = Vec::new();
                         for &port in &MULTI_HOST_PORTS {
                             let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
-                            if let Ok(s) =
-                                std::net::TcpStream::connect_timeout(&addr, Duration::from_millis(500))
-                            {
+                            if let Ok(s) = std::net::TcpStream::connect_timeout(
+                                &addr,
+                                Duration::from_millis(500),
+                            ) {
                                 streams.push(s);
                             }
                         }

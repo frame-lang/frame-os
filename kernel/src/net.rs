@@ -548,7 +548,6 @@ pub fn run_demo() {
     tcp_connect();
 }
 
-
 /// Serve inbound traffic for a bounded window: pump RX through the RxPipeline,
 /// whose $Arp/$Icmp leaves answer who-has-10.0.2.15 and echo-request-to-us (the
 /// `send_arp_reply`/`send_icmp_echo_reply` responders). Used on the TAP path so

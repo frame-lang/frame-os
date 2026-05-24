@@ -61,7 +61,10 @@ fn timeouts_to_the_cap_fail() {
     }
     assert!(a.is_failed(), "gave up after the retry cap");
     assert!(!a.is_resolved());
-    assert!(net::failed(), "arp_on_failed() fired via $Failed's enter handler");
+    assert!(
+        net::failed(),
+        "arp_on_failed() fired via $Failed's enter handler"
+    );
     // Five attempts' worth of requests were sent (1 construct + 4 retransmits).
     assert_eq!(net::requests_sent(), 5);
 }

@@ -71,7 +71,10 @@ fn active_open_sends_syn_and_goes_syn_sent() {
     c.open_active();
     assert_eq!(c.state(), "SynSent");
     assert!(tcp::fired("send_syn"));
-    assert!(tcp::fired("arm_retransmit"), "SynSent arms the retransmit timer");
+    assert!(
+        tcp::fired("arm_retransmit"),
+        "SynSent arms the retransmit timer"
+    );
 }
 
 #[test]
@@ -219,6 +222,10 @@ fn syn_received_timeout_retransmits_the_syn_ack() {
     c.segment(syn()); // -> SynReceived (send_syn_ack)
     tcp::reset();
     c.timeout(); // retransmit timer fired before the peer's ACK
-    assert_eq!(c.state(), "SynReceived", "stays in SynReceived on a retransmit");
+    assert_eq!(
+        c.state(),
+        "SynReceived",
+        "stays in SynReceived on a retransmit"
+    );
     assert!(tcp::fired("send_syn_ack"));
 }

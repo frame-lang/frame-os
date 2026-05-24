@@ -22,13 +22,13 @@ use crate::{frames, paging};
 
 const PAGE: u64 = 4096;
 const USER_STACK_VA: u64 = 0x0000_0000_2000_0000; // proven-free user VA
-// User stack size in pages. One page (4 KiB) sufficed through B10, but the
-// on-device C compiler (tcc, B11-3) is a recursive-descent parser with large
-// local buffers and easily blows a 4 KiB stack. 32 pages (128 KiB) gives it
-// generous headroom; the stack region [VA, VA + 32*PAGE) sits far below the
-// brk heap (0x3000_0000) and above the program image (0x1000_0000), so it
-// can't collide with either. Uniform for every program — small programs simply
-// don't touch the extra pages (they're mapped lazily-zeroed at load).
+                                                  // User stack size in pages. One page (4 KiB) sufficed through B10, but the
+                                                  // on-device C compiler (tcc, B11-3) is a recursive-descent parser with large
+                                                  // local buffers and easily blows a 4 KiB stack. 32 pages (128 KiB) gives it
+                                                  // generous headroom; the stack region [VA, VA + 32*PAGE) sits far below the
+                                                  // brk heap (0x3000_0000) and above the program image (0x1000_0000), so it
+                                                  // can't collide with either. Uniform for every program — small programs simply
+                                                  // don't touch the extra pages (they're mapped lazily-zeroed at load).
 const USER_STACK_PAGES: u64 = 32;
 // Pages we can roll back on a *failed* load (the $Failed funnel calls
 // `cleanup`). Sized to cover the largest program we load (tcc: ~104 PT_LOAD
@@ -202,7 +202,7 @@ fn map_one_segment(p_offset: u64, p_vaddr: u64, p_filesz: u64, p_memsz: u64, fla
         unsafe {
             let dst = frames::phys_to_virt(frame);
             core::ptr::write_bytes(dst, 0, PAGE as usize); // zero (covers .bss)
-            // Overlap of this page [va, va+PAGE) with file content [p_vaddr, file_end).
+                                                           // Overlap of this page [va, va+PAGE) with file content [p_vaddr, file_end).
             let content_start = core::cmp::max(va, p_vaddr);
             let content_end = core::cmp::min(va + PAGE, file_end);
             if content_start < content_end {

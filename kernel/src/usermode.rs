@@ -141,7 +141,8 @@ static USER_FPUTEST_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/user_
 static USER_SHELL_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/user_shell.elf"));
 // `frameshell` (B4 Step 4b) tokenizes command lines with the *same* parser.frs
 // the hosted shell uses — the "one source, two targets" demonstration.
-static USER_FRAMESHELL_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/user_frameshell.elf"));
+static USER_FRAMESHELL_ELF: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/user_frameshell.elf"));
 // `ish` (B8) is the interactive shell: a REPL reading live console input
 // (read_line) that fork+exec+waits programs — so it survives running them.
 #[cfg(feature = "interactive")]

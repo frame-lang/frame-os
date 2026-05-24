@@ -291,11 +291,7 @@ pub fn resolve(cwd: &[u8], path: &[u8], out: &mut [u8]) -> Option<usize> {
 
     // An absolute path ignores cwd; a relative one is rooted at cwd.
     let absolute = matches!(path.first(), Some(&b'/'));
-    let sources: [&[u8]; 2] = if absolute {
-        [b"", path]
-    } else {
-        [cwd, path]
-    };
+    let sources: [&[u8]; 2] = if absolute { [b"", path] } else { [cwd, path] };
 
     for src in sources {
         for comp in src.split(|&c| c == b'/') {

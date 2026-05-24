@@ -79,8 +79,7 @@ const TCB_INIT: PcTcb = PcTcb {
 
 // Per-core scheduler state. Each core touches only its own row, except the
 // result atomics (written by the owning core, read by the BSP afterwards).
-static mut PC_TCBS: [[PcTcb; SLOTS_PER_CORE]; MAX_CPUS] =
-    [[TCB_INIT; SLOTS_PER_CORE]; MAX_CPUS];
+static mut PC_TCBS: [[PcTcb; SLOTS_PER_CORE]; MAX_CPUS] = [[TCB_INIT; SLOTS_PER_CORE]; MAX_CPUS];
 static mut PC_CURRENT: [usize; MAX_CPUS] = [0; MAX_CPUS];
 static PC_ACTIVE: [AtomicBool; MAX_CPUS] = [const { AtomicBool::new(false) }; MAX_CPUS];
 

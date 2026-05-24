@@ -47,7 +47,11 @@ fn unknown_ethertype_dispatches_to_nothing() {
     net::reset();
     let mut p = RxPipeline::__create();
     p.deliver(desc(0x86dd, 0)); // IPv6 — not classified at B5 Step 3
-    assert_eq!(net::last_dispatch(), "", "no leaf fires for an unknown ethertype");
+    assert_eq!(
+        net::last_dispatch(),
+        "",
+        "no leaf fires for an unknown ethertype"
+    );
 }
 
 #[test]
