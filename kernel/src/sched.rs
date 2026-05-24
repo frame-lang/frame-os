@@ -25,7 +25,7 @@ use core::arch::asm;
 use core::sync::atomic::{AtomicBool, Ordering};
 
 use crate::frame_systems::Scheduler;
-use crate::{gdt, interrupts, paging, serial};
+use crate::{fpu, gdt, interrupts, paging, serial};
 
 const MAX_THREADS: usize = 8;
 const STACK_SIZE: usize = 16 * 1024;
@@ -91,6 +91,17 @@ static mut STACK2: [u8; STACK_SIZE] = [0; STACK_SIZE];
 // processes never share ring-0 stack state.
 static mut KSTACKS: [[u8; STACK_SIZE]; MAX_THREADS] = [[0; STACK_SIZE]; MAX_THREADS];
 
+// Per-thread x87/SSE save area, indexed by TCB slot (B11-3a). `schedule()`
+// FXSAVEs the outgoing thread's FPU here and FXRSTORs the incoming thread's —
+// so the FPU register file is per-thread, exactly like the GPRs. New threads
+// are seeded with the clean (post-`fninit`) template (see the spawn paths).
+static mut FPU_AREAS: [fpu::FpuState; MAX_THREADS] = [fpu::FpuState::zeroed(); MAX_THREADS];
+
+/// Raw pointer to slot `n`'s FPU save area (for FXSAVE/FXRSTOR).
+fn fpu_area(n: usize) -> *mut fpu::FpuState {
+    unsafe { ((&raw mut FPU_AREAS) as *mut fpu::FpuState).add(n) }
+}
+
 // The Frame Scheduler — guarded by interrupts-off critical sections (it is
 // non-reentrant and shared across preemptible threads).
 static mut SCHED: Option<Scheduler> = None;
@@ -146,6 +157,15 @@ extern "C" fn schedule(current_rsp: u64) -> u64 {
             }
         }
 
+        // FPU/SSE state is per-thread (B11-3a): save the outgoing thread's
+        // x87/SSE registers and restore the incoming thread's, so two
+        // preemptively-interleaved FPU users don't clobber each other. Skip the
+        // no-op self-switch. (The ISR prologue + the scheduler code above touch
+        // no FPU, so the outgoing thread's live FPU is still intact here.)
+        if next != cur {
+            fpu::save(fpu_area(cur));
+        }
+
         (&raw mut CURRENT).write(next);
 
         // Address-space + kernel-stack switch (B3 Step 5a). A user process
@@ -164,6 +184,10 @@ extern "C" fn schedule(current_rsp: u64) -> u64 {
             let kstack = (*t.add(next)).kstack_top;
             gdt::set_rsp0(kstack);
             (&raw mut CURRENT_KSTACK).write(kstack);
+        }
+
+        if next != cur {
+            fpu::restore(fpu_area(next));
         }
 
         (*t.add(next)).rsp
@@ -233,6 +257,7 @@ fn init_boot() {
         (&raw mut N).write(1);
         (&raw mut CURRENT).write(0);
         (*tcbs().add(0)).state = RunState::Runnable; // boot is always available
+        fpu_area(0).write(fpu::clean()); // boot context starts with a clean FPU
         let kpml4 = paging::current_pml4();
         (&raw mut KERNEL_PML4).write(kpml4);
         (&raw mut LAST_PML4).write(kpml4);
@@ -248,6 +273,7 @@ unsafe fn spawn(stack_top: *mut u8, entry: extern "C" fn() -> !) {
     let t = tcbs();
     (*t.add(n)).rsp = rsp;
     (*t.add(n)).state = RunState::Runnable;
+    fpu_area(n).write(fpu::clean()); // fresh thread → clean FPU
     (&raw mut N).write(n + 1);
     with_sched(|s| s.task_ready());
 }
@@ -299,6 +325,7 @@ pub unsafe fn spawn_user(pml4: u64, entry: u64, user_rsp: u64, pid: u32) {
     (*t.add(n)).kstack_top = kstack_top;
     (*t.add(n)).pid = pid;
     (*t.add(n)).heap_brk = USER_HEAP_BASE; // fresh process: empty brk heap
+    fpu_area(n).write(fpu::clean()); // fresh process → clean FPU
     (&raw mut N).write(n + 1);
     with_sched(|s| s.task_ready());
 }
@@ -331,6 +358,10 @@ pub unsafe fn spawn_user_from_frame(
     // The child inherits the parent's program break — fork_address_space copied
     // the parent's heap pages (PML4 index 0), so the heap contents carry over.
     (*t.add(n)).heap_brk = brk_of_pid(parent_pid).unwrap_or(USER_HEAP_BASE);
+    // fork inherits the parent's FPU state: the parent is the one running this
+    // syscall, so its live x87/SSE registers are the state to copy — FXSAVE them
+    // straight into the child's save area.
+    fpu::save(fpu_area(n));
     (&raw mut N).write(n + 1);
     with_sched(|s| s.task_ready());
 }
@@ -430,6 +461,12 @@ pub unsafe fn exec_into(new_pml4: u64) {
     let cur = (&raw const CURRENT).read();
     (*tcbs().add(cur)).pml4 = new_pml4;
     (*tcbs().add(cur)).heap_brk = USER_HEAP_BASE; // new image ⇒ fresh, empty brk heap
+    // New image ⇒ fresh FPU: reset both the live registers and the saved area to
+    // the clean template, so the old image's x87/SSE state (esp. MXCSR) can't
+    // leak into the new program before its first context switch (B11-3a).
+    let c = fpu::clean();
+    fpu_area(cur).write(c);
+    fpu::restore(fpu_area(cur));
     paging::switch(new_pml4);
     (&raw mut LAST_PML4).write(new_pml4);
 }

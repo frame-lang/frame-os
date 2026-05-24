@@ -39,6 +39,7 @@ mod console;
 mod context;
 mod crosscore;
 mod elf;
+mod fpu;
 mod frame_systems;
 mod frames;
 mod fs;
@@ -141,6 +142,7 @@ unsafe extern "C" fn ap_entry(cpu: &limine::mp::Cpu) -> ! {
     // stack rather than triple-faulting.
     gdt::load_on_ap(index);
     percpu::init_this_cpu(index, cpu.lapic_id);
+    fpu::init_this_cpu(); // enable SSE/x87 + fninit on this AP (B11-3a)
     // R5b: confirm this core loaded its own per-CPU TSS (so #DF uses its IST stack).
     if gdt::current_tr() == gdt::tss_selector(index) {
         AP_TSS_OK.fetch_add(1, Ordering::SeqCst);
@@ -246,6 +248,7 @@ unsafe extern "C" fn kmain() -> ! {
         if let Some(mp) = MP_REQUEST.get_response() {
             let bsp = mp.bsp_lapic_id();
             percpu::init_this_cpu(0, bsp); // BSP is per-CPU index 0
+            fpu::init_this_cpu(); // enable SSE/x87 + fninit on the BSP (B11-3a)
             lapic::map(); // map the LAPIC register page before the APs use it
             let mut next_index = 1usize;
             let mut ap_count = 0usize;
@@ -715,6 +718,7 @@ unsafe extern "C" fn kmain() -> ! {
         // bring-up block (skipped here), so the interactive build must do it itself.
         let bsp = MP_REQUEST.get_response().map_or(0, |mp| mp.bsp_lapic_id());
         percpu::init_this_cpu(0, bsp);
+        fpu::init_this_cpu(); // enable SSE/x87 + fninit on the BSP (B11-3a)
 
         vm::init(); // PageFaultHandler: a user fault kills the process, not the kernel
         if !virtio_blk::init() {

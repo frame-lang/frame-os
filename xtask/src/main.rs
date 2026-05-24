@@ -1522,6 +1522,26 @@ const SMOKE_TESTS: &[SmokeTest] = &[
         timeout_secs: 20,
     },
     SmokeTest {
+        // B11-3a: FPU/SSE state preserved across context switches. `fputest`
+        // forks two processes that each pin distinct sentinels into xmm0..xmm7
+        // and verify, over thousands of preemption windows, that their registers
+        // survive — which only holds if the scheduler FXSAVEs/FXRSTORs the FPU on
+        // every switch. Both must PASS; a clobber prints "FAIL". This is the
+        // foundation for the on-device C toolchain (B11-3), whose compiled code
+        // and tcc itself use SSE/x87.
+        name: "fpu_preempt_b11",
+        expect_contains: &["fputest: child PASS", "fputest: parent PASS"],
+        expect_absent: &[
+            "fputest: child FAIL",
+            "fputest: parent FAIL",
+            "xmm clobbered",
+            "KERNEL EXCEPTION",
+            "KERNEL PANIC",
+            "triple fault",
+        ],
+        timeout_secs: 30,
+    },
+    SmokeTest {
         // B4 Step 1: the virtio-blk driver + the post/drain deferred-event
         // pattern. The kernel inits the device, writes a known pattern to a
         // sector and reads it back — the completion IRQ `post`s, the kernel

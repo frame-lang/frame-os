@@ -124,6 +124,8 @@ static USER_WAITER_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/user_w
 static USER_BRKTEST_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/user_brktest.elf"));
 // `fwtest` (B9-3) exercises the file write path: write/lseek/fstat/dup/read-back.
 static USER_FWTEST_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/user_fwtest.elf"));
+// `fputest` (B11-3a) forks two FPU users that verify xmm0..7 survive preemption.
+static USER_FPUTEST_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/user_fputest.elf"));
 // `shell` (B4 Step 4a) cats `/motd` then execs `/bin/hello` from disk by path.
 static USER_SHELL_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/user_shell.elf"));
 // `frameshell` (B4 Step 4b) tokenizes command lines with the *same* parser.frs
@@ -961,6 +963,12 @@ pub fn run() {
     // B9-3: the file write path. `fwtest` creates /tmp.txt and round-trips
     // write / lseek / fstat / dup / read through the on-disk filesystem.
     run_one(USER_FWTEST_ELF, "fwtest");
+
+    // B11-3a: FPU/SSE state preserved across context switches. `fputest` forks
+    // two processes that pin distinct sentinels into xmm0..7 and verify they
+    // survive preemptive interleaving — proving the scheduler saves/restores the
+    // FPU register file (the foundation for the on-device C toolchain's floats).
+    run_one(USER_FPUTEST_ELF, "fputest");
 
     // B4 Step 4a: a scripted shell that uses the file-I/O syscalls (open/read/
     // close) to `cat /motd`, then `exec`s `/bin/hello` *from disk by path* —

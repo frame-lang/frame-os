@@ -55,6 +55,13 @@ path = "src/argtest.rs"
 name = "fwtest"
 path = "src/fwtest.rs"
 
+# FPU/SSE state preservation across context switches (B11-3a): forks two
+# processes that each pin distinct sentinels into xmm0..xmm7 and verify they
+# survive preemption. Baked into the kernel; run by usermode::run.
+[[bin]]
+name = "fputest"
+path = "src/fputest.rs"
+
 # C-style program over frame-libc (B10-1): no `_start` of its own — crt0 comes
 # from frame-os-libc — just `main(argc, argv, envp)`. Disk-only (the shell runs
 # /bin/cmain), exercising the exact entry path a tcc-compiled C program will use.

@@ -133,6 +133,7 @@ fn build_user_program(workspace_root: &Path, out_dir: &Path) -> Result<()> {
         ("waiter", "user_waiter.elf"),
         ("brktest", "user_brktest.elf"),
         ("fwtest", "user_fwtest.elf"),
+        ("fputest", "user_fputest.elf"),
         ("shell", "user_shell.elf"),
         ("frameshell", "user_frameshell.elf"),
         ("ish", "user_ish.elf"),
