@@ -1102,11 +1102,52 @@ load-bearing for *integer* C compilation, but each is a real gap:
    `kernel/src/usermode.rs`), freed after the synchronous load. Regression guard:
    the `coexec` program + `concurrent_exec_buffers` smoke test (two children exec
    different disk programs at once; argtest's `argv[1]=Z` must survive).
-8. **User stack is one page** (`kernel/src/elf.rs`) — likely too small for tcc's
-   recursive-descent parser; enlarge the loader's user stack for B11-3d.
+8. **User stack is one page** (`kernel/src/elf.rs`) — RESOLVED in B11-3d: the
+   loader now maps a 32-page (128 KiB) user stack (`USER_STACK_PAGES`); tcc's
+   recursive-descent parser overflowed 4 KiB. Also bumped the kernel heap to
+   8 MiB (`exec` reads each image into a per-exec heap buffer; tcc is ~1.2 MiB)
+   and `MAX_TRACKED` to 512 (failed-load rollback covers tcc's ~104 PT_LOAD pages).
 9. **`strtod`/`strtof` precision** — the Rust implementations target correctness
    for common cases, not last-bit IEEE rounding; revisit if a float program's
    output proves sensitive.
 
 These are tracked here rather than silently carried; B11-3d/e and beyond should
 burn them down (especially #2/#3/#4, which the toolchain genuinely wants).
+
+### B11-3d done (2026-05-24): tcc compiles + runs C on-device
+
+`tcc -B/usr/lib/tcc -static /hello.c -o /out.elf` then `/out.elf` works at the
+shell — the C half of the V1.0 north star. Key outcomes (full detail in
+`docs/frame_assessment.md`):
+
+- **C-shim libc** (`libc/cshim/cshim.c`, `gcc -fno-pic -fvisibility=hidden`) is
+  tcc's link target — no GOT, no PLT, only the simple relocations tcc applies
+  correctly. tcc stays **pristine 0.9.27** (the static-link PLT/GOT bugs are real
+  and fixed in tcc `mob`, but adopting mob was *measured and rejected* — heavy
+  recurring freestanding port for features we don't use; the C-shim is smaller +
+  faster on-device). Rust `frame-libc` remains the OS's own runtime.
+- **Five kernel/libc bugs fixed** (0-length read/write NULL-deref; scheduler
+  TCB-slot leak; non-page-aligned ELF segments; #PF RIP diagnostic; printf `%*`).
+
+New follow-ups from B11-3d (lower priority — none block the V1.0 goal):
+
+10. **C-shim libc is minimal** (`libc/cshim/cshim.c`) — printf handles
+    `%d/%u/%x/%c/%s/%p` only; `malloc` is a bump allocator (`free` is a no-op).
+    Grow as on-device C programs need more (full printf, real free, more libc).
+    Consider sharing the printf scanner FSM with frame-libc instead of two impls.
+11. **`unlink` (#2 above) matters more now** — bigger on-device compiles will
+    want tcc temp files + output overwrite; add the file-delete syscall.
+12. **`qemu-test` artifact thrash** — flipping the kernel's `interactive` feature
+    between `console-test` and `qemu-test` in the same `/target` forces full
+    rebuilds and can leave a stale/half-written ESP (looked like an all-tests
+    empty-capture failure; was a flake, 49/49 green after clean rebuild). A
+    separate target dir per feature set, or a `clean` between, would prevent it.
+
+### B11-3e (next): BuildDriver Frame FSM
+
+Frame's turn on this track: a `BuildDriver` Frame system (`.frs`) that
+orchestrates the on-device toolchain — `$Idle → $Compiling → $Linking →
+$Running → $Done`, with a `$Failed` sink that reports which phase failed and the
+exit code. Models the compile→link→run pipeline as an explicit state machine
+(the "Frame owns lifecycle, native owns mechanism" split), driven from a user
+program that shells out to `/bin/tcc` + execs the output.
