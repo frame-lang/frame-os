@@ -1,0 +1,33 @@
+// frame/hello.frs
+//
+// Hello — the V1.0 capstone Frame system. Deliberately tiny and *language
+// neutral*: its handlers contain no native code, only Frame transitions and a
+// literal interface return. That lets the SAME @@system be transpiled by framec
+// to BOTH Rust and C, each wrapped by a per-language native harness (a Rust bin
+// and a C `main`) that drives it and prints. Proves the north star: one Frame
+// source → both backends → both compiled and run from the shell (the C one via
+// the on-device tcc).
+//
+// State graph:
+//   $Ready ──greet()──► $Greeted        (greeted() flips false → true)
+//
+// The harness constructs Hello, asserts !greeted(), calls greet(), then asserts
+// greeted() and prints the message — so a real state transition gates the
+// output, not a hardcoded print.
+
+@@system Hello {
+    interface:
+        greet()
+        greeted(): bool = false
+
+    machine:
+        $Ready {
+            greet() {
+                -> $Greeted
+            }
+        }
+
+        $Greeted {
+            greeted(): bool { @@:(true) }
+        }
+}

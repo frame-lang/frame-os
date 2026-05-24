@@ -20,6 +20,10 @@ const FRAME_SYSTEMS: &[(&str, &str)] = &[
     // BuildDriver (B11-3e): the on-device toolchain pipeline FSM, driven by the
     // `build` bin. Generated to OUT_DIR; `src/build_frame.rs` include!s it.
     ("builddriver", "builddriver.frs"),
+    // Hello (V1.0 capstone): the same hello.frs that framec also transpiles to
+    // C; here generated to Rust and driven by the `fhello` bin (src/hello_frame.rs
+    // include!s it). One Frame source, both backends.
+    ("hello", "hello.frs"),
 ];
 
 fn main() {

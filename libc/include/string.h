@@ -23,5 +23,6 @@ char *strcat(char *dst, const char *src);
 char *strchr(const char *s, int c);
 char *strrchr(const char *s, int c);
 char *strstr(const char *haystack, const char *needle);
+char *strdup(const char *s);
 
 #endif /* _FRAMEOS_STRING_H */

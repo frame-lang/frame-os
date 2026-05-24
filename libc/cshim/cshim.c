@@ -120,21 +120,27 @@ char *strcpy(char *d, const char *s) {
 }
 
 /* --- a simple bump allocator over brk (syscall 10) ------------------------ */
+/* Each block is prefixed with a 16-byte header storing its usable size, so
+ * `realloc` knows how much to copy. The header keeps the returned pointer
+ * 16-aligned. `free` is still a no-op (a bump allocator never reclaims). */
 
 static unsigned long heap_cur, heap_end;
 void *malloc(size_t n) {
-    n = (n + 15) & ~(size_t)15; /* 16-align */
+    n = (n + 15) & ~(size_t)15; /* 16-align the usable size */
     if (heap_cur == 0) {
         heap_cur = heap_end = (unsigned long)syscall3(10, 0, 0, 0); /* query brk */
     }
-    if (heap_cur + n > heap_end) {
-        unsigned long want = heap_cur + n;
+    unsigned long need = n + 16; /* 16-byte size header + usable bytes */
+    if (heap_cur + need > heap_end) {
+        unsigned long want = heap_cur + need;
         unsigned long grown = (unsigned long)syscall3(10, (long)((want + 0xFFFF) & ~0xFFFFUL), 0, 0);
         if (grown < want) return 0; /* OOM */
         heap_end = grown;
     }
-    void *p = (void *)heap_cur;
-    heap_cur += n;
+    unsigned long *hdr = (unsigned long *)heap_cur;
+    hdr[0] = n; /* usable size, for realloc */
+    void *p = (void *)(heap_cur + 16);
+    heap_cur += need;
     return p;
 }
 void free(void *p) { (void)p; /* bump allocator: no per-object free */ }
@@ -143,6 +149,22 @@ void *calloc(size_t nmemb, size_t size) {
     void *p = malloc(n);
     if (p) memset(p, 0, n);
     return p;
+}
+void *realloc(void *p, size_t n) {
+    if (!p) return malloc(n);
+    unsigned long old = ((unsigned long *)p)[-2]; /* size header sits 16 bytes back */
+    void *q = malloc(n);
+    if (!q) return 0;
+    memcpy(q, p, old < n ? old : n);
+    return q; /* old block leaks — bump allocator */
+}
+/* strdup lives here (not with the string fns) so `malloc` is already defined —
+ * the shim is built `-nostdinc`, so a forward use would be an implicit decl. */
+char *strdup(const char *s) {
+    size_t n = strlen(s) + 1;
+    char *d = malloc(n);
+    if (d) memcpy(d, s, n);
+    return d;
 }
 
 /* --- minimal printf to stdout (fd 1) -------------------------------------- */

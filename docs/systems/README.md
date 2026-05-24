@@ -56,6 +56,7 @@ These run inside the bare-metal kernel image. They do not appear in the hosted-m
 | [`UsbTransfer`](usb_transfer.md) | B6 | Documented | One transfer's lifecycle: `$Idle → $InFlight → ($Complete \| $Failed)`. `$InFlight` queues the transfer; a Transfer Event advances the FSM; `$Complete` reads the result. Completes a real interrupt-IN HID key report from the qemu-xhci usb-kbd (closes B6-3). |
 | [`EventCounter`](event_counter.md) | B7 | Documented | A tiny `$Counting → $Closed` system driven by **cross-core posts**: other cores enqueue `tick(n)` into a `SpinLock` MPSC queue, the owner core drains + dispatches. Demonstrates cross-core safety with the instance pinned + only `Send` data crossing — no framec `Send`/`Sync` change. |
 | [`BuildDriver`](builddriver.md) | B11-3e | Documented | The on-device C toolchain pipeline (ring 3): `$Idle → $Compiling → $Linking → $Running → $Done`, fallible phases funneled to `$Failed`. Enter handlers fork/exec/wait `/bin/tcc` (`-c`, then `-static` link) + run `/out.elf`; the `buildc` program drives it. The Frame half of B11-3 (native owns the fork/exec mechanism). |
+| [`Hello`](hello.md) | V1.0 capstone | Documented | The capstone: one language-neutral `hello.frs` (`$Ready → $Greeted`) that framec transpiles to **both** Rust (`/bin/fhello`) and C (`/fhello.c`, built on-device by tcc via `buildc /fhello.c`). One Frame source → both backends → both run from the shell. |
 
 ## Shared systems
 

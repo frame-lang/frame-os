@@ -103,6 +103,14 @@ path = "src/ish.rs"
 name = "buildc"
 path = "src/buildc.rs"
 
+# fhello (V1.0 capstone, Rust half): drives the Hello Frame system generated
+# from frame/hello.frs by `framec -l rust`. Links frame-libc (crt0 + heap for
+# the FSM's alloc). The same hello.frs is transpiled to C and built on-device by
+# tcc (/fhello.c) — one Frame source, both backends. Disk-only (/bin/fhello).
+[[bin]]
+name = "fhello"
+path = "src/fhello.rs"
+
 # Heap allocator for the Frame-generated code (Vec/String/Rc/BTreeMap).
 # Only `frameshell` pulls it in (via `mod mem`); the other bins stay
 # allocator-free. Same crate + version the kernel uses.

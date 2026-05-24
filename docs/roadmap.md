@@ -1210,3 +1210,90 @@ follow-up is "grow the C-shim libc as on-device programs need more" — an
 open-ended, demand-driven item, not a discrete task. Relative `exec` (deferred
 exec/argv still uses absolute `/bin/...`) and an ish `cd` builtin are the small
 nice-to-haves noted under cwd.
+
+### C1–C5 (next): the V1.0 capstone — one Frame system → both C and Rust
+
+Honest status check: today framec is only ever invoked with `-l rust` (28
+`.frs` → Rust); the C/Rust hello-worlds that compile + run on-device are
+*hand-written*, not framec output. So we have NOT yet literally satisfied the
+north star — "run framec to compile a hello world in C and Rust and run them
+from the shell." This track closes that gap by authoring **one** Frame
+hello-world system and running it through framec to **both** backends:
+
+```
+                    frame/hello.frs   (one @@system, authored once)
+                    /              \
+        framec -l rust          framec -l c
+              |                      |
+      Rust user bin            generated hello.c   (staged at /fhello.c)
+        /bin/fhello                  |
+              |              on-device tcc + C-shim   (buildc /fhello.c)
+          run it                     |
+                                  run it
+```
+
+Steps (tasks C1–C5):
+1. **C1 — spike (de-risk first).** Author `frame/hello.frs`; run host
+   `framec compile -l c` and inspect the output: what libc surface/headers does
+   it need (alloc, string, stdio, the FrameEvent/Compartment runtime), and does
+   tcc 0.9.27 + the C-shim accept it? Produce a go/no-go + concrete gap list.
+   The real risk lives here: the C backend emits a richer runtime than the
+   minimal C-shim currently provides, and tcc 0.9.27 is strict.
+2. **C2 — Rust half.** `hello.frs` → `framec -l rust` → `/bin/fhello`, run from
+   the shell (the Rust user-bin path, like `cmain`).
+3. **C3 — C half.** `hello.frs` → `framec -l c` → `/fhello.c`; `buildc /fhello.c`
+   compiles that *framec-generated* C with the on-device tcc + C-shim and runs
+   it. Grow the C-shim to cover the gaps C1 finds — fixing root causes, never
+   stubbing behavior away.
+4. **C4 — shell demo.** Make sure the shell drives the whole thing end to end
+   (`fhello` for Rust, `buildc /fhello.c` for C), proven in console-test: one
+   Frame source, both languages, both run from the shell.
+5. **C5 — docs/diagram/journal.** `hello.frs` state diagram, README index,
+   and the milestone write-up.
+
+If C1 surfaces a gap too large to close cheaply (e.g. the C runtime wants libc
+breadth tcc can't easily link), that is reported honestly rather than worked
+around — the C-shim grows to meet a *real, working* generated program, not a
+hollowed-out one.
+
+### C1–C5 DONE (2026-05-24): the V1.0 north star is literally met
+
+One Frame system (`frame/hello.frs`, `$Ready → $Greeted`) now runs in **both**
+languages from the shell:
+- **Frame → Rust:** `framec -l rust` (in user/build.rs) → `/bin/fhello`, which
+  drives the generated FSM and prints `transpiled to Rust!`.
+- **Frame → C:** `framec -l c` on the *same* source (xtask `build_fhello_c`) →
+  `/fhello.c`; `buildc /fhello.c` compiles + links + runs it with the **on-device
+  tcc**, printing `transpiled to C!` and exiting 0.
+
+console-test asserts both. What it took:
+- **C-shim grew** `realloc` (malloc now carries a 16-byte size header), `strdup`,
+  and a new `<stdint.h>` (`intptr_t` etc.) — exactly what framec's C runtime
+  (`FrameDict`/`FrameVec`) needs. Real implementations, no stubs.
+- **`fs::create` is now multi-block.** It only ever used the root dir's first
+  data block (a 16-entry cap), though `dir_lookup`/`unlink` already iterated all
+  of `dir.direct`; the capstone's extra build artifacts pushed root past 16 and
+  exposed it. Fixed to grow into new dir blocks on demand.
+- **One-line tcc patch** (`tccelf.c:1082`, `|| s1->output_type ==
+  TCC_OUTPUT_EXE`): the framec-generated C is the first on-device program to call
+  its **own** non-`static` functions, and tcc 0.9.27's broken static-exe PLT
+  crashed it (`#PF` at a garbage `jmp *GOT(%rip)`). The C-shim only covered libc
+  (hidden) calls; this is the upstream/mob fix for the caller side. Surgical;
+  tcc otherwise pristine. See `third_party/tcc/README.frame-os.md`. (Decision
+  made with the user — the dependency was previously kept pristine; the capstone
+  showed the on-device C toolchain was printf-only-capable without it.)
+
+This is the genuine close of the V1.0 north star: **framec compiles a hello-world
+to C and Rust and both run from the shell.** Remaining is the open-ended "grow
+the C-shim as programs need more" + the small cwd/exec niceties.
+
+Validation: `console-test` PASS (both `fhello` + `buildc /fhello.c`), `qemu-test`
+48/49. The lone failure is `concurrent_exec_buffers`, a **pre-existing flake**
+unrelated to this changeset: it asserts the *contiguous* substring `argv[1]=Z`,
+but under concurrent exec the byte-at-a-time `write_char` of argtest's
+`argv[1]=`/`Z` interleaves on the shared serial console with the parent's
+`[wait] pid … reaped …` line — the argv *value* is correct, the bytes just
+aren't adjacent. It reproduces ~1/4 **in isolation** (rate rises with host load),
+and `fs::create` (the only kernel delta here) is never on its path. Follow-up:
+make that test robust to console interleaving (or give the console a per-line
+lock) — tracked separately, not a capstone regression.
