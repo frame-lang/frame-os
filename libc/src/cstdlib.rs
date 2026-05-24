@@ -116,6 +116,53 @@ pub extern "C" fn abort() -> ! {
     exit(134)
 }
 
+/// `__assert_fail(expr, file, line, func)` — the target of a failed `assert()`
+/// (see libc/include/assert.h). Prints "file:line: func: Assertion `expr'
+/// failed." to stderr, then aborts. glibc-compatible signature, so the C
+/// `assert` macro links directly against frame-libc (the chello / direct-link
+/// path; tcc-compiled programs link the C-shim's copy). Never returns.
+///
+/// # Safety
+/// `expr`/`file`/`func` must each be a NUL-terminated C string or NULL.
+#[no_mangle]
+pub unsafe extern "C" fn __assert_fail(
+    expr: *const c_char,
+    file: *const c_char,
+    line: u32,
+    func: *const c_char,
+) -> ! {
+    unsafe fn put(p: *const c_char) {
+        let p = if p.is_null() { c"?".as_ptr() } else { p };
+        let mut n = 0;
+        while *p.add(n) != 0 {
+            n += 1;
+        }
+        crate::write(2, core::slice::from_raw_parts(p as *const u8, n));
+    }
+    put(file);
+    crate::write(2, b":");
+    // line number, decimal.
+    let mut buf = [0u8; 20];
+    let mut i = buf.len();
+    let mut l = line;
+    if l == 0 {
+        i -= 1;
+        buf[i] = b'0';
+    }
+    while l > 0 {
+        i -= 1;
+        buf[i] = b'0' + (l % 10) as u8;
+        l /= 10;
+    }
+    crate::write(2, &buf[i..]);
+    crate::write(2, b": ");
+    put(func);
+    crate::write(2, b": Assertion `");
+    put(expr);
+    crate::write(2, b"' failed.\n");
+    abort()
+}
+
 /// `getenv(name)` — Frame OS has no environment yet, so always "not set".
 #[no_mangle]
 pub extern "C" fn getenv(_name: *const c_char) -> *mut c_char {

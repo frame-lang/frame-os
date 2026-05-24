@@ -825,7 +825,18 @@ fn build_tcc_disk_elf(workspace: &Path) -> Result<Vec<u8>> {
                 "-w",
                 "-c",
             ])
-            .args(["-DTCC_TARGET_X86_64", "-DCONFIG_TCC_STATIC", "-DCONFIG_TCCBOOT"])
+            // -DNDEBUG: build tcc with its internal asserts compiled out (the
+            // conventional release build). frame-libc's <assert.h> is now a real
+            // abort (B11-3 follow-up); without NDEBUG, a tcc-internal assert would
+            // pull in __assert_fail and abort the compiler. tcc-compiled *user*
+            // programs are unaffected — the on-device tcc never passes -DNDEBUG,
+            // so their asserts stay live.
+            .args([
+                "-DTCC_TARGET_X86_64",
+                "-DCONFIG_TCC_STATIC",
+                "-DCONFIG_TCCBOOT",
+                "-DNDEBUG",
+            ])
             .arg(one_source)
             .arg("-isystem")
             .arg(&freestd)
@@ -1005,6 +1016,11 @@ fn build_tcc_sysroot(workspace: &Path) -> Result<Vec<(String, Vec<u8>)>> {
     // The C program the on-device tcc will compile.
     let hello_c = workspace.join("csrc").join("tcchello.c");
     files.push(("/hello.c".into(), std::fs::read(&hello_c)?));
+
+    // A program whose assert fails — proves assert() is a real abort (B11-3
+    // follow-up), compiled + run on-device by the console-test.
+    let assert_c = workspace.join("csrc").join("tcc_assert.c");
+    files.push(("/assert.c".into(), std::fs::read(&assert_c)?));
 
     Ok(files)
 }
@@ -1339,6 +1355,17 @@ fn run_console_test() -> Result<()> {
         stdin.write_all(b"/bin/buildc\n").context("write buildc")?;
         stdin.flush().ok();
         wait_for_output(&buf, "[build] pipeline ok; /out.elf exited with code 7", 90)?;
+        // B11-3 follow-up: assert() is a real abort, not a no-op. Compile and run
+        // /assert.c (a deliberately-false assert); __assert_fail prints the
+        // diagnostic to the console and abort()s before the program's printf, so
+        // the "Assertion `...' failed." line is the proof (the "unreachable"
+        // printf never appears).
+        eprintln!("console-test: typing `/bin/tcc … /assert.c -o /assert.elf` then `/assert.elf`");
+        stdin
+            .write_all(b"/bin/tcc -B/usr/lib/tcc -static /assert.c -o /assert.elf\n/assert.elf\n")
+            .context("write tcc assert compile + run")?;
+        stdin.flush().ok();
+        wait_for_output(&buf, "/assert.c:15: main: Assertion `answer == 42' failed.", 90)?;
         eprintln!("console-test: C program ran on Frame OS; typing `exit`");
         stdin.write_all(b"exit\n").context("write exit")?;
         stdin.flush().ok();

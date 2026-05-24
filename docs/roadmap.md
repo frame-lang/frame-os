@@ -1151,3 +1151,31 @@ $Running → $Done`, with a `$Failed` sink that reports which phase failed and t
 exit code. Models the compile→link→run pipeline as an explicit state machine
 (the "Frame owns lifecycle, native owns mechanism" split), driven from a user
 program that shells out to `/bin/tcc` + execs the output.
+
+### B11-3e done + toolchain tech-debt burn-down (2026-05-24)
+
+`BuildDriver` shipped (`frame/builddriver.frs` → `/bin/buildc`): the compile→
+link→run pipeline as a Frame FSM with a `$Failed` sink. console-test drives it
+and asserts `[build] pipeline ok; /out.elf exited with code 7`.
+
+Then started paying down the toolchain follow-ups from above:
+
+- **#11 `unlink` — DONE.** New syscall #17 (`kernel/src/fs.rs::unlink`: namei the
+  parent dir, refuse directories, free blocks, clear the dirent). Wired through
+  frame-libc (`sys_unlink`, real `unlink`/`remove`) and the C-shim
+  (`unlink(const char*)`). `fwtest` step 7 unlinks `/tmp.txt` and confirms a
+  subsequent open-for-read fails; smoke `file_write_roundtrip_b9` asserts it.
+  Bigger on-device compiles can now manage temp files + overwrite outputs.
+- **assert → real abort — DONE.** `libc/include/assert.h` was a no-op
+  (`((void)0)`); now `assert(expr)` calls `__assert_fail(#expr, __FILE__,
+  __LINE__, __func__)` which prints `file:line: func: Assertion `expr' failed.`
+  to stderr and `abort()`s (exit 134), in both the C-shim (tcc-linked programs)
+  and frame-libc (direct-link). tcc itself is built `-DNDEBUG` so its *own*
+  internal asserts stay compiled-out (its current behavior) — the on-device tcc
+  never passes `-DNDEBUG`, so user programs' asserts are live. Validated by
+  console-test compiling+running `/assert.c` (a false assert) and matching the
+  diagnostic (`csrc/tcc_assert.c`).
+
+Still open from the list: real clock (`time()` via CMOS RTC), per-process
+`cwd`/`chdir`/`getcwd`, growing the C-shim, and `buildc` taking a source path
+from argv (so it's a general `cc <file>` rather than a fixed `/hello.c`).

@@ -43,7 +43,7 @@ __attribute__((noreturn)) void exit(int code) {
     }
 }
 __attribute__((noreturn)) void _exit(int code) { exit(code); }
-void abort(void) { exit(134); }
+__attribute__((noreturn)) void abort(void) { exit(134); }
 
 ssize_t write(int fd, const void *buf, size_t len) {
     /* stdout/stderr go to the console via write_char (syscall 0), one byte at a
@@ -223,6 +223,37 @@ int puts(const char *s) {
 int putchar(int c) {
     outc((char)c);
     return c;
+}
+
+/* --- assert (real abort, not a no-op) ------------------------------------- */
+/* `__assert_fail` is what <assert.h>'s assert() calls on a failed check: print
+ * "file:line: func: Assertion `expr' failed." to stderr (fd 2), then abort.
+ * Hidden visibility (like every shim symbol) → tcc resolves the call directly,
+ * no PLT. */
+__attribute__((noreturn)) void __assert_fail(const char *expr, const char *file,
+                                             unsigned int line, const char *func) {
+    if (!file) file = "?";
+    if (!func) func = "?";
+    if (!expr) expr = "?";
+    write(2, file, strlen(file));
+    write(2, ":", 1);
+    char buf[16];
+    int i = 0;
+    if (line == 0) buf[i++] = '0';
+    while (line) {
+        buf[i++] = (char)('0' + line % 10);
+        line /= 10;
+    }
+    while (i) {
+        char c = buf[--i];
+        write(2, &c, 1);
+    }
+    write(2, ": ", 2);
+    write(2, func, strlen(func));
+    write(2, ": Assertion `", 13);
+    write(2, expr, strlen(expr));
+    write(2, "' failed.\n", 10);
+    abort();
 }
 
 /* --- crt0 (Rust half) ----------------------------------------------------- */
