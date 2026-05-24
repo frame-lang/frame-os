@@ -3182,10 +3182,15 @@ fn find_ovmf() -> Result<(PathBuf, PathBuf)> {
             "edk2-x86_64-code.fd",
             "edk2-i386-vars.fd",
         ),
-        // Ubuntu / Debian `ovmf` package
+        // Ubuntu 24.04+ `ovmf` package renamed the firmware to the 4 MB
+        // variants and dropped the plain `OVMF_CODE.fd` — check these first so
+        // CI (ubuntu-latest = Noble) finds them.
+        ("/usr/share/OVMF", "OVMF_CODE_4M.fd", "OVMF_VARS_4M.fd"),
+        // Older Ubuntu / Debian (incl. the bookworm dev container) `ovmf` package
         ("/usr/share/OVMF", "OVMF_CODE.fd", "OVMF_VARS.fd"),
-        // Fedora / Arch `edk2-ovmf` package
+        // Fedora / Arch `edk2-ovmf` package (4M and legacy names)
         ("/usr/share/edk2/ovmf", "OVMF_CODE.fd", "OVMF_VARS.fd"),
+        ("/usr/share/edk2/x64", "OVMF_CODE.4m.fd", "OVMF_VARS.4m.fd"),
     ];
 
     for (dir, code_name, vars_name) in CANDIDATES {
