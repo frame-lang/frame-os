@@ -21,6 +21,7 @@ mod frame_systems;
 mod malloc;
 mod posix;
 mod printf;
+mod setjmp;
 mod stdio;
 pub use malloc::{calloc, free, malloc, realloc};
 pub use printf::{print_fmt, vformat, Arg};
@@ -86,6 +87,8 @@ unsafe extern "C" fn __libc_start(sp: *const usize) -> ! {
     let argv = sp.add(1) as *const *const u8;
     // envp begins just past argv's NULL terminator: sp[1 + argc + 1].
     let envp = sp.add(1 + argc as usize + 1) as *const *const u8;
+    // Make the C `stdin`/`stdout`/`stderr` FILE* globals valid before `main`.
+    stdio::init_std_streams();
     let code = main(argc, argv, envp);
     exit(code);
 }

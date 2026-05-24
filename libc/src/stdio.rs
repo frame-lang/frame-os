@@ -350,6 +350,89 @@ pub fn stderr() -> *mut FILE {
     unsafe { console_stream(&raw mut STDERR, 2, true) }
 }
 
+// C exposes `stdin`/`stdout`/`stderr` as FILE* lvalues (e.g. `fprintf(stderr,
+// ...)`), so frame-libc provides them as globals — distinct from the Rust
+// `stdin()`/`stdout()`/`stderr()` accessors above (which Rust callers + the
+// internal puts/putchar use). `#[export_name]` gives the C symbol while keeping
+// a non-clashing Rust identifier. Filled by `init_std_streams` from crt0 before
+// `main`, so the pointers are valid the first time C reads them. (B11-3c)
+#[export_name = "stdin"]
+pub static mut STDIN_PTR: *mut FILE = core::ptr::null_mut();
+#[export_name = "stdout"]
+pub static mut STDOUT_PTR: *mut FILE = core::ptr::null_mut();
+#[export_name = "stderr"]
+pub static mut STDERR_PTR: *mut FILE = core::ptr::null_mut();
+
+/// Initialize the C `stdin`/`stdout`/`stderr` globals. Called once from crt0
+/// (`__libc_start`) before `main`.
+pub fn init_std_streams() {
+    unsafe {
+        (&raw mut STDIN_PTR).write(stdin());
+        (&raw mut STDOUT_PTR).write(stdout());
+        (&raw mut STDERR_PTR).write(stderr());
+    }
+}
+
+/// `fseek(f, offset, whence)` — flush pending output, discard the read buffer,
+/// and `lseek` the underlying fd. Returns 0, or -1 on error.
+#[no_mangle]
+pub unsafe extern "C" fn fseek(f: *mut FILE, offset: i64, whence: i32) -> i32 {
+    if f.is_null() {
+        return -1;
+    }
+    let s = &mut *f;
+    s.flush();
+    s.ibuf.clear();
+    s.ipos = 0;
+    s.eof = false;
+    if crate::sys_lseek(s.fd, offset, whence) == u64::MAX {
+        -1
+    } else {
+        0
+    }
+}
+
+/// `ftell(f)` — current file offset: the fd's offset (after flushing pending
+/// output), minus any buffered-but-unread input. Returns -1 on error.
+#[no_mangle]
+pub unsafe extern "C" fn ftell(f: *mut FILE) -> i64 {
+    if f.is_null() {
+        return -1;
+    }
+    let s = &mut *f;
+    s.flush();
+    let pos = crate::sys_lseek(s.fd, 0, 1 /* SEEK_CUR */);
+    if pos == u64::MAX {
+        return -1;
+    }
+    pos as i64 - (s.ibuf.len() - s.ipos) as i64
+}
+
+/// `fdopen(fd, mode)` — wrap an already-open fd in a buffered `FILE` (the mode
+/// only sets the read/write gate; the fd is used as-is). Returns NULL on error.
+#[no_mangle]
+pub unsafe extern "C" fn fdopen(fd: i32, mode: *const u8) -> *mut FILE {
+    if mode.is_null() {
+        return core::ptr::null_mut();
+    }
+    let write_mode = *mode == b'w' || *mode == b'a';
+    let mut of = OpenFile::__create();
+    if write_mode {
+        of.open_write();
+    } else {
+        of.open_read();
+    }
+    alloc::boxed::Box::into_raw(alloc::boxed::Box::new(FileStream {
+        fd,
+        of,
+        eof: false,
+        err: false,
+        obuf: Vec::new(),
+        ibuf: Vec::new(),
+        ipos: 0,
+    }))
+}
+
 /// `fprintf` into a stream (B10-3b). The Rust-friendly front end alongside the
 /// C-ABI variadic `fprintf` below.
 pub fn fprintf_args(f: *mut FILE, fmt: &str, args: &[Arg]) {
