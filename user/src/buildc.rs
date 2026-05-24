@@ -9,10 +9,11 @@
 // the FSM owns the phase sequencing and the `$Failed` sink. Same "Frame owns
 // lifecycle, native owns mechanism" split as the kernel's ElfLoader.
 //
-// It builds the staged `/hello.c` into `/out.elf` and runs it:
-//   compile:  tcc -c -B/usr/lib/tcc /hello.c -o /hello.o
-//   link:     tcc -B/usr/lib/tcc -static /hello.o -o /out.elf
-//   run:      /out.elf   (its exit code is captured + reported)
+// Usage: `buildc [SOURCE.c]` — compiles SOURCE (default `/hello.c`) into
+// SOURCE-with-.elf and runs it. A general `cc <file>` rather than a fixed path:
+//   compile:  tcc -c -B/usr/lib/tcc <src>   -o <src:.c->.o>
+//   link:     tcc -B/usr/lib/tcc -static <obj> -o <src:.c->.elf>
+//   run:      <out>   (its exit code is captured + reported)
 //
 // Syscall ABI: 0=write_char 1=exit 2=fork 4=wait 11=exec_argv.
 
@@ -21,13 +22,75 @@
 
 extern crate alloc;
 
-use core::arch::asm;
+use core::arch::{asm, global_asm};
 use core::panic::PanicInfo;
 
 mod build_frame;
 mod mem;
 
 use build_frame::BuildDriver;
+
+// Entry shim: at process start `rsp` points at the SysV initial stack (argc,
+// argv[], …). Hand that pointer to `build_main` in rdi, 16-aligned, so we can
+// read argv[1] (the source path). Same shim as argtest/crt0.
+global_asm!(
+    ".global _start",
+    "_start:",
+    "  mov rdi, rsp",
+    "  and rsp, -16",
+    "  call build_main",
+    "  ud2",
+);
+
+// The build paths, derived from argv once at startup and read by the FSM's
+// `actions::*`. buildc is single-threaded, so plain statics (accessed via raw
+// pointers — no references, to satisfy the static-mut lints) are safe.
+static mut SRC_BUF: [u8; 256] = [0; 256];
+static mut OBJ_BUF: [u8; 256] = [0; 256];
+static mut OUT_BUF: [u8; 256] = [0; 256];
+static mut SRC_LEN: usize = 0;
+static mut OBJ_LEN: usize = 0;
+static mut OUT_LEN: usize = 0;
+
+/// Copy the concatenation of `parts` into the static byte buffer at `buf`,
+/// recording the length at `lenp` (capped at 256).
+unsafe fn fill(buf: *mut u8, lenp: *mut usize, parts: &[&[u8]]) {
+    let mut n = 0usize;
+    for p in parts {
+        for &b in *p {
+            if n < 256 {
+                *buf.add(n) = b;
+            }
+            n += 1;
+        }
+    }
+    *lenp = n.min(256);
+}
+
+/// Set the source path and derive the object (.o) and output (.elf) paths by
+/// replacing a trailing ".c" (or appending if the source has no ".c").
+fn set_paths(src: &[u8]) {
+    let stem: &[u8] = if src.ends_with(b".c") {
+        &src[..src.len() - 2]
+    } else {
+        src
+    };
+    unsafe {
+        fill((&raw mut SRC_BUF) as *mut u8, &raw mut SRC_LEN, &[src]);
+        fill((&raw mut OBJ_BUF) as *mut u8, &raw mut OBJ_LEN, &[stem, b".o"]);
+        fill((&raw mut OUT_BUF) as *mut u8, &raw mut OUT_LEN, &[stem, b".elf"]);
+    }
+}
+
+fn src_path() -> &'static [u8] {
+    unsafe { core::slice::from_raw_parts((&raw const SRC_BUF) as *const u8, (&raw const SRC_LEN).read()) }
+}
+fn obj_path() -> &'static [u8] {
+    unsafe { core::slice::from_raw_parts((&raw const OBJ_BUF) as *const u8, (&raw const OBJ_LEN).read()) }
+}
+fn out_path() -> &'static [u8] {
+    unsafe { core::slice::from_raw_parts((&raw const OUT_BUF) as *const u8, (&raw const OUT_LEN).read()) }
+}
 
 #[inline(always)]
 pub(crate) unsafe fn syscall3(num: u64, a0: u64, a1: u64, a2: u64) -> u64 {
@@ -113,27 +176,68 @@ pub mod actions {
     }
 
     pub fn compile() -> bool {
-        print(b"[build] compile: tcc -c /hello.c -> /hello.o\n");
-        spawn(&[b"/bin/tcc", b"-c", b"-B/usr/lib/tcc", b"/hello.c", b"-o", b"/hello.o"]) == 0
+        let (src, obj) = (crate::src_path(), crate::obj_path());
+        print(b"[build] compile: tcc -c ");
+        print(src);
+        print(b" -> ");
+        print(obj);
+        write_char(b'\n');
+        spawn(&[b"/bin/tcc", b"-c", b"-B/usr/lib/tcc", src, b"-o", obj]) == 0
     }
     pub fn link() -> bool {
-        print(b"[build] link: tcc -static /hello.o -> /out.elf\n");
-        spawn(&[b"/bin/tcc", b"-B/usr/lib/tcc", b"-static", b"/hello.o", b"-o", b"/out.elf"]) == 0
+        let (obj, out) = (crate::obj_path(), crate::out_path());
+        print(b"[build] link: tcc -static ");
+        print(obj);
+        print(b" -> ");
+        print(out);
+        write_char(b'\n');
+        spawn(&[b"/bin/tcc", b"-B/usr/lib/tcc", b"-static", obj, b"-o", out]) == 0
     }
     pub fn run() -> i32 {
-        print(b"[build] run: /out.elf\n");
-        spawn(&[b"/out.elf"]) as i32
+        let out = crate::out_path();
+        print(b"[build] run: ");
+        print(out);
+        write_char(b'\n');
+        spawn(&[out]) as i32
     }
 }
 
+/// Length of the NUL-terminated C string at `p` (an argv entry).
+fn cstr_len(p: *const u8) -> usize {
+    let mut n = 0;
+    unsafe {
+        while *p.add(n) != 0 {
+            n += 1;
+        }
+    }
+    n
+}
+
 #[no_mangle]
-pub extern "C" fn _start() -> ! {
+extern "C" fn build_main(sp: *const u64) -> ! {
     mem::init();
-    print(b"[build] BuildDriver: compile -> link -> run  (/hello.c -> /out.elf)\n");
+    // argv[1] (at sp[2]) is the source path; default to /hello.c when omitted.
+    let argc = unsafe { *sp };
+    if argc >= 2 {
+        let p = unsafe { *sp.add(2) } as *const u8;
+        let n = cstr_len(p);
+        let src = unsafe { core::slice::from_raw_parts(p, n) };
+        set_paths(src);
+    } else {
+        set_paths(b"/hello.c");
+    }
+
+    print(b"[build] BuildDriver: compile -> link -> run  (");
+    print(src_path());
+    print(b" -> ");
+    print(out_path());
+    print(b")\n");
     let mut d = BuildDriver::__create();
     d.start();
     if d.is_done() {
-        print(b"[build] pipeline ok; /out.elf exited with code ");
+        print(b"[build] pipeline ok; ");
+        print(out_path());
+        print(b" exited with code ");
         print_i32(d.program_exit());
         write_char(b'\n');
         exit(0);

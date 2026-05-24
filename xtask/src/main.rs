@@ -1022,6 +1022,11 @@ fn build_tcc_sysroot(workspace: &Path) -> Result<Vec<(String, Vec<u8>)>> {
     let assert_c = workspace.join("csrc").join("tcc_assert.c");
     files.push(("/assert.c".into(), std::fs::read(&assert_c)?));
 
+    // A second source so the console-test can prove `buildc <src>` reads its
+    // source path from argv (compiles /hi.c -> /hi.elf, exit 3).
+    let hi_c = workspace.join("csrc").join("tcc_hi.c");
+    files.push(("/hi.c".into(), std::fs::read(&hi_c)?));
+
     Ok(files)
 }
 
@@ -1368,7 +1373,18 @@ fn run_console_test() -> Result<()> {
         eprintln!("console-test: typing `/bin/buildc`");
         stdin.write_all(b"/bin/buildc\n").context("write buildc")?;
         stdin.flush().ok();
-        wait_for_output(&buf, "[build] pipeline ok; /out.elf exited with code 7", 90)?;
+        // No-arg buildc defaults to /hello.c; output path is now derived
+        // (/hello.c -> /hello.elf), proving the BuildDriver pipeline end to end.
+        wait_for_output(&buf, "[build] pipeline ok; /hello.elf exited with code 7", 90)?;
+        // B11-3 follow-up: `buildc <src>` takes the source path from argv. Build
+        // a *different* source (/hi.c -> /hi.elf, exit 3) to prove it's argv, not
+        // a hardcoded /hello.c.
+        eprintln!("console-test: typing `/bin/buildc /hi.c`");
+        stdin
+            .write_all(b"/bin/buildc /hi.c\n")
+            .context("write buildc /hi.c")?;
+        stdin.flush().ok();
+        wait_for_output(&buf, "[build] pipeline ok; /hi.elf exited with code 3", 90)?;
         // B11-3 follow-up: assert() is a real abort, not a no-op. Compile and run
         // /assert.c (a deliberately-false assert); __assert_fail prints the
         // diagnostic to the console and abort()s before the program's printf, so

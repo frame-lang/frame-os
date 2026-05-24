@@ -1197,5 +1197,16 @@ Then started paying down the toolchain follow-ups from above:
   follow-up — the deferred exec/argv path uses absolute `/bin/...` today; an ish
   `cd` builtin is also a future nicety.)
 
-Still open from the list: growing the C-shim, and `buildc` taking a source path
-from argv (so it's a general `cc <file>` rather than a fixed `/hello.c`).
+- **`buildc <src>` from argv — DONE.** `buildc` no longer hardcodes `/hello.c`:
+  its `_start` is now an argv shim (like argtest) that reads `argv[1]` as the
+  source (default `/hello.c`), derives the object (`.c`→`.o`) and output
+  (`.c`→`.elf`) paths, and the BuildDriver FSM's `actions::*` build/run those.
+  console-test runs both the default (`/hello.c`→`/hello.elf`, exit 7) and an
+  explicit `buildc /hi.c` (→`/hi.elf`, exit 3, `csrc/tcc_hi.c`) — a real
+  `cc <file>`.
+
+With this the B11-3 toolchain tech-debt list is cleared. The only remaining
+follow-up is "grow the C-shim libc as on-device programs need more" — an
+open-ended, demand-driven item, not a discrete task. Relative `exec` (deferred
+exec/argv still uses absolute `/bin/...`) and an ish `cd` builtin are the small
+nice-to-haves noted under cwd.
