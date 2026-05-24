@@ -55,3 +55,27 @@ The system headers tcc includes (`stdio`/`stdlib`/`string`/`errno`/`math`/
 `frame-libc`'s `libc/include`; the functions it calls are implemented in
 `frame-libc` (B11-3c). Files here are **not modified** from upstream — the port
 lives entirely in frame-libc, so a version bump is a clean re-vendor.
+
+The `include/` subdirectory (`stdarg.h`, `stddef.h`, `stdbool.h`, `float.h`,
+`varargs.h`) is tcc's own intrinsic headers, vendored verbatim from the same
+0.9.27 release; they are staged on-device at `{tcc_lib_path}/include` so a
+compiled program's `#include <stdarg.h>` resolves.
+
+## Known limitation: static linking of Rust/LLVM objects (B11-3d)
+
+tcc 0.9.27's **fully-static x86-64 linker** mishandles objects with pervasive
+GOT/PLT relocations, which is exactly what a Rust/LLVM-compiled `libc.a`
+(`core` + `compiler_builtins` + frame-libc) emits. Two confirmed bugs: (1) it
+builds PLT stubs for default-visibility globals even in a static link, and those
+stubs have a wrong GOT displacement (jump into the PLT, GOT slots unfilled); and
+(2) the `.got` for `R_X86_64_GOTPCREL` data relocations is left unfilled. A
+program tcc links against the Rust `libc.a` therefore *links* but crashes at
+runtime. (Details + disassembly evidence in `docs/frame_assessment.md`,
+2026-05-24.)
+
+**We do not patch tcc** (these files stay pristine). Instead, tcc links against a
+**C-shim libc** built with `gcc -fno-pic` (no GOT relocations) and
+`-fvisibility=hidden` (so tcc's existing linker resolves `PLT32` calls directly,
+no PLT) — sidestepping both bugs. The Rust `frame-libc` remains the runtime for
+the OS's own programs. The bugs may be worth reporting against tcc's active
+`mob` branch (not the frozen 0.9.27) — verify they still reproduce there first.

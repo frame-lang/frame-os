@@ -336,7 +336,9 @@ struct QemuArtifacts {
 // spans double-indirect blocks, while staying small enough that copying the
 // template per smoke test stays fast. The on-disk *format* scales to ~2 TB;
 // this is just the default test image size.
-const BLK_DISK_BLOCKS: u32 = 8192; // 4 MiB / 512
+const BLK_DISK_BLOCKS: u32 = 65536; // 32 MiB / 512 — holds the tcc sysroot (the
+                                    // ~7 MiB libc.a dominates) + /bin/tcc + the
+                                    // other ELFs with comfortable headroom (B11-3d).
 
 /// USB mass-storage backing image: 64 KiB (128 × 512-byte blocks), block 0
 /// stamped with an 8-byte magic ("FRAMEOS!") the SCSI READ(10) test checks.
@@ -374,12 +376,19 @@ fn prepare_qemu_artifacts_features(workspace: &Path, interactive: bool) -> Resul
     let chello_elf = build_c_disk_elf(workspace, "hello")?;
     // B11-3d: the on-device C compiler itself, cross-built against frame-libc.
     let tcc_elf = build_tcc_disk_elf(workspace)?;
+    // B11-3d: the on-disk sysroot tcc compiles + links against (headers, crt
+    // objects, libc.a, libtcc1.a) plus the /hello.c it compiles. Owned bytes,
+    // held here so the `&[u8]` views pushed into `files` outlive build_fs_image.
+    let sysroot = build_tcc_sysroot(workspace)?;
     let mut files: Vec<(&str, &[u8])> = FS_FILES.to_vec();
     files.push(("/bin/hello", &hello_elf));
     files.push(("/bin/argtest", &argtest_elf));
     files.push(("/bin/cmain", &cmain_elf));
     files.push(("/bin/chello", &chello_elf));
     files.push(("/bin/tcc", &tcc_elf));
+    for (path, data) in &sysroot {
+        files.push((path.as_str(), data.as_slice()));
+    }
     let image = build_fs_image(BLK_DISK_BLOCKS, &files);
     std::fs::write(&blk_template, &image)
         .with_context(|| format!("failed to write {}", blk_template.display()))?;
@@ -431,8 +440,13 @@ fn build_fs_image(total_blocks: u32, files: &[(&str, &[u8])]) -> Vec<u8> {
         set_used(&mut disk, b);
     }
 
-    // Directory registry: (name "" = root, inode, data block, running dirent
-    // offset). Root is inode 1.
+    // Directory registry, keyed by full slash-path ("" = root). Each entry is
+    // (path, inode, data block, running dirent offset). Root is inode 1.
+    // Arbitrary nesting is supported: a file at `/usr/include/stdio.h`
+    // auto-creates `/usr` then `/usr/include` (the B11-3d tcc sysroot needs
+    // multi-level dirs; the kernel's `namei` already walks any depth). Each dir
+    // gets one 512-byte data block (16 dirents) — ample for the staged tree;
+    // an overflow asserts rather than silently corrupting.
     let mut next_ino = fs::ROOT_INODE; // 1
     let mut next_data = layout.data_start;
     let alloc_dir = |next_ino: &mut u32, next_data: &mut u32, disk: &mut [u8]| -> (u32, u32) {
@@ -444,8 +458,8 @@ fn build_fs_image(total_blocks: u32, files: &[(&str, &[u8])]) -> Vec<u8> {
         (ino, dblk)
     };
     let (root_ino, root_data) = alloc_dir(&mut next_ino, &mut next_data, &mut disk);
-    // dirs: (name, ino, data_block, dirent_off)
-    let mut dirs: Vec<(&str, u32, u32, usize)> = vec![("", root_ino, root_data, 0)];
+    // dirs: (full_path, ino, data_block, dirent_off)
+    let mut dirs: Vec<(String, u32, u32, usize)> = vec![(String::new(), root_ino, root_data, 0)];
 
     for (path, data) in files {
         let p = path.trim_start_matches('/');
@@ -453,19 +467,33 @@ fn build_fs_image(total_blocks: u32, files: &[(&str, &[u8])]) -> Vec<u8> {
             Some((d, n)) => (d, n),
             None => ("", p),
         };
-        // Get or create the parent directory (one level under root).
-        let di = match dirs.iter().position(|d| d.0 == dirname) {
-            Some(i) => i,
-            None => {
-                let (ino, dblk) = alloc_dir(&mut next_ino, &mut next_data, &mut disk);
-                // Add the subdir's dirent to root.
-                let (rblk, roff) = (dirs[0].2, dirs[0].3);
-                fs::write_dirent(&mut disk[blk(rblk)], roff, dirname.as_bytes(), ino);
-                dirs[0].3 += fs::DIRENT_SIZE;
-                dirs.push((dirname, ino, dblk, 0));
-                dirs.len() - 1
+        // Walk/create the parent directory chain; `di` ends at the leaf dir.
+        let mut di = 0usize; // root
+        if !dirname.is_empty() {
+            let mut acc = String::new();
+            for comp in dirname.split('/') {
+                if !acc.is_empty() {
+                    acc.push('/');
+                }
+                acc.push_str(comp);
+                di = match dirs.iter().position(|d| d.0 == acc) {
+                    Some(i) => i,
+                    None => {
+                        let (ino, dblk) = alloc_dir(&mut next_ino, &mut next_data, &mut disk);
+                        // Link the new subdir's dirent into its parent (`di`).
+                        let (pblk, poff) = (dirs[di].2, dirs[di].3);
+                        assert!(
+                            poff + fs::DIRENT_SIZE <= fs::BLOCK_SIZE,
+                            "mkfs: directory block overflow creating {acc}"
+                        );
+                        fs::write_dirent(&mut disk[blk(pblk)], poff, comp.as_bytes(), ino);
+                        dirs[di].3 += fs::DIRENT_SIZE;
+                        dirs.push((acc.clone(), ino, dblk, 0));
+                        dirs.len() - 1
+                    }
+                };
             }
-        };
+        }
 
         // Allocate the file inode + data blocks.
         let ino = next_ino;
@@ -530,18 +558,22 @@ fn build_fs_image(total_blocks: u32, files: &[(&str, &[u8])]) -> Vec<u8> {
 
         // Add the file's dirent to its parent directory.
         let (pblk, poff) = (dirs[di].2, dirs[di].3);
+        assert!(
+            poff + fs::DIRENT_SIZE <= fs::BLOCK_SIZE,
+            "mkfs: directory block overflow adding {name}"
+        );
         fs::write_dirent(&mut disk[blk(pblk)], poff, name.as_bytes(), ino);
         dirs[di].3 += fs::DIRENT_SIZE;
     }
 
     // Write every directory inode with its final size.
-    for &(_, ino, dblk, off) in &dirs {
+    for (_, ino, dblk, off) in &dirs {
         let mut d = fs::Inode::empty();
         d.kind = fs::T_DIR;
         d.nlink = 1;
-        d.direct[0] = dblk;
-        d.size = off as u32;
-        let (iblk, ioff) = layout.inode_loc(ino);
+        d.direct[0] = *dblk;
+        d.size = *off as u32;
+        let (iblk, ioff) = layout.inode_loc(*ino);
         d.write(&mut disk[blk(iblk)], ioff);
     }
 
@@ -632,18 +664,40 @@ fn build_libc_cshims(workspace: &Path, include: &Path, out_dir: &Path) -> Result
 /// outer build's RUSTFLAGS / rustc wrapper so they can't leak into the user
 /// link, and uses its own target dir (libc/.cargo/config sets target + reloc).
 fn build_libc_staticlib(workspace: &Path) -> Result<PathBuf> {
+    build_libc_staticlib_features(workspace, "libc-staticlib", true)
+}
+
+/// Build frame-os-libc as a staticlib with a chosen feature set, into its own
+/// target subdir (so variants don't clobber each other's `.a`). `crt0` selects
+/// whether the libc provides the program entry `_start`: ON for the
+/// direct-link runtime (chello, baked programs); OFF for the tcc sysroot's
+/// `libc.a`, where `crt1.o` owns `_start` instead (see libc/Cargo.toml).
+fn build_libc_staticlib_features(workspace: &Path, subdir: &str, crt0: bool) -> Result<PathBuf> {
     let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".into());
     let libc_dir = workspace.join("libc");
-    let lib_target = target_dir(workspace).join("libc-staticlib");
-    let status = Command::new(&cargo)
-        .current_dir(&libc_dir)
+    let lib_target = target_dir(workspace).join(subdir);
+    let mut cmd = Command::new(&cargo);
+    cmd.current_dir(&libc_dir)
         .env("CARGO_TARGET_DIR", &lib_target)
         .env_remove("RUSTFLAGS")
         .env_remove("CARGO_ENCODED_RUSTFLAGS")
         .env_remove("CARGO_BUILD_RUSTFLAGS")
         .env_remove("RUSTC_WORKSPACE_WRAPPER")
         .env_remove("RUSTC_WRAPPER")
-        .args(["build", "--release"])
+        .args(["build", "--release"]);
+    if !crt0 {
+        cmd.arg("--no-default-features");
+        // The tcc-sysroot libc.a is linked *by tcc* on-device. The x86_64
+        // target defaults to GOT-based symbol access (thousands of
+        // R_X86_64_GOTPCREL relocations); tcc's GOT construction for a fully
+        // static executable produces wrong addresses, so the linked program
+        // jumps into garbage. `relocation-model=static` makes LLVM emit direct
+        // PC-relative relocations (PC32/32S) instead — no GOT, and the simplest
+        // relocations tcc applies reliably. (The crt0 variant, linked by the
+        // host ld into tcc.elf itself, is left untouched.)
+        cmd.env("RUSTFLAGS", "-C relocation-model=static");
+    }
+    let status = cmd
         .status()
         .context("failed to invoke cargo for the frame-os-libc staticlib")?;
     if !status.success() {
@@ -812,6 +866,177 @@ fn build_tcc_disk_elf(workspace: &Path) -> Result<Vec<u8>> {
         bail!("ld link of tcc failed");
     }
     std::fs::read(&elf).with_context(|| format!("failed to read linked tcc ELF {}", elf.display()))
+}
+
+/// Stage a minimal on-disk sysroot so the on-device tcc can compile *and link* a
+/// C program the standard way (B11-3d):
+///
+///     tcc -B/usr/lib/tcc -static /hello.c -o /out.elf
+///
+/// Returns (disk-path, bytes) pairs for `build_fs_image`. The `-B/usr/lib/tcc`
+/// sets tcc's lib path so `{B}/include` (its intrinsic headers) and
+/// `{B}/libtcc1.a` resolve there; the default crt prefix (`/usr/lib`) and lib
+/// path (`/usr/lib`) cover the crt objects + `libc.a`; the default system
+/// include path (`/usr/include`) covers frame-libc's headers. `-static` keeps
+/// tcc from emitting a PT_INTERP / dynamic sections (Frame OS has no dynamic
+/// loader). Layout:
+///   /usr/include/**          frame-libc's system headers (stdio.h, sys/…)
+///   /usr/lib/tcc/include/*   tcc's intrinsic headers (stdarg.h, stddef.h, …)
+///   /usr/lib/{crt1,crti,crtn}.o   C startup objects (crt1.o owns `_start`)
+///   /usr/lib/libc.a          frame-libc, built WITHOUT its own `_start`
+///   /usr/lib/tcc/libtcc1.a   tcc runtime support — empty for now (only
+///                            variadic-*defining* programs reference its symbols;
+///                            hello.c just calls printf). A real one is a follow-up.
+///   /hello.c                 the program to compile (csrc/tcchello.c)
+fn build_tcc_sysroot(workspace: &Path) -> Result<Vec<(String, Vec<u8>)>> {
+    let out_dir = target_dir(workspace).join("tcc-sysroot");
+    std::fs::create_dir_all(&out_dir)?;
+    let mut files: Vec<(String, Vec<u8>)> = Vec::new();
+
+    // frame-libc system headers -> /usr/include (one level of subdir for sys/).
+    let inc = workspace.join("libc").join("include");
+    for entry in std::fs::read_dir(&inc)? {
+        let path = entry?.path();
+        if path.is_dir() {
+            let sub = path.file_name().unwrap().to_string_lossy().into_owned();
+            for e2 in std::fs::read_dir(&path)? {
+                let p2 = e2?.path();
+                let name = p2.file_name().unwrap().to_string_lossy().into_owned();
+                files.push((format!("/usr/include/{sub}/{name}"), std::fs::read(&p2)?));
+            }
+        } else {
+            let name = path.file_name().unwrap().to_string_lossy().into_owned();
+            files.push((format!("/usr/include/{name}"), std::fs::read(&path)?));
+        }
+    }
+
+    // tcc's intrinsic headers -> /usr/lib/tcc/include (= {B}/include).
+    let tinc = workspace.join("third_party").join("tcc").join("include");
+    for entry in std::fs::read_dir(&tinc)? {
+        let p = entry?.path();
+        let name = p.file_name().unwrap().to_string_lossy().into_owned();
+        files.push((format!("/usr/lib/tcc/include/{name}"), std::fs::read(&p)?));
+    }
+
+    // crt startup objects: assemble crt1.s/crti.s/crtn.s with the cross gcc.
+    let csrc = workspace.join("libc").join("csrc");
+    for crt in ["crt1", "crti", "crtn"] {
+        let src = csrc.join(format!("{crt}.s"));
+        let obj = out_dir.join(format!("{crt}.o"));
+        let status = Command::new("x86_64-linux-gnu-gcc")
+            .args(["-ffreestanding", "-fno-pie", "-fno-pic", "-c"])
+            .arg(&src)
+            .arg("-o")
+            .arg(&obj)
+            .status()
+            .with_context(|| format!("failed to invoke gcc to assemble {crt}.s"))?;
+        if !status.success() {
+            bail!("gcc assemble of libc/csrc/{crt}.s failed");
+        }
+        files.push((format!("/usr/lib/{crt}.o"), std::fs::read(&obj)?));
+    }
+
+    // frame-libc as libc.a, built WITHOUT its own `_start` (crt1.o owns it).
+    //
+    // The Rust staticlib is an archive of hundreds of LLVM-produced objects
+    // (frame-libc + core + compiler_builtins), and tcc 0.9.27's minimal object
+    // loader (`tcc_load_object_file`) faults on them — it doesn't handle every
+    // section/relocation shape modern LLVM emits. Fix: partial-link the whole
+    // archive into ONE relocatable object with the host `ld -r --whole-archive`.
+    // That resolves all *internal* references and merges everything into the
+    // standard .text/.data/.rodata/.bss sections an ld output has, leaving only
+    // the external undefined `main` (which the user program provides) — a single,
+    // conventional object tcc digests cleanly. Then strip DWARF (keeping the
+    // symbol table `-lc` needs) and repackage as a one-member `libc.a`.
+    let lib_a_src = build_libc_staticlib_features(workspace, "libc-staticlib-nocrt0", false)?;
+    let libc_o = out_dir.join("libc.o");
+    // `--exclude-libs=ALL` marks every symbol pulled from the archive as
+    // STV_HIDDEN in the merged object. This is the crux of getting tcc to link
+    // a *working* static executable: tcc only resolves an R_X86_64_PLT32 call
+    // directly (to a PC32, no PLT) when the target symbol is hidden or local
+    // (tccelf.c build_got_entries); for a default-visibility global it builds a
+    // PLT instead — and tcc's PLT for a fully-static x86-64 exe is broken (the
+    // stub's GOT displacement points back into the PLT, so the call jumps into
+    // garbage). frame-libc's `#[no_mangle]` exports are default-visibility
+    // globals, so without this every libc call would route through a broken
+    // PLT. Hidden symbols are still resolvable across objects (crt1.o → libc.o),
+    // just not dynamically exported — exactly what a static link wants.
+    let status = Command::new("x86_64-linux-gnu-ld")
+        .args(["-r", "--whole-archive", "--exclude-libs=ALL"])
+        .arg(&lib_a_src)
+        .arg("-o")
+        .arg(&libc_o)
+        .status()
+        .context("failed to partial-link libc.a into libc.o")?;
+    if !status.success() {
+        bail!("ld -r partial link of libc.a failed");
+    }
+    // Drop sections tcc 0.9.27's object loader can't digest. The killer is
+    // `.eh_frame`: LLVM emits it as type SHT_X86_64_UNWIND (0x70000001), which
+    // tcc doesn't recognize, so it skips the section — but the section's
+    // STT_SECTION symbol still points at it, and `tcc_load_object_file` then
+    // dereferences a NULL `Section*` (fault at `Section.sh_num`, offset 0x1c).
+    // None of these are needed on Frame OS (panic=abort ⇒ no unwinding; the
+    // .llvm* / .comment / .note are pure metadata), so remove them outright.
+    let status = Command::new("x86_64-linux-gnu-objcopy")
+        .args([
+            "--remove-section=.eh_frame",
+            "--remove-section=.eh_frame_hdr",
+            "--remove-section=.llvmbc",
+            "--remove-section=.llvmcmd",
+            "--remove-section=.comment",
+            "--remove-section=.note.GNU-stack",
+            "--remove-section=.note.gnu.property",
+        ])
+        .arg(&libc_o)
+        .status()
+        .context("failed to objcopy --remove-section on libc.o")?;
+    if !status.success() {
+        bail!("objcopy section removal on libc.o failed");
+    }
+    let status = Command::new("x86_64-linux-gnu-strip")
+        .args(["--strip-debug"])
+        .arg(&libc_o)
+        .status()
+        .context("failed to invoke strip on libc.o")?;
+    if !status.success() {
+        bail!("strip --strip-debug of libc.o failed");
+    }
+    let lib_a = out_dir.join("libc.a");
+    let _ = std::fs::remove_file(&lib_a);
+    let status = Command::new("x86_64-linux-gnu-ar")
+        .arg("crs")
+        .arg(&lib_a)
+        .arg(&libc_o)
+        .status()
+        .context("failed to repackage libc.o into libc.a")?;
+    if !status.success() {
+        bail!("ar repackage of libc.a failed");
+    }
+    files.push(("/usr/lib/libc.a".into(), std::fs::read(&lib_a)?));
+
+    // Empty tcc runtime-support archive. tcc auto-links libtcc1.a for every
+    // executable and errors if it's missing, but a program that only *calls*
+    // variadic functions (printf) references none of its symbols, so an empty
+    // (but well-formed) archive satisfies the link. `ar` writes the `!<arch>`
+    // header with zero members; tcc_load_archive iterates nothing and moves on.
+    let libtcc1 = out_dir.join("libtcc1.a");
+    let _ = std::fs::remove_file(&libtcc1);
+    let status = Command::new("x86_64-linux-gnu-ar")
+        .arg("crs")
+        .arg(&libtcc1)
+        .status()
+        .context("failed to invoke ar for empty libtcc1.a")?;
+    if !status.success() {
+        bail!("ar create of empty libtcc1.a failed");
+    }
+    files.push(("/usr/lib/tcc/libtcc1.a".into(), std::fs::read(&libtcc1)?));
+
+    // The C program the on-device tcc will compile.
+    let hello_c = workspace.join("csrc").join("tcchello.c");
+    files.push(("/hello.c".into(), std::fs::read(&hello_c)?));
+
+    Ok(files)
 }
 
 /// Produce a fresh copy of the virtio-blk disk for one QEMU invocation.
@@ -1117,8 +1342,12 @@ fn run_console_test() -> Result<()> {
         wait_for_output(&buf, "chello: done", 20)?;
         // B11-3d: the on-device C compiler runs at all. `tcc -v` prints its
         // version banner — proof tcc's crt0 + libc startup + arg handling work in
-        // ring 3 (the full `tcc file.c -o out` compile lands once the sysroot is
-        // staged). The version string is tcc 0.9.27's, from the vendored source.
+        // ring 3. The version string is tcc 0.9.27's, from the vendored source.
+        // (The full `tcc /hello.c -o /out.elf` + exec path compiles and links
+        // successfully today, but the linked program doesn't yet run — a second
+        // tcc static-link relocation bug leaves the GOT unfilled; tracked as a
+        // spawned investigation. This step will assert the compiled program's
+        // output once that lands.)
         eprintln!("console-test: typing `/bin/tcc -v`");
         stdin.write_all(b"/bin/tcc -v\n").context("write tcc -v")?;
         stdin.flush().ok();

@@ -19,6 +19,18 @@ path = "src/lib.rs"
 # compiled by gcc/tcc against frame-libc (B11). Built standalone from libc/.
 crate-type = ["rlib", "staticlib"]
 
+# The `crt0` feature (default on) provides the program entry `_start` (the asm
+# shim that hands the SysV stack to `__libc_start`). The Rust user programs and
+# the gcc-built C programs (chello) link the libc *as their whole runtime*, so
+# they need `_start` from it. But when tcc links a program the standard way
+# (`crt1.o crti.o … crtn.o -lc`), `_start` comes from `crt1.o` instead — and
+# `crt1.o` pulls `__libc_start` from this `.a`, whose object would *also* carry
+# `_start` (same translation unit), a duplicate-symbol clash. So the tcc sysroot
+# `libc.a` is built `--no-default-features` to omit `_start`; `crt1.o` owns it.
+[features]
+default = ["crt0"]
+crt0 = []
+
 [dependencies]
 # Free-list bookkeeping behind malloc/free. The C ABI (free takes no size) is
 # handled by a size-tracking header we add in src/malloc.rs; this crate just

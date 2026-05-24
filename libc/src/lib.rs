@@ -13,7 +13,9 @@
 extern crate alloc;
 
 use core::alloc::{GlobalAlloc, Layout};
-use core::arch::{asm, global_asm};
+use core::arch::asm;
+#[cfg(feature = "crt0")]
+use core::arch::global_asm;
 
 mod cfloat;
 mod cstdlib;
@@ -62,6 +64,11 @@ static GLOBAL: LibcAlloc = LibcAlloc;
 // crt0 the `argtest` program hand-rolled in B9-2, now owned by the libc — every
 // program that links frame-libc gets a real `_start` for free and just writes
 // `main`.
+// Gated by the `crt0` feature (default on). Omitted from the tcc-sysroot
+// `libc.a` (built `--no-default-features`), where `_start` comes from `crt1.o`
+// instead — see Cargo.toml. `__libc_start` (below) stays in either build, so
+// `crt1.o` can call it.
+#[cfg(feature = "crt0")]
 global_asm!(
     ".global _start",
     "_start:",
