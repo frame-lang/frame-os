@@ -173,6 +173,12 @@ pub(crate) fn sys_lseek(fd: i32, offset: i64, whence: i32) -> u64 {
     unsafe { syscall3(13, fd as u64, offset as u64, whence as u64) }
 }
 
+/// unlink(path) → 0 on success, u64::MAX if it doesn't resolve to a file
+/// (syscall #17, the B11-3 file-delete follow-up).
+pub(crate) fn sys_unlink(path: &[u8]) -> u64 {
+    unsafe { syscall3(17, path.as_ptr() as u64, path.len() as u64, 0) }
+}
+
 /// read_line(buf) → bytes read for the console (blocks until a line; B8 syscall
 /// #9). Backs `stdin` refills, where the console has no plain readable fd.
 pub(crate) fn sys_read_line(buf: &mut [u8]) -> usize {

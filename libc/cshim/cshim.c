@@ -59,6 +59,12 @@ ssize_t write(int fd, const void *buf, size_t len) {
 ssize_t read(int fd, void *buf, size_t len) {
     return syscall3(6, fd, (long)buf, (long)len);
 }
+int unlink(const char *path) {
+    /* syscall 17: 0 ok, -1 (u64::MAX) if it doesn't resolve to a file. */
+    size_t n = 0;
+    while (path[n]) n++;
+    return syscall3(17, (long)path, (long)n, 0) == -1L ? -1 : 0;
+}
 
 /* --- mem/string ----------------------------------------------------------- */
 

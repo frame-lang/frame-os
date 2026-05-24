@@ -7,7 +7,7 @@
 
 use core::ffi::c_char;
 
-use crate::{sys_close, sys_lseek, sys_open, sys_read};
+use crate::{sys_close, sys_lseek, sys_open, sys_read, sys_unlink};
 
 /// The single global `errno`. frame-libc is single-threaded per process, so a
 /// plain global matches the `extern int errno;` the header declares.
@@ -68,11 +68,17 @@ pub extern "C" fn lseek(fd: i32, offset: i64, whence: i32) -> i64 {
     }
 }
 
-/// `unlink(path)` — Frame OS has no file-delete syscall yet; report failure.
-/// (tcc only unlinks temp files, which the compile-to-file path doesn't make.)
+/// `unlink(path)` — delete a file via the kernel (syscall #17, B11-3 follow-up).
+/// Returns 0 on success, -1 if the path doesn't resolve to a regular file.
 #[no_mangle]
-pub unsafe extern "C" fn unlink(_path: *const c_char) -> i32 {
-    -1
+pub unsafe extern "C" fn unlink(path: *const c_char) -> i32 {
+    let len = cstr_len(path);
+    let bytes = core::slice::from_raw_parts(path as *const u8, len);
+    if sys_unlink(bytes) == u64::MAX {
+        -1
+    } else {
+        0
+    }
 }
 
 /// `remove(path)` — same as unlink for regular files.

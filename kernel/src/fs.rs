@@ -417,6 +417,62 @@ pub fn delete(name: &[u8]) -> bool {
     true
 }
 
+/// Delete the file at absolute `path` (B11-3-followup). Generalizes `delete`
+/// (which is root-only): resolves the parent directory by path, frees the
+/// file's inode + data blocks, and clears its dirent in the parent. Returns
+/// false if the path doesn't resolve to a regular file. Directories are not
+/// removed (only `T_FILE`). The syscall layer (`unlink`) calls this.
+pub fn unlink(path: &[u8]) -> bool {
+    // Split into the parent directory path and the final component name.
+    let (parent_path, name): (&[u8], &[u8]) = match path.iter().rposition(|&c| c == b'/') {
+        Some(i) => (&path[..i], &path[i + 1..]),
+        None => (b"", path),
+    };
+    if name.is_empty() {
+        return false;
+    }
+    let parent_ino = if parent_path.is_empty() {
+        fs::ROOT_INODE
+    } else {
+        match namei(parent_path) {
+            Some(i) => i,
+            None => return false,
+        }
+    };
+    let Some(ino) = dir_lookup(parent_ino, name) else {
+        return false;
+    };
+    let node = read_inode(ino);
+    if node.kind != fs::T_FILE {
+        return false; // don't unlink directories
+    }
+    free_all_blocks(&node);
+    write_inode(ino, &fs::Inode::empty()); // mark $free
+
+    // Clear the dirent in the parent's data blocks (set inode 0; lookup skips it).
+    let parent = read_inode(parent_ino);
+    let entries = parent.size as usize / fs::DIRENT_SIZE;
+    let mut seen = 0usize;
+    for &blk in parent.direct.iter() {
+        if blk == 0 {
+            continue;
+        }
+        let mut data = read_block(blk);
+        let mut off = 0;
+        while off + fs::DIRENT_SIZE <= fs::BLOCK_SIZE && seen < entries {
+            let (dname, dino) = fs::read_dirent(&data, off);
+            seen += 1;
+            if dino == ino && fs::name_eq(&dname, name) {
+                fs::write_dirent(&mut data, off, b"", 0);
+                write_block(blk, &data);
+                return true;
+            }
+            off += fs::DIRENT_SIZE;
+        }
+    }
+    true
+}
+
 // --- mount -----------------------------------------------------------------
 
 /// Mount the FS by driving the `Mount` HSM ($Unmounted → $Mounting → $Mounted)

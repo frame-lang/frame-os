@@ -9,7 +9,7 @@
 // "fwtest: all ok" on success (a FAIL line otherwise).
 //
 // Syscall ABI: 1=exit 5=open(path,len,flags) 6=read 7=close 12=write 13=lseek
-//              14=fstat 16=dup, plus 0=write_char for printing.
+//              14=fstat 16=dup 17=unlink, plus 0=write_char for printing.
 
 #![no_std]
 #![no_main]
@@ -88,6 +88,9 @@ fn fstat(fd: u64) -> u64 {
 fn dup(fd: u64) -> u64 {
     unsafe { syscall3(16, fd, 0, 0) }
 }
+fn unlink(path: &[u8]) -> u64 {
+    unsafe { syscall3(17, path.as_ptr() as u64, path.len() as u64, 0) }
+}
 
 fn fail(msg: &[u8]) -> ! {
     print(b"FAIL: ");
@@ -164,9 +167,19 @@ pub extern "C" fn _start() -> ! {
     close(rfd);
     close(dfd);
 
+    // 7. unlink the file, then confirm it's gone (B11-3 follow-up, syscall #17):
+    //    unlink returns 0, and a subsequent open-for-read must fail.
+    if unlink(PATH) != 0 {
+        fail(b"unlink");
+    }
+    if open(PATH, O_READ) != u64::MAX {
+        fail(b"file still present after unlink");
+    }
+
     print(b"fwtest: wrote 16 bytes, fstat=");
     print_u64(sz);
     print(b", seek+overwrite+dup read-back ok\n");
+    print(b"fwtest: unlink removed /tmp.txt (reopen fails): ok\n");
     print(b"fwtest: all ok\n");
     exit(0);
 }

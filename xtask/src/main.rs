@@ -1904,7 +1904,11 @@ const SMOKE_TESTS: &[SmokeTest] = &[
         // round-trip through the on-disk filesystem. These are the syscalls a
         // libc/toolchain (B10+) needs to write its output and stat its inputs.
         name: "file_write_roundtrip_b9",
-        expect_contains: &["fwtest: wrote 16 bytes, fstat=16", "fwtest: all ok"],
+        expect_contains: &[
+            "fwtest: wrote 16 bytes, fstat=16",
+            "fwtest: unlink removed /tmp.txt (reopen fails): ok",
+            "fwtest: all ok",
+        ],
         expect_absent: &["FAIL:", "KERNEL EXCEPTION", "KERNEL PANIC", "triple fault"],
         timeout_secs: 20,
     },
