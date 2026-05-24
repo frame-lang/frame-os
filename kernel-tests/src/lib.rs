@@ -220,7 +220,9 @@ pub mod elf {
     }
 
     pub fn build_stack() -> bool {
-        STACK_TOP.with(|c| c.set(0x2000_0000 + 4096 - 16));
+        // Mirrors kernel::elf USER_STACK_PAGES = 32 (the value is inert for the
+        // loader-phase FSM tests; kept consistent so the double doesn't mislead).
+        STACK_TOP.with(|c| c.set(0x2000_0000 + 32 * 4096 - 16));
         true
     }
 

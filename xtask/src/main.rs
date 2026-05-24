@@ -372,11 +372,14 @@ fn prepare_qemu_artifacts_features(workspace: &Path, interactive: bool) -> Resul
     let cmain_elf = build_user_disk_elf(workspace, "cmain")?;
     // B11-2: a C program cross-compiled (gcc + ld) against frame-libc.
     let chello_elf = build_c_disk_elf(workspace, "hello")?;
+    // B11-3d: the on-device C compiler itself, cross-built against frame-libc.
+    let tcc_elf = build_tcc_disk_elf(workspace)?;
     let mut files: Vec<(&str, &[u8])> = FS_FILES.to_vec();
     files.push(("/bin/hello", &hello_elf));
     files.push(("/bin/argtest", &argtest_elf));
     files.push(("/bin/cmain", &cmain_elf));
     files.push(("/bin/chello", &chello_elf));
+    files.push(("/bin/tcc", &tcc_elf));
     let image = build_fs_image(BLK_DISK_BLOCKS, &files);
     std::fs::write(&blk_template, &image)
         .with_context(|| format!("failed to write {}", blk_template.display()))?;
@@ -623,10 +626,13 @@ fn build_libc_cshims(workspace: &Path, include: &Path, out_dir: &Path) -> Result
 ///   3. `ld` link the object + the `.a` with the user linker script (ENTRY
 ///      `_start` comes from the libc's crt0) into a non-PIE ET_EXEC.
 /// This is exactly the toolchain flow tcc will perform on-device at B11-3.
-fn build_c_disk_elf(workspace: &Path, name: &str) -> Result<Vec<u8>> {
+/// Build frame-os-libc as a staticlib and return the path to its
+/// `libframe_os_libc.a`. Shared by every C program build (chello, tcc): the `.a`
+/// is the C/POSIX runtime + crt0 they link against. The nested cargo scrubs the
+/// outer build's RUSTFLAGS / rustc wrapper so they can't leak into the user
+/// link, and uses its own target dir (libc/.cargo/config sets target + reloc).
+fn build_libc_staticlib(workspace: &Path) -> Result<PathBuf> {
     let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".into());
-
-    // 1. frame-os-libc staticlib (libc/.cargo/config sets the target + reloc).
     let libc_dir = workspace.join("libc");
     let lib_target = target_dir(workspace).join("libc-staticlib");
     let status = Command::new(&cargo)
@@ -643,10 +649,16 @@ fn build_c_disk_elf(workspace: &Path, name: &str) -> Result<Vec<u8>> {
     if !status.success() {
         bail!("frame-os-libc staticlib build failed");
     }
-    let lib_a = lib_target
+    Ok(lib_target
         .join("x86_64-unknown-none")
         .join("release")
-        .join("libframe_os_libc.a");
+        .join("libframe_os_libc.a"))
+}
+
+fn build_c_disk_elf(workspace: &Path, name: &str) -> Result<Vec<u8>> {
+    // 1. frame-os-libc staticlib (shared with the tcc build).
+    let libc_dir = workspace.join("libc");
+    let lib_a = build_libc_staticlib(workspace)?;
 
     let out_dir = target_dir(workspace).join("csrc");
     std::fs::create_dir_all(&out_dir)?;
@@ -708,6 +720,98 @@ fn build_c_disk_elf(workspace: &Path, name: &str) -> Result<Vec<u8>> {
     }
 
     std::fs::read(&elf).with_context(|| format!("failed to read linked ELF {}", elf.display()))
+}
+
+/// Cross-compile the vendored TinyCC (`third_party/tcc`) against frame-libc into
+/// a Frame OS user ELF, returned as bytes for staging at `/bin/tcc` (B11-3d) —
+/// the on-device C toolchain. tcc 0.9.27 defaults to ONE_SOURCE, so it's two
+/// translation units: `libtcc.c` (`-DONE_SOURCE=1`, which `#include`s the
+/// preprocessor/codegen/ELF/asm/x86_64 backend) and `tcc.c` (`-DONE_SOURCE=0`,
+/// the CLI driver, which `#include`s `tcctools.c`). Both are compiled
+/// freestanding + `-nostdinc` against the gcc freestanding headers (for
+/// `stdarg`/`stddef`/`stdint`) + `libc/include` + the tcc dir, then linked with
+/// the user linker script + the frame-libc staticlib + the `strtold` C shim.
+/// Build defines per third_party/tcc/README.frame-os.md: `TCC_TARGET_X86_64`,
+/// `CONFIG_TCC_STATIC`, `CONFIG_TCCBOOT`. `-w` silences upstream warnings (the
+/// vendored source is unmodified, so they aren't actionable here).
+fn build_tcc_disk_elf(workspace: &Path) -> Result<Vec<u8>> {
+    let tcc_dir = workspace.join("third_party").join("tcc");
+    let include = workspace.join("libc").join("include");
+    let out_dir = target_dir(workspace).join("tcc-build");
+    std::fs::create_dir_all(&out_dir)?;
+
+    // gcc's own freestanding header dir (stdarg.h/stddef.h/stdint.h) — queried so
+    // the gcc version isn't hard-coded into a path.
+    let freestd = {
+        let out = Command::new("x86_64-linux-gnu-gcc")
+            .args(["-print-file-name=include"])
+            .output()
+            .context("failed to query gcc freestanding include dir")?;
+        if !out.status.success() {
+            bail!("`gcc -print-file-name=include` failed");
+        }
+        PathBuf::from(String::from_utf8_lossy(&out.stdout).trim())
+    };
+
+    // Compile one tcc translation unit. `one_source` is "-DONE_SOURCE=1" or "=0".
+    let compile = |src: &str, one_source: &str, obj: &Path| -> Result<()> {
+        let status = Command::new("x86_64-linux-gnu-gcc")
+            .args([
+                "-ffreestanding",
+                "-nostdinc",
+                "-fno-stack-protector",
+                "-fno-pie",
+                "-fno-pic",
+                "-O2",
+                "-w",
+                "-c",
+            ])
+            .args(["-DTCC_TARGET_X86_64", "-DCONFIG_TCC_STATIC", "-DCONFIG_TCCBOOT"])
+            .arg(one_source)
+            .arg("-isystem")
+            .arg(&freestd)
+            .arg("-I")
+            .arg(&include)
+            .arg("-I")
+            .arg(&tcc_dir)
+            .arg(tcc_dir.join(src))
+            .arg("-o")
+            .arg(obj)
+            .status()
+            .with_context(|| format!("failed to invoke gcc for tcc unit {src}"))?;
+        if !status.success() {
+            bail!("gcc compile of third_party/tcc/{src} failed");
+        }
+        Ok(())
+    };
+    let libtcc_o = out_dir.join("libtcc.o");
+    let tcc_o = out_dir.join("tcc.o");
+    compile("libtcc.c", "-DONE_SOURCE=1", &libtcc_o)?;
+    compile("tcc.c", "-DONE_SOURCE=0", &tcc_o)?;
+
+    // The frame-libc staticlib + its C shims (strtold) — same runtime chello links.
+    let lib_a = build_libc_staticlib(workspace)?;
+    let shims = build_libc_cshims(workspace, &include, &out_dir)?;
+
+    // Link: user linker script (ENTRY `_start` from crt0), gc + strip.
+    let elf = out_dir.join("tcc.elf");
+    let linker_script = workspace.join("user").join("linker.ld");
+    let mut ld = Command::new("x86_64-linux-gnu-ld");
+    ld.arg("-T")
+        .arg(&linker_script)
+        .args(["-z", "max-page-size=0x1000", "--gc-sections", "--strip-all"])
+        .arg("-o")
+        .arg(&elf)
+        .arg(&libtcc_o)
+        .arg(&tcc_o);
+    for shim in &shims {
+        ld.arg(shim);
+    }
+    let status = ld.arg(&lib_a).status().context("failed to invoke ld for tcc")?;
+    if !status.success() {
+        bail!("ld link of tcc failed");
+    }
+    std::fs::read(&elf).with_context(|| format!("failed to read linked tcc ELF {}", elf.display()))
 }
 
 /// Produce a fresh copy of the virtio-blk disk for one QEMU invocation.
@@ -1011,6 +1115,14 @@ fn run_console_test() -> Result<()> {
         wait_for_output(&buf, "chello: malloc buf = ABCDEFGHIJ", 20)?;
         wait_for_output(&buf, "chello: read back: C wrote this: 1234", 20)?;
         wait_for_output(&buf, "chello: done", 20)?;
+        // B11-3d: the on-device C compiler runs at all. `tcc -v` prints its
+        // version banner — proof tcc's crt0 + libc startup + arg handling work in
+        // ring 3 (the full `tcc file.c -o out` compile lands once the sysroot is
+        // staged). The version string is tcc 0.9.27's, from the vendored source.
+        eprintln!("console-test: typing `/bin/tcc -v`");
+        stdin.write_all(b"/bin/tcc -v\n").context("write tcc -v")?;
+        stdin.flush().ok();
+        wait_for_output(&buf, "tcc version 0.9.27", 20)?;
         eprintln!("console-test: C program ran on Frame OS; typing `exit`");
         stdin.write_all(b"exit\n").context("write exit")?;
         stdin.flush().ok();

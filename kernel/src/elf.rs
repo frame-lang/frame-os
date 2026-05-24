@@ -22,7 +22,20 @@ use crate::{frames, paging};
 
 const PAGE: u64 = 4096;
 const USER_STACK_VA: u64 = 0x0000_0000_2000_0000; // proven-free user VA
-const MAX_TRACKED: usize = 64; // mapped pages we can roll back on failure
+// User stack size in pages. One page (4 KiB) sufficed through B10, but the
+// on-device C compiler (tcc, B11-3) is a recursive-descent parser with large
+// local buffers and easily blows a 4 KiB stack. 32 pages (128 KiB) gives it
+// generous headroom; the stack region [VA, VA + 32*PAGE) sits far below the
+// brk heap (0x3000_0000) and above the program image (0x1000_0000), so it
+// can't collide with either. Uniform for every program — small programs simply
+// don't touch the extra pages (they're mapped lazily-zeroed at load).
+const USER_STACK_PAGES: u64 = 32;
+// Pages we can roll back on a *failed* load (the $Failed funnel calls
+// `cleanup`). Sized to cover the largest program we load (tcc: ~104 PT_LOAD
+// pages) plus its stack, so a partial load is fully reclaimed. The *success*
+// path doesn't depend on this — `paging::free_address_space` walks the page
+// tables on exit/reap and frees everything regardless.
+const MAX_TRACKED: usize = 512;
 
 /// The parsed ELF header fields that flow down the `ElfLoader` phase pipeline
 /// as an enter parameter (`$ReadingHeader → $ValidatingHeader → $MappingSegments`).
@@ -201,22 +214,24 @@ fn map_one_segment(p_offset: u64, p_vaddr: u64, p_filesz: u64, p_memsz: u64, fla
     true
 }
 
-/// Phase 4: allocate + map a one-page user stack. Returns false on OOM.
+/// Phase 4: allocate + map the user stack (`USER_STACK_PAGES` pages). Returns
+/// false on OOM (after rolling back via the tracked-page list on the $Failed
+/// path). The stack occupies `[USER_STACK_VA, USER_STACK_VA + N*PAGE)` and grows
+/// down from the top; every page is mapped up front (no demand paging here).
 pub fn build_stack() -> bool {
     let e = elf();
-    let Some(frame) = frames::alloc_frame() else {
-        return false;
-    };
-    unsafe {
-        paging::map_in(
-            e.pml4,
-            USER_STACK_VA,
-            frame,
-            paging::USER | paging::WRITABLE,
-        );
+    for i in 0..USER_STACK_PAGES {
+        let va = USER_STACK_VA + i * PAGE;
+        let Some(frame) = frames::alloc_frame() else {
+            return false;
+        };
+        unsafe {
+            core::ptr::write_bytes(frames::phys_to_virt(frame), 0, PAGE as usize);
+            paging::map_in(e.pml4, va, frame, paging::USER | paging::WRITABLE);
+        }
+        track(va, frame);
     }
-    track(USER_STACK_VA, frame);
-    e.stack_top = USER_STACK_VA + PAGE - 16; // 16-aligned-ish top
+    e.stack_top = USER_STACK_VA + USER_STACK_PAGES * PAGE - 16; // 16-aligned-ish top
     true
 }
 

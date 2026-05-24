@@ -51,10 +51,15 @@ pub fn alloc_count() -> u64 {
     ALLOCATOR.allocs.load(Ordering::Relaxed)
 }
 
-/// Heap size. 256 KiB is comfortable headroom for B0's allocation needs
-/// (boot HSM event/compartment plumbing) without bloating the kernel
-/// image's BSS unreasonably.
-const HEAP_SIZE: usize = 256 * 1024;
+/// Heap size. 256 KiB sufficed through B10, but `exec` now reads each program's
+/// ELF image into a per-exec heap buffer (`usermode::read_exec_elf`), and the
+/// on-device C compiler `/bin/tcc` is ~1.2 MiB — far past 256 KiB, so its exec
+/// `try_reserve` failed and the shell reported "command not found". 8 MiB gives
+/// the largest program's image plus steady-state kernel allocations (Frame
+/// runtime events, process table, buffer cache) generous headroom. It's a
+/// zero-initialized BSS static, so it costs nothing in the on-disk image — the
+/// loader carves it from RAM (QEMU's default is well over 100 MiB).
+const HEAP_SIZE: usize = 8 * 1024 * 1024;
 
 /// The heap backing store. A zero-initialized static lives in BSS, so it
 /// costs nothing in the kernel image on disk — it's carved out of RAM by
