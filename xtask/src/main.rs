@@ -1329,6 +1329,9 @@ fn run_console_test() -> Result<()> {
         // the date + hour prefix (boot consumes only seconds of VM time, so the
         // hour stays 12); the minute/second tail is left unasserted.
         wait_for_output(&buf, "cmain: clock 2026-05-24 12:", 20)?;
+        // B11-3 follow-up: per-process cwd. getcwd/chdir (absolute, relative,
+        // ".."), a failing chdir, and a relative fopen that honors the cwd.
+        wait_for_output(&buf, "cmain: cwd chdir/getcwd + relative open ok", 20)?;
         // B11-2: a real C program (gcc-compiled, linked against frame-libc) runs.
         eprintln!("console-test: typing `/bin/chello`");
         stdin.write_all(b"/bin/chello\n").context("write chello")?;

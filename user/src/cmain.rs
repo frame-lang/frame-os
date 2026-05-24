@@ -44,6 +44,13 @@ struct Tm {
 extern "C" {
     fn time(t: *mut i64) -> i64;
     fn localtime(t: *const i64) -> *const Tm;
+    fn getcwd(buf: *mut u8, size: usize) -> *mut u8;
+    fn chdir(path: *const u8) -> i32;
+}
+
+// Compare a NUL-terminated buffer `buf` against `expected` (no NUL).
+fn cstr_eq(buf: &[u8], expected: &[u8]) -> bool {
+    expected.len() < buf.len() && &buf[..expected.len()] == expected && buf[expected.len()] == 0
 }
 
 // `main`, C-style: `int main(int argc, char **argv, char **envp)`. frame-libc's
@@ -215,6 +222,38 @@ extern "C" fn main(argc: i32, argv: *const *const u8, _envp: *const *const u8) -
             Arg::Int(now),
         ],
     );
+
+    // B11-3 follow-up: per-process cwd. getcwd reports the start dir ("/"),
+    // chdir moves into directories (absolute, relative, and ".."), a bad target
+    // fails, and a relative fopen honors the cwd — exercising the kernel's cwd
+    // storage + path-resolution syscalls end to end.
+    let mut cbuf = [0u8; 64];
+    let r0 = unsafe { getcwd(cbuf.as_mut_ptr(), cbuf.len()) };
+    let at_root = !r0.is_null() && cstr_eq(&cbuf, b"/");
+    let cd_usr = unsafe { chdir(b"/usr\0".as_ptr()) } == 0;
+    unsafe { getcwd(cbuf.as_mut_ptr(), cbuf.len()) };
+    let in_usr = cstr_eq(&cbuf, b"/usr");
+    let cd_inc = unsafe { chdir(b"include\0".as_ptr()) } == 0; // relative
+    unsafe { getcwd(cbuf.as_mut_ptr(), cbuf.len()) };
+    let in_inc = cstr_eq(&cbuf, b"/usr/include");
+    let cd_up = unsafe { chdir(b"..\0".as_ptr()) } == 0; // ".." → /usr
+    unsafe { getcwd(cbuf.as_mut_ptr(), cbuf.len()) };
+    let back_usr = cstr_eq(&cbuf, b"/usr");
+    let bad = unsafe { chdir(b"/nope\0".as_ptr()) } == -1; // missing dir fails
+    let cd_root = unsafe { chdir(b"/\0".as_ptr()) } == 0;
+    // /readme is staged at the root; open it via a *relative* path.
+    let rf = unsafe { fopen(b"readme\0".as_ptr(), b"r\0".as_ptr()) };
+    let rel_open = !rf.is_null();
+    if !rf.is_null() {
+        unsafe { fclose(rf) };
+    }
+    if at_root && cd_usr && in_usr && cd_inc && in_inc && cd_up && back_usr && bad && cd_root
+        && rel_open
+    {
+        write(1, b"cmain: cwd chdir/getcwd + relative open ok\n");
+    } else {
+        write(1, b"cmain: cwd MISMATCH\n");
+    }
     0
 }
 // No #[panic_handler] here: frame-libc provides it (cmain links the libc).

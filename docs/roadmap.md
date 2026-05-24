@@ -1186,6 +1186,16 @@ Then started paying down the toolchain follow-ups from above:
   determinism; `cmain` prints `clock 2026-05-24 12:…` and console-test asserts
   it.
 
-Still open from the list: per-process `cwd`/`chdir`/`getcwd`, growing the
-C-shim, and `buildc` taking a source path from argv (so it's a general
-`cc <file>` rather than a fixed `/hello.c`).
+- **Per-process cwd + chdir/getcwd — DONE.** Each TCB now carries a canonical
+  absolute cwd (`fork` inherits it, `exec` keeps it, fresh processes start at
+  "/"). New syscalls #19 `chdir` and #20 `getcwd`; `fs::resolve` canonicalizes a
+  possibly-relative path against the cwd (collapsing `.`/`..`/`//`), and the
+  file syscalls (open/stat/unlink) run it so relative paths honor the cwd.
+  frame-libc gets real `chdir`/`getcwd`. `cmain` exercises it end to end:
+  getcwd at "/", chdir absolute/relative/"..", a failing chdir, and a relative
+  `fopen("readme")` that resolves to `/readme`. (Relative `exec` is left for a
+  follow-up — the deferred exec/argv path uses absolute `/bin/...` today; an ish
+  `cd` builtin is also a future nicety.)
+
+Still open from the list: growing the C-shim, and `buildc` taking a source path
+from argv (so it's a general `cc <file>` rather than a fixed `/hello.c`).

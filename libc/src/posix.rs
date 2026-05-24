@@ -88,15 +88,36 @@ pub unsafe extern "C" fn remove(path: *const c_char) -> i32 {
     unlink(path)
 }
 
-/// `getcwd(buf, size)` — Frame OS has no per-process cwd; report root "/".
+/// `getcwd(buf, size)` — copy the process's current working directory (a
+/// canonical absolute path) into `buf`, NUL-terminated. Returns `buf`, or NULL
+/// (ERANGE) if it doesn't fit. Backed by syscall #20 (B11-3 follow-up).
 #[no_mangle]
 pub unsafe extern "C" fn getcwd(buf: *mut c_char, size: usize) -> *mut c_char {
-    if buf.is_null() || size < 2 {
+    if buf.is_null() || size == 0 {
         return core::ptr::null_mut();
     }
-    *buf = b'/' as c_char;
-    *buf.add(1) = 0;
+    // The kernel returns the path without a NUL, so leave room for one.
+    let dst = core::slice::from_raw_parts_mut(buf as *mut u8, size);
+    let n = crate::sys_getcwd(&mut dst[..size - 1]);
+    if n == u64::MAX {
+        return core::ptr::null_mut();
+    }
+    *buf.add(n as usize) = 0;
     buf
+}
+
+/// `chdir(path)` — set the process's current working directory. Returns 0 on
+/// success, -1 if the path doesn't resolve to a directory. Backed by syscall
+/// #19 (B11-3 follow-up).
+#[no_mangle]
+pub unsafe extern "C" fn chdir(path: *const c_char) -> i32 {
+    let len = cstr_len(path);
+    let bytes = core::slice::from_raw_parts(path as *const u8, len);
+    if crate::sys_chdir(bytes) == u64::MAX {
+        -1
+    } else {
+        0
+    }
 }
 
 /// `execvp(file, argv)` — Frame OS's tcc is self-contained (no external `as`/

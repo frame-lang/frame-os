@@ -274,6 +274,63 @@ pub fn is_file(ino: u32) -> bool {
     read_inode(ino).kind == fs::T_FILE
 }
 
+/// Whether `ino` is a directory.
+pub fn is_dir(ino: u32) -> bool {
+    read_inode(ino).kind == fs::T_DIR
+}
+
+/// Resolve a possibly-relative `path` against the absolute `cwd` into a single
+/// canonical absolute path written to `out`; returns the byte length, or `None`
+/// if it doesn't fit. Pure string canonicalization (B11-3 follow-up): collapses
+/// "." / "" components and pops on ".." (a ".." at the root stays at root).
+/// Used by the path syscalls so relative paths honor the caller's cwd.
+pub fn resolve(cwd: &[u8], path: &[u8], out: &mut [u8]) -> Option<usize> {
+    let mut len = 0usize; // canonical bytes in `out` (no trailing '/'; 0 == root)
+    let mut ends = [0usize; 64]; // end offset of each pushed component
+    let mut depth = 0usize;
+
+    // An absolute path ignores cwd; a relative one is rooted at cwd.
+    let absolute = matches!(path.first(), Some(&b'/'));
+    let sources: [&[u8]; 2] = if absolute {
+        [b"", path]
+    } else {
+        [cwd, path]
+    };
+
+    for src in sources {
+        for comp in src.split(|&c| c == b'/') {
+            if comp.is_empty() || comp == b"." {
+                continue;
+            }
+            if comp == b".." {
+                if depth > 0 {
+                    depth -= 1;
+                    len = if depth > 0 { ends[depth - 1] } else { 0 };
+                }
+                continue;
+            }
+            if depth >= ends.len() || len + 1 + comp.len() > out.len() {
+                return None;
+            }
+            out[len] = b'/';
+            len += 1;
+            out[len..len + comp.len()].copy_from_slice(comp);
+            len += comp.len();
+            ends[depth] = len;
+            depth += 1;
+        }
+    }
+    if len == 0 {
+        // Root: emit "/".
+        if out.is_empty() {
+            return None;
+        }
+        out[0] = b'/';
+        return Some(1);
+    }
+    Some(len)
+}
+
 /// Read up to `out.len()` bytes of file `ino` into `out`. Returns bytes read.
 pub fn read_file(ino: u32, out: &mut [u8]) -> usize {
     read_at(ino, 0, out)

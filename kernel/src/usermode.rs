@@ -40,6 +40,8 @@
 //  17 = unlink(rdi = path, rsi = len)         → 0 ok / MAX; delete a file (B11-3)
 //  18 = time()                                → wall-clock Unix epoch seconds,
 //                                                read from the CMOS RTC (B11-3)
+//  19 = chdir(rdi = path, rsi = len)          → 0 ok / MAX; set the cwd (B11-3)
+//  20 = getcwd(rdi = buf, rsi = len)          → path bytes written / MAX (B11-3)
 
 use core::arch::{asm, global_asm};
 
@@ -366,10 +368,10 @@ fn proc_table() -> &'static mut ProcessTable {
 /// Validation predicate, called by the dispatcher's `$Validating` state.
 /// 0=write_char 1=exit 2=fork 3=exec(prog_id) 4=wait 5=open 6=read 7=close
 /// 8=exec(path) 9=read_line 10=brk 11=exec_argv 12=write 13=lseek 14=fstat
-/// 15=stat 16=dup 17=unlink 18=time. (B4 Step 4 added the file-I/O +
-/// exec-from-disk syscalls; 17=unlink and 18=time are B11-3 follow-ups.)
+/// 15=stat 16=dup 17=unlink 18=time 19=chdir 20=getcwd. (B4 Step 4 added the
+/// file-I/O + exec-from-disk syscalls; 17–20 are B11-3 follow-ups.)
 pub fn is_known_syscall(num: u64) -> bool {
-    num <= 18
+    num <= 20
 }
 
 /// Block until the console has a complete line, copy it into the user buffer
@@ -403,6 +405,22 @@ unsafe fn copy_from_user(ptr: u64, len: usize, out: &mut [u8]) -> usize {
     let n = len.min(out.len());
     core::ptr::copy_nonoverlapping(ptr as *const u8, out.as_mut_ptr(), n);
     n
+}
+
+/// Copy a user path (`ptr`/`len`) and resolve it against the caller's current
+/// working directory into a canonical absolute path in `out` (B11-3 follow-up).
+/// Returns the canonical byte length, or `None` for an empty path or one that
+/// doesn't fit. The path syscalls run this so relative paths honor the cwd.
+fn resolve_user_path(ptr: u64, len: usize, out: &mut [u8]) -> Option<usize> {
+    let mut raw = [0u8; 256];
+    let n = unsafe { copy_from_user(ptr, len, &mut raw) };
+    if n == 0 {
+        return None;
+    }
+    let mut cwd = [0u8; 256];
+    let cl = sched::cwd_current(&mut cwd);
+    let cwd: &[u8] = if cl > 0 { &cwd[..cl] } else { b"/" };
+    crate::fs::resolve(cwd, &raw[..n], out)
 }
 
 /// `brk(new_end)`: grow or shrink the calling process's heap (B9-1). A growable
@@ -526,13 +544,15 @@ pub fn perform_syscall(num: u64, a0: u64, _a1: u64) -> u64 {
             // open(path_ptr=a0, path_len=a1, flags=rdx) → fd, or u64::MAX on
             // failure. flags bit0: 0 = read (default; back-compat), 1 = write
             // (create/truncate). B9-3 added the write mode.
-            let mut path = [0u8; 256];
-            let n = unsafe { copy_from_user(a0, _a1 as usize, &mut path) };
+            let mut canon = [0u8; 512];
+            let Some(n) = resolve_user_path(a0, _a1 as usize, &mut canon) else {
+                return u64::MAX;
+            };
             let write = arg2() & 1 != 0;
             let r = if write {
-                crate::vfs::open_write(&path[..n])
+                crate::vfs::open_write(&canon[..n])
             } else {
-                crate::vfs::open_read(&path[..n])
+                crate::vfs::open_read(&canon[..n])
             };
             r.map_or(u64::MAX, |fd| fd as u64)
         }
@@ -595,9 +615,11 @@ pub fn perform_syscall(num: u64, a0: u64, _a1: u64) -> u64 {
         14 => crate::vfs::fstat_size(a0 as usize).map_or(u64::MAX, |s| s as u64), // fstat(fd) → size
         15 => {
             // stat(path_ptr=a0, path_len=a1) → file size, or u64::MAX (B9-3).
-            let mut path = [0u8; 256];
-            let n = unsafe { copy_from_user(a0, _a1 as usize, &mut path) };
-            match crate::fs::namei(&path[..n]) {
+            let mut canon = [0u8; 512];
+            let Some(n) = resolve_user_path(a0, _a1 as usize, &mut canon) else {
+                return u64::MAX;
+            };
+            match crate::fs::namei(&canon[..n]) {
                 Some(ino) if crate::fs::is_file(ino) => crate::fs::size_of(ino) as u64,
                 _ => u64::MAX,
             }
@@ -607,15 +629,54 @@ pub fn perform_syscall(num: u64, a0: u64, _a1: u64) -> u64 {
             // unlink(path_ptr=a0, path_len=a1) → 0 on success, u64::MAX if the
             // path doesn't resolve to a regular file. Lets a program delete a
             // file (tcc temp/output overwrite, `rm`).
-            let mut path = [0u8; 256];
-            let n = unsafe { copy_from_user(a0, _a1 as usize, &mut path) };
-            if crate::fs::unlink(&path[..n]) {
+            let mut canon = [0u8; 512];
+            let Some(n) = resolve_user_path(a0, _a1 as usize, &mut canon) else {
+                return u64::MAX;
+            };
+            if crate::fs::unlink(&canon[..n]) {
                 0
             } else {
                 u64::MAX
             }
         }
         18 => crate::rtc::epoch_secs(), // time() → CMOS RTC wall-clock epoch seconds
+        19 => {
+            // chdir(path_ptr=a0, path_len=a1) → 0 on success, u64::MAX if the path
+            // doesn't resolve to a directory (or doesn't fit). Resolves relative
+            // to the caller's cwd, then stores the canonical absolute result.
+            let mut canon = [0u8; 512];
+            let Some(n) = resolve_user_path(a0, _a1 as usize, &mut canon) else {
+                return u64::MAX;
+            };
+            match crate::fs::namei(&canon[..n]) {
+                Some(ino) if crate::fs::is_dir(ino) => {
+                    if sched::set_cwd_current(&canon[..n]) {
+                        0
+                    } else {
+                        u64::MAX
+                    }
+                }
+                _ => u64::MAX,
+            }
+        }
+        20 => {
+            // getcwd(buf_ptr=a0, buf_len=a1) → bytes written (the path, no NUL —
+            // libc appends it), or u64::MAX if the buffer is too small. The user
+            // buffer is mapped in the current address space (CR3 unchanged).
+            let mut cwd = [0u8; 256];
+            let cl = sched::cwd_current(&mut cwd);
+            let src: &[u8] = if cl > 0 { &cwd[..cl] } else { b"/" };
+            let buflen = _a1 as usize;
+            if buflen < src.len() {
+                u64::MAX
+            } else {
+                unsafe {
+                    let dst = core::slice::from_raw_parts_mut(a0 as *mut u8, src.len());
+                    dst.copy_from_slice(src);
+                }
+                src.len() as u64
+            }
+        }
         _ => u64::MAX, // unreachable: validated by is_known_syscall
     }
 }

@@ -192,6 +192,18 @@ pub(crate) fn sys_time() -> u64 {
     unsafe { syscall3(18, 0, 0, 0) }
 }
 
+/// chdir(path) → 0 on success, u64::MAX if the path doesn't resolve to a
+/// directory (syscall #19, B11-3 follow-up).
+pub(crate) fn sys_chdir(path: &[u8]) -> u64 {
+    unsafe { syscall3(19, path.as_ptr() as u64, path.len() as u64, 0) }
+}
+
+/// getcwd(buf) → bytes written (the path, without a NUL), or u64::MAX if `buf`
+/// is too small to hold the cwd (syscall #20).
+pub(crate) fn sys_getcwd(buf: &mut [u8]) -> u64 {
+    unsafe { syscall3(20, buf.as_mut_ptr() as u64, buf.len() as u64, 0) }
+}
+
 /// Terminate the process with status `code` (POSIX `exit`). Never returns.
 #[no_mangle]
 pub extern "C" fn exit(code: i32) -> ! {

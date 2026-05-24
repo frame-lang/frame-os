@@ -30,6 +30,9 @@ use crate::{fpu, gdt, interrupts, paging, serial};
 const MAX_THREADS: usize = 8;
 const STACK_SIZE: usize = 16 * 1024;
 const ROUNDS_PER_WORKER: u32 = 4;
+/// Max length of a process's stored current-working-directory path (B11-3
+/// follow-up). Canonical absolute paths only; 256 matches the syscall path cap.
+const CWD_MAX: usize = 256;
 
 #[derive(Clone, Copy, PartialEq)]
 enum RunState {
@@ -50,6 +53,11 @@ struct Tcb {
     pid: u32,        // the owning Process's pid (0 if none)
     parent_pid: u32, // the pid that forked this one (0 if none) — for wait()
     heap_brk: u64,   // program break: end of this process's brk heap (B9-1)
+    // Current working directory: a canonical absolute path (B11-3 follow-up).
+    // `fork` copies it; `exec` keeps it (same pid/slot); fresh processes start
+    // at "/". Path syscalls resolve relative paths against it.
+    cwd: [u8; CWD_MAX],
+    cwd_len: u16,
 }
 
 const TCB_INIT: Tcb = Tcb {
@@ -60,6 +68,8 @@ const TCB_INIT: Tcb = Tcb {
     pid: 0,
     parent_pid: 0,
     heap_brk: 0,
+    cwd: [0; CWD_MAX],
+    cwd_len: 0,
 };
 
 /// Base VA of a user process's `brk` heap (B9-1). Sits well above the program
@@ -351,6 +361,7 @@ pub unsafe fn spawn_user(pml4: u64, entry: u64, user_rsp: u64, pid: u32) {
     (*t.add(n)).kstack_top = kstack_top;
     (*t.add(n)).pid = pid;
     (*t.add(n)).heap_brk = USER_HEAP_BASE; // fresh process: empty brk heap
+    set_slot_cwd(n, b"/"); // fresh process starts at the root directory
     fpu_area(n).write(fpu::clean()); // fresh process → clean FPU
     with_sched(|s| s.task_ready());
 }
@@ -383,6 +394,10 @@ pub unsafe fn spawn_user_from_frame(
     // The child inherits the parent's program break — fork_address_space copied
     // the parent's heap pages (PML4 index 0), so the heap contents carry over.
     (*t.add(n)).heap_brk = brk_of_pid(parent_pid).unwrap_or(USER_HEAP_BASE);
+    // The child inherits the parent's cwd (POSIX fork semantics).
+    let mut pcwd = [0u8; CWD_MAX];
+    let pl = cwd_of_pid(parent_pid, &mut pcwd);
+    set_slot_cwd(n, if pl > 0 { &pcwd[..pl] } else { b"/" });
     // fork inherits the parent's FPU state: the parent is the one running this
     // syscall, so its live x87/SSE registers are the state to copy — FXSAVE them
     // straight into the child's save area.
@@ -525,6 +540,60 @@ fn brk_of_pid(pid: u32) -> Option<u64> {
             }
         }
         None
+    }
+}
+
+// --- per-process current working directory (B11-3 follow-up) ---------------
+
+/// Store `path` (a canonical absolute path, ≤ CWD_MAX bytes) as TCB slot `n`'s
+/// cwd. Over-long paths are rejected by the caller (chdir), so this truncates
+/// defensively only.
+unsafe fn set_slot_cwd(n: usize, path: &[u8]) {
+    let len = path.len().min(CWD_MAX);
+    let t = tcbs();
+    (&mut (*t.add(n)).cwd)[..len].copy_from_slice(&path[..len]);
+    (*t.add(n)).cwd_len = len as u16;
+}
+
+/// Copy the current process's cwd into `out`, returning the byte length written
+/// (0 if unset — callers treat that as "/").
+pub fn cwd_current(out: &mut [u8]) -> usize {
+    unsafe {
+        let cur = (&raw const CURRENT).read();
+        let t = tcbs();
+        let len = ((*t.add(cur)).cwd_len as usize).min(out.len());
+        out[..len].copy_from_slice(&(&(*t.add(cur)).cwd)[..len]);
+        len
+    }
+}
+
+/// Set the current process's cwd to `path` (a canonical absolute path). Returns
+/// false if it doesn't fit in CWD_MAX.
+pub fn set_cwd_current(path: &[u8]) -> bool {
+    if path.len() > CWD_MAX {
+        return false;
+    }
+    unsafe {
+        let cur = (&raw const CURRENT).read();
+        set_slot_cwd(cur, path);
+    }
+    true
+}
+
+/// Copy the cwd of the process with pid `pid` into `out` (used so a `fork`ed
+/// child inherits its parent's cwd). Returns the byte length, 0 if not found.
+fn cwd_of_pid(pid: u32, out: &mut [u8]) -> usize {
+    unsafe {
+        let t = tcbs();
+        let n = (&raw const N).read();
+        for i in 0..n {
+            if (*t.add(i)).pid == pid && (*t.add(i)).state != RunState::Free {
+                let len = ((*t.add(i)).cwd_len as usize).min(out.len());
+                out[..len].copy_from_slice(&(&(*t.add(i)).cwd)[..len]);
+                return len;
+            }
+        }
+        0
     }
 }
 
