@@ -15,8 +15,11 @@ extern crate alloc;
 use core::alloc::{GlobalAlloc, Layout};
 use core::arch::{asm, global_asm};
 
+mod cstdlib;
+mod cstring;
 mod frame_systems;
 mod malloc;
+mod posix;
 mod printf;
 mod stdio;
 pub use malloc::{calloc, free, malloc, realloc};
@@ -152,6 +155,11 @@ pub(crate) fn sys_read(fd: i32, buf: &mut [u8]) -> usize {
 /// close(fd) (syscall #7).
 pub(crate) fn sys_close(fd: i32) {
     unsafe { syscall3(7, fd as u64, 0, 0) };
+}
+
+/// lseek(fd, offset, whence) → new offset, or u64::MAX on error (syscall #13).
+pub(crate) fn sys_lseek(fd: i32, offset: i64, whence: i32) -> u64 {
+    unsafe { syscall3(13, fd as u64, offset as u64, whence as u64) }
 }
 
 /// read_line(buf) → bytes read for the console (blocks until a line; B8 syscall
