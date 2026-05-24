@@ -26,6 +26,26 @@ extern "C" {
     fn fprintf(f: *mut FILE, fmt: *const u8, ...) -> i32;
 }
 
+// The C `<time.h>` surface frame-libc provides (B11-3 follow-up). `time` reads
+// the kernel's CMOS RTC; `localtime` breaks an epoch into this `struct tm`
+// (layout must match libc/src/posix.rs::Tm).
+#[repr(C)]
+struct Tm {
+    tm_sec: i32,
+    tm_min: i32,
+    tm_hour: i32,
+    tm_mday: i32,
+    tm_mon: i32,
+    tm_year: i32,
+    tm_wday: i32,
+    tm_yday: i32,
+    tm_isdst: i32,
+}
+extern "C" {
+    fn time(t: *mut i64) -> i64;
+    fn localtime(t: *const i64) -> *const Tm;
+}
+
 // `main`, C-style: `int main(int argc, char **argv, char **envp)`. frame-libc's
 // crt0 calls this, then `exit`s with the returned code.
 #[no_mangle]
@@ -175,6 +195,26 @@ extern "C" fn main(argc: i32, argv: *const *const u8, _envp: *const *const u8) -
     } else {
         write(1, b"cmain: heap VERIFY MISMATCH\n");
     }
+
+    // B11-3 follow-up: the real wall clock. time() reads the CMOS RTC via the
+    // kernel; localtime() breaks it into a calendar date. Prints
+    // "cmain: clock YYYY-MM-DD HH:MM:SS (epoch=...)" — the same call path tcc
+    // takes for __DATE__/__TIME__. (QEMU pins the RTC to a fixed base in tests,
+    // so the date is deterministic.)
+    let now = unsafe { time(core::ptr::null_mut()) };
+    let tm = unsafe { &*localtime(&now) };
+    print_fmt(
+        "cmain: clock %d-%02d-%02d %02d:%02d:%02d (epoch=%d)\n",
+        &[
+            Arg::Int((tm.tm_year + 1900) as i64),
+            Arg::Int((tm.tm_mon + 1) as i64),
+            Arg::Int(tm.tm_mday as i64),
+            Arg::Int(tm.tm_hour as i64),
+            Arg::Int(tm.tm_min as i64),
+            Arg::Int(tm.tm_sec as i64),
+            Arg::Int(now),
+        ],
+    );
     0
 }
 // No #[panic_handler] here: frame-libc provides it (cmain links the libc).

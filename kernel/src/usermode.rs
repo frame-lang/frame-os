@@ -38,6 +38,8 @@
 //  15 = stat(rdi = path, rsi = len)           → file size, or MAX (B9-3)
 //  16 = dup(rdi = fd)                         → new fd (B9-3)
 //  17 = unlink(rdi = path, rsi = len)         → 0 ok / MAX; delete a file (B11-3)
+//  18 = time()                                → wall-clock Unix epoch seconds,
+//                                                read from the CMOS RTC (B11-3)
 
 use core::arch::{asm, global_asm};
 
@@ -364,10 +366,10 @@ fn proc_table() -> &'static mut ProcessTable {
 /// Validation predicate, called by the dispatcher's `$Validating` state.
 /// 0=write_char 1=exit 2=fork 3=exec(prog_id) 4=wait 5=open 6=read 7=close
 /// 8=exec(path) 9=read_line 10=brk 11=exec_argv 12=write 13=lseek 14=fstat
-/// 15=stat 16=dup 17=unlink. (B4 Step 4 added the file-I/O + exec-from-disk
-/// syscalls; 17=unlink is the B11-3 follow-up file-delete.)
+/// 15=stat 16=dup 17=unlink 18=time. (B4 Step 4 added the file-I/O +
+/// exec-from-disk syscalls; 17=unlink and 18=time are B11-3 follow-ups.)
 pub fn is_known_syscall(num: u64) -> bool {
-    num <= 17
+    num <= 18
 }
 
 /// Block until the console has a complete line, copy it into the user buffer
@@ -613,6 +615,7 @@ pub fn perform_syscall(num: u64, a0: u64, _a1: u64) -> u64 {
                 u64::MAX
             }
         }
+        18 => crate::rtc::epoch_secs(), // time() → CMOS RTC wall-clock epoch seconds
         _ => u64::MAX, // unreachable: validated by is_known_syscall
     }
 }

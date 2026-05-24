@@ -1,9 +1,10 @@
 //! POSIX/`<unistd.h>`/`<fcntl.h>` surface tcc needs (B11-3c): the fd-I/O wrappers
-//! over the Frame OS syscalls (open/read/close/lseek), plus `errno` and the
-//! handful of stubs for features Frame OS doesn't have yet (unlink/execvp/
-//! gettimeofday/localtime/time/mprotect). The stubs only need to *link* — tcc's
-//! compile-to-file path never calls them (they belong to temp-file cleanup, the
-//! `-run` JIT, and `__DATE__`/`__TIME__`, none of which the demo exercises).
+//! over the Frame OS syscalls (open/read/close/lseek/unlink), `errno`, and the
+//! real wall-clock surface (time/gettimeofday/localtime) backed by the kernel's
+//! CMOS RTC (syscall #18) — tcc reads these while preprocessing `__DATE__`/
+//! `__TIME__`. The remaining entries are stubs for features Frame OS doesn't
+//! have yet (execvp/mprotect): they only need to *link* — tcc's compile-to-file
+//! path never calls them (they belong to the `-run` JIT).
 
 use core::ffi::c_char;
 
@@ -111,17 +112,19 @@ pub extern "C" fn mprotect(_addr: *mut u8, _len: usize, _prot: i32) -> i32 {
     0
 }
 
-// --- time (fixed; Frame OS has no wall clock) ------------------------------
+// --- time (real wall clock via the CMOS RTC, syscall #18) ------------------
 
-const FIXED_TIME: i64 = 0;
-
-/// `time(t)` — returns a fixed epoch (used only for `__DATE__`/`__TIME__`).
+/// `time(t)` — current Unix epoch seconds (UTC) from the kernel's CMOS RTC. If
+/// `t` is non-NULL the value is also stored through it. tcc calls this (and
+/// `localtime`) while preprocessing `__DATE__`/`__TIME__`, so a compiled
+/// program now carries the real build date.
 #[no_mangle]
 pub unsafe extern "C" fn time(t: *mut i64) -> i64 {
+    let now = crate::sys_time() as i64;
     if !t.is_null() {
-        *t = FIXED_TIME;
+        *t = now;
     }
-    FIXED_TIME
+    now
 }
 
 #[repr(C)]
@@ -137,22 +140,72 @@ pub struct Tm {
     pub tm_isdst: i32,
 }
 
-static mut FIXED_TM: Tm = Tm {
+/// Inverse of the kernel's `days_from_civil`: days-since-epoch → (year, month
+/// [1,12], day [1,31]) in the proleptic Gregorian calendar (Howard Hinnant's
+/// `civil_from_days`).
+fn civil_from_days(z: i64) -> (i64, i64, i64) {
+    let z = z + 719_468;
+    let era = (if z >= 0 { z } else { z - 146_096 }) / 146_097;
+    let doe = z - era * 146_097; // [0, 146096]
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365; // [0, 399]
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]
+    let mp = (5 * doy + 2) / 153; // [0, 11] (Mar=0 … Feb=11)
+    let d = doy - (153 * mp + 2) / 5 + 1; // [1, 31]
+    let m = if mp < 10 { mp + 3 } else { mp - 9 }; // [1, 12]
+    (if m <= 2 { y + 1 } else { y }, m, d)
+}
+
+/// Days since 1970-01-01 for a civil date (mirrors the kernel's helper); used to
+/// derive `tm_yday`.
+fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = (if y >= 0 { y } else { y - 399 }) / 400;
+    let yoe = y - era * 400;
+    let mp = if m > 2 { m - 3 } else { m + 9 };
+    let doy = (153 * mp + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146_097 + doe - 719_468
+}
+
+// `localtime` returns a pointer into a single static buffer (the C contract —
+// callers must copy before the next call). frame-libc is single-threaded per
+// process, so a plain static matches the standard.
+static mut LOCALTIME_BUF: Tm = Tm {
     tm_sec: 0,
     tm_min: 0,
     tm_hour: 0,
     tm_mday: 1,
     tm_mon: 0,
-    tm_year: 126, // 2026 - 1900
+    tm_year: 70,
     tm_wday: 0,
     tm_yday: 0,
     tm_isdst: 0,
 };
 
-/// `localtime(t)` — returns a pointer to a fixed broken-down time (2026-01-01).
+/// `localtime(t)` — break `*t` (Unix epoch seconds) into a `struct tm`. Frame OS
+/// has no timezone, so this is effectively `gmtime`: the RTC is treated as UTC.
 #[no_mangle]
-pub unsafe extern "C" fn localtime(_t: *const i64) -> *mut Tm {
-    &raw mut FIXED_TM
+pub unsafe extern "C" fn localtime(t: *const i64) -> *mut Tm {
+    let secs = if t.is_null() { 0 } else { *t };
+    let days = secs.div_euclid(86_400);
+    let rem = secs.rem_euclid(86_400);
+    let (year, mon, mday) = civil_from_days(days);
+    let yday = days - days_from_civil(year, 1, 1);
+    // 1970-01-01 was a Thursday (wday 4); wday is 0=Sunday.
+    let wday = (days + 4).rem_euclid(7);
+
+    let tm = &raw mut LOCALTIME_BUF;
+    (*tm).tm_sec = (rem % 60) as i32;
+    (*tm).tm_min = ((rem / 60) % 60) as i32;
+    (*tm).tm_hour = (rem / 3600) as i32;
+    (*tm).tm_mday = mday as i32;
+    (*tm).tm_mon = (mon - 1) as i32;
+    (*tm).tm_year = (year - 1900) as i32;
+    (*tm).tm_wday = wday as i32;
+    (*tm).tm_yday = yday as i32;
+    (*tm).tm_isdst = 0;
+    tm
 }
 
 #[repr(C)]
@@ -161,11 +214,12 @@ pub struct Timeval {
     pub tv_usec: i64,
 }
 
-/// `gettimeofday(tv, tz)` — fills a fixed time; returns 0.
+/// `gettimeofday(tv, tz)` — fills `tv` with the RTC time (whole seconds; the RTC
+/// has no sub-second resolution, so `tv_usec` is 0). Returns 0.
 #[no_mangle]
 pub unsafe extern "C" fn gettimeofday(tv: *mut Timeval, _tz: *mut core::ffi::c_void) -> i32 {
     if !tv.is_null() {
-        (*tv).tv_sec = FIXED_TIME;
+        (*tv).tv_sec = crate::sys_time() as i64;
         (*tv).tv_usec = 0;
     }
     0

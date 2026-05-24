@@ -1176,6 +1176,16 @@ Then started paying down the toolchain follow-ups from above:
   console-test compiling+running `/assert.c` (a false assert) and matching the
   diagnostic (`csrc/tcc_assert.c`).
 
-Still open from the list: real clock (`time()` via CMOS RTC), per-process
-`cwd`/`chdir`/`getcwd`, growing the C-shim, and `buildc` taking a source path
-from argv (so it's a general `cc <file>` rather than a fixed `/hello.c`).
+- **Real clock (CMOS RTC) — DONE.** New `kernel/src/rtc.rs` reads the
+  MC146818 CMOS RTC (0x70/0x71, UIP wait + double-read, BCD/12-hour decode) and
+  folds it to Unix epoch seconds; exposed as syscall #18 (`time()`). frame-libc's
+  `time`/`gettimeofday`/`localtime` (previously fixed stubs) are now real —
+  `localtime` does the `civil_from_days` epoch→calendar conversion. tcc reads
+  these while preprocessing `__DATE__`/`__TIME__`, so a compiled program carries
+  the real build date. QEMU pins `-rtc base=2026-05-24T12:00:00,clock=vm` for
+  determinism; `cmain` prints `clock 2026-05-24 12:…` and console-test asserts
+  it.
+
+Still open from the list: per-process `cwd`/`chdir`/`getcwd`, growing the
+C-shim, and `buildc` taking a source path from argv (so it's a general
+`cc <file>` rather than a fixed `/hello.c`).

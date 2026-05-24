@@ -185,6 +185,13 @@ pub(crate) fn sys_read_line(buf: &mut [u8]) -> usize {
     unsafe { syscall3(9, buf.as_mut_ptr() as u64, buf.len() as u64, 0) as usize }
 }
 
+/// time() → wall-clock Unix epoch seconds from the CMOS RTC (syscall #18, the
+/// B11-3 follow-up). Backs the C `time`/`gettimeofday`/`localtime` surface, so
+/// tcc-computed `__DATE__`/`__TIME__` reflect real time.
+pub(crate) fn sys_time() -> u64 {
+    unsafe { syscall3(18, 0, 0, 0) }
+}
+
 /// Terminate the process with status `code` (POSIX `exit`). Never returns.
 #[no_mangle]
 pub extern "C" fn exit(code: i32) -> ! {

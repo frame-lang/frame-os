@@ -58,6 +58,7 @@ mod percpu;
 mod reactor;
 mod pic;
 mod pit;
+mod rtc;
 mod sched;
 mod sched_demo;
 mod serial;

@@ -1083,6 +1083,12 @@ fn qemu_base_command(
         // them (B7 Step 1), then schedules across them (later steps). Harmless
         // for B0–B6 (the APs stay parked).
         .args(["-smp", "4"])
+        // B11-3 follow-up: pin the CMOS RTC to a fixed wall-clock base so the
+        // kernel's `time()` syscall (and thus libc time/localtime, and tcc's
+        // __DATE__/__TIME__) is deterministic across test runs. `clock=vm`
+        // advances the guest clock with VM time from this base (no real-time
+        // drift). The kernel reads the RTC as UTC, matching the face value here.
+        .args(["-rtc", "base=2026-05-24T12:00:00,clock=vm"])
         // UEFI firmware (split into read-only code + writable NVRAM).
         .args(["-drive"])
         .arg(format!(
@@ -1318,6 +1324,11 @@ fn run_console_test() -> Result<()> {
         wait_for_output(&buf, "cmain: fgets line-by-line ok", 20)?;
         // B10-2: the libc heap (malloc/realloc/free over brk).
         wait_for_output(&buf, "cmain: malloc/realloc/free ok", 20)?;
+        // B11-3 follow-up: real wall clock. time() reads the CMOS RTC (pinned to
+        // 2026-05-24T12:00:00 by `-rtc base=`), localtime() breaks it down. Assert
+        // the date + hour prefix (boot consumes only seconds of VM time, so the
+        // hour stays 12); the minute/second tail is left unasserted.
+        wait_for_output(&buf, "cmain: clock 2026-05-24 12:", 20)?;
         // B11-2: a real C program (gcc-compiled, linked against frame-libc) runs.
         eprintln!("console-test: typing `/bin/chello`");
         stdin.write_all(b"/bin/chello\n").context("write chello")?;
