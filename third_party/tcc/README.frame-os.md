@@ -89,3 +89,30 @@ heavy, recurring freestanding port (generate `tccdefs_.h`, vendor `dwarf.h`,
 `environ` for the unused native `-run` path), and the payoff — a 7–11 MiB Rust
 `libc.a` tcc must scan every compile — is worse than the few-KB C-shim. Staying
 on pinned 0.9.27 + the C-shim is simpler, smaller, and faster on-device.
+
+## The one-line static-exe PLT patch (V1.0 capstone)
+
+The C-shim solves the bug **for libc**: gcc compiles it `-fvisibility=hidden`,
+so its symbols are `STV_HIDDEN` and tcc's `build_got_entries`
+(`tccelf.c:1082`) already converts their `PLT32` call relocations to direct
+`PC32`. But that conversion fires *only* for hidden/local symbols — **not** for
+a tcc-compiled program's **own** default-visibility globals. So a program that
+calls its own non-`static` function still routes that call through the broken
+static-exe PLT and crashes (`#PF` at a garbage `jmp *GOT(%rip)` address). The
+existing tests (`tcchello`, `tcc_hi`, `tcc_assert`) never tripped this — they
+only call libc — but the V1.0 capstone's **framec-generated C** (`/fhello.c`,
+whose `main` calls `Hello_new`/`Hello_greet`/`Hello_greeted`) is the first real
+program to call its own functions, and it exposed the latent defect: the
+on-device C toolchain could only ever run printf-only toys.
+
+So we now apply **one surgical patch** to `tccelf.c:1082` — the exact upstream
+(`mob`) fix — adding `|| s1->output_type == TCC_OUTPUT_EXE` to that condition:
+for a **fully-static executable** (our only output mode; we always link
+`-static`, no shared libraries), every intra-image call is safe to resolve
+directly, so all `PLT32`/`PC32` function relocations become `PC32`. This is a
+minimal, well-understood change that makes the C toolchain usable for real
+programs; tcc is otherwise still pristine 0.9.27. (We did *not* adopt mob
+wholesale — see the rejection above; this is just the single relocation-fix
+line.) The C-shim stays (it's still the link-time libc, and `-fno-pic` keeps the
+libc free of GOT relocations); the patch fixes the *caller* side for the
+program's own globals.

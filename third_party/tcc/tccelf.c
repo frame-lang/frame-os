@@ -1079,9 +1079,21 @@ ST_FUNC void build_got_entries(TCCState *s1)
             }
 
 #ifdef TCC_TARGET_X86_64
+            /* Frame OS patch (V1.0 capstone): resolve a function-call PLT32/PC32
+             * relocation to a DIRECT PC32 call (no PLT) not only for hidden/local
+             * symbols, but for ANY symbol when the output is a (fully-static)
+             * executable. tcc 0.9.27's static-exe PLT is broken on x86-64 (stub
+             * GOT displacement points into the PLT, GOT slots unfilled), so a call
+             * to a default-visibility global routed through it jumps to garbage.
+             * In a static EXE there are no shared libs, so every intra-image call
+             * is safe to make direct. Without this, a tcc-compiled program crashes
+             * the instant it calls its own (non-static) function — only libc-only
+             * (hidden) callers like a printf hello-world survived. This is the
+             * one-line upstream/mob fix; see third_party/tcc/README.frame-os.md. */
             if ((type == R_X86_64_PLT32 || type == R_X86_64_PC32) &&
                 (ELFW(ST_VISIBILITY)(sym->st_other) != STV_DEFAULT ||
-		 ELFW(ST_BIND)(sym->st_info) == STB_LOCAL)) {
+		 ELFW(ST_BIND)(sym->st_info) == STB_LOCAL ||
+		 s1->output_type == TCC_OUTPUT_EXE)) {
                 rel->r_info = ELFW(R_INFO)(sym_index, R_X86_64_PC32);
                 continue;
             }
