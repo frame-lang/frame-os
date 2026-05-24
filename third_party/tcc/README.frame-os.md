@@ -77,5 +77,15 @@ runtime. (Details + disassembly evidence in `docs/frame_assessment.md`,
 **C-shim libc** built with `gcc -fno-pic` (no GOT relocations) and
 `-fvisibility=hidden` (so tcc's existing linker resolves `PLT32` calls directly,
 no PLT) — sidestepping both bugs. The Rust `frame-libc` remains the runtime for
-the OS's own programs. The bugs may be worth reporting against tcc's active
-`mob` branch (not the frozen 0.9.27) — verify they still reproduce there first.
+the OS's own programs.
+
+Both bugs *are* fixed in tcc's active `mob` branch (0.9.28rc — the
+`build_got_entries` condition gained `|| output_type & TCC_OUTPUT_EXE`), so no
+upstream report is warranted (0.9.27 is frozen). We **evaluated adopting mob**
+(to drop the C-shim and link the Rust `frame-libc` directly) and **rejected it**
+(2026-05-24, see docs/frame_assessment.md): mob's newer feature set needs a
+heavy, recurring freestanding port (generate `tccdefs_.h`, vendor `dwarf.h`,
+`-DCONFIG_TCC_SEMLOCK=0`, and stub `<signal.h>` + the glibc `ucontext_t` +
+`environ` for the unused native `-run` path), and the payoff — a 7–11 MiB Rust
+`libc.a` tcc must scan every compile — is worse than the few-KB C-shim. Staying
+on pinned 0.9.27 + the C-shim is simpler, smaller, and faster on-device.
