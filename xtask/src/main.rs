@@ -336,9 +336,10 @@ struct QemuArtifacts {
 // spans double-indirect blocks, while staying small enough that copying the
 // template per smoke test stays fast. The on-disk *format* scales to ~2 TB;
 // this is just the default test image size.
-const BLK_DISK_BLOCKS: u32 = 65536; // 32 MiB / 512 — holds the tcc sysroot (the
-                                    // ~7 MiB libc.a dominates) + /bin/tcc + the
-                                    // other ELFs with comfortable headroom (B11-3d).
+const BLK_DISK_BLOCKS: u32 = 16384; // 8 MiB / 512 — holds the tcc sysroot
+                                    // (/bin/tcc ~1.2 MiB dominates; the C-shim
+                                    // libc.a is tiny) + the other ELFs, with room
+                                    // to spare (B11-3d).
 
 /// USB mass-storage backing image: 64 KiB (128 × 512-byte blocks), block 0
 /// stamped with an 8-byte magic ("FRAMEOS!") the SCSI READ(10) test checks.
@@ -936,82 +937,47 @@ fn build_tcc_sysroot(workspace: &Path) -> Result<Vec<(String, Vec<u8>)>> {
         files.push((format!("/usr/lib/{crt}.o"), std::fs::read(&obj)?));
     }
 
-    // frame-libc as libc.a, built WITHOUT its own `_start` (crt1.o owns it).
+    // libc.a — the C-shim (libc/cshim/cshim.c), NOT the Rust frame-libc.
     //
-    // The Rust staticlib is an archive of hundreds of LLVM-produced objects
-    // (frame-libc + core + compiler_builtins), and tcc 0.9.27's minimal object
-    // loader (`tcc_load_object_file`) faults on them — it doesn't handle every
-    // section/relocation shape modern LLVM emits. Fix: partial-link the whole
-    // archive into ONE relocatable object with the host `ld -r --whole-archive`.
-    // That resolves all *internal* references and merges everything into the
-    // standard .text/.data/.rodata/.bss sections an ld output has, leaving only
-    // the external undefined `main` (which the user program provides) — a single,
-    // conventional object tcc digests cleanly. Then strip DWARF (keeping the
-    // symbol table `-lc` needs) and repackage as a one-member `libc.a`.
-    let lib_a_src = build_libc_staticlib_features(workspace, "libc-staticlib-nocrt0", false)?;
-    let libc_o = out_dir.join("libc.o");
-    // `--exclude-libs=ALL` marks every symbol pulled from the archive as
-    // STV_HIDDEN in the merged object. This is the crux of getting tcc to link
-    // a *working* static executable: tcc only resolves an R_X86_64_PLT32 call
-    // directly (to a PC32, no PLT) when the target symbol is hidden or local
-    // (tccelf.c build_got_entries); for a default-visibility global it builds a
-    // PLT instead — and tcc's PLT for a fully-static x86-64 exe is broken (the
-    // stub's GOT displacement points back into the PLT, so the call jumps into
-    // garbage). frame-libc's `#[no_mangle]` exports are default-visibility
-    // globals, so without this every libc call would route through a broken
-    // PLT. Hidden symbols are still resolvable across objects (crt1.o → libc.o),
-    // just not dynamically exported — exactly what a static link wants.
-    let status = Command::new("x86_64-linux-gnu-ld")
-        .args(["-r", "--whole-archive", "--exclude-libs=ALL"])
-        .arg(&lib_a_src)
-        .arg("-o")
-        .arg(&libc_o)
-        .status()
-        .context("failed to partial-link libc.a into libc.o")?;
-    if !status.success() {
-        bail!("ld -r partial link of libc.a failed");
-    }
-    // Drop sections tcc 0.9.27's object loader can't digest. The killer is
-    // `.eh_frame`: LLVM emits it as type SHT_X86_64_UNWIND (0x70000001), which
-    // tcc doesn't recognize, so it skips the section — but the section's
-    // STT_SECTION symbol still points at it, and `tcc_load_object_file` then
-    // dereferences a NULL `Section*` (fault at `Section.sh_num`, offset 0x1c).
-    // None of these are needed on Frame OS (panic=abort ⇒ no unwinding; the
-    // .llvm* / .comment / .note are pure metadata), so remove them outright.
-    let status = Command::new("x86_64-linux-gnu-objcopy")
+    // tcc 0.9.27's fully-static linker mishandles the GOT/PLT relocations a
+    // Rust/LLVM staticlib is full of (broken PLT + unfilled GOT; see
+    // third_party/tcc/README.frame-os.md). The C-shim sidesteps both:
+    //   -fno-pic           → direct data addressing, ZERO GOT relocations.
+    //   -fvisibility=hidden → every shim symbol hidden, so tcc's existing linker
+    //                         resolves PLT32 calls to them directly (no PLT).
+    // The result links to only the simple PC32/64 relocations tcc applies
+    // reliably. `crt1.o` owns `_start` and calls the shim's `__libc_start`.
+    let cshim_c = workspace.join("libc").join("cshim").join("cshim.c");
+    let cshim_o = out_dir.join("cshim.o");
+    let status = Command::new("x86_64-linux-gnu-gcc")
         .args([
-            "--remove-section=.eh_frame",
-            "--remove-section=.eh_frame_hdr",
-            "--remove-section=.llvmbc",
-            "--remove-section=.llvmcmd",
-            "--remove-section=.comment",
-            "--remove-section=.note.GNU-stack",
-            "--remove-section=.note.gnu.property",
+            "-ffreestanding",
+            "-nostdinc",
+            "-fno-stack-protector",
+            "-fno-pie",
+            "-fno-pic",
+            "-fvisibility=hidden",
+            "-O2",
+            "-c",
         ])
-        .arg(&libc_o)
+        .arg(&cshim_c)
+        .arg("-o")
+        .arg(&cshim_o)
         .status()
-        .context("failed to objcopy --remove-section on libc.o")?;
+        .context("failed to invoke gcc for the C-shim libc")?;
     if !status.success() {
-        bail!("objcopy section removal on libc.o failed");
-    }
-    let status = Command::new("x86_64-linux-gnu-strip")
-        .args(["--strip-debug"])
-        .arg(&libc_o)
-        .status()
-        .context("failed to invoke strip on libc.o")?;
-    if !status.success() {
-        bail!("strip --strip-debug of libc.o failed");
+        bail!("gcc compile of libc/cshim/cshim.c failed");
     }
     let lib_a = out_dir.join("libc.a");
     let _ = std::fs::remove_file(&lib_a);
     let status = Command::new("x86_64-linux-gnu-ar")
         .arg("crs")
         .arg(&lib_a)
-        .arg(&libc_o)
+        .arg(&cshim_o)
         .status()
-        .context("failed to repackage libc.o into libc.a")?;
+        .context("failed to archive cshim.o into libc.a")?;
     if !status.success() {
-        bail!("ar repackage of libc.a failed");
+        bail!("ar of C-shim libc.a failed");
     }
     files.push(("/usr/lib/libc.a".into(), std::fs::read(&lib_a)?));
 
@@ -1341,17 +1307,25 @@ fn run_console_test() -> Result<()> {
         wait_for_output(&buf, "chello: read back: C wrote this: 1234", 20)?;
         wait_for_output(&buf, "chello: done", 20)?;
         // B11-3d: the on-device C compiler runs at all. `tcc -v` prints its
-        // version banner — proof tcc's crt0 + libc startup + arg handling work in
-        // ring 3. The version string is tcc 0.9.27's, from the vendored source.
-        // (The full `tcc /hello.c -o /out.elf` + exec path compiles and links
-        // successfully today, but the linked program doesn't yet run — a second
-        // tcc static-link relocation bug leaves the GOT unfilled; tracked as a
-        // spawned investigation. This step will assert the compiled program's
-        // output once that lands.)
+        // version banner — proof tcc's crt0 + libc startup + arg handling work.
         eprintln!("console-test: typing `/bin/tcc -v`");
         stdin.write_all(b"/bin/tcc -v\n").context("write tcc -v")?;
         stdin.flush().ok();
         wait_for_output(&buf, "tcc version 0.9.27", 20)?;
+        // B11-3d: the full on-device compile + link + exec. tcc reads /hello.c
+        // (`#include <stdio.h>` from the staged /usr/include), links it with
+        // crt1.o + the C-shim libc.a from the /usr sysroot (gcc -fno-pic +
+        // -fvisibility=hidden → no GOT, no PLT, only relocations tcc applies
+        // correctly), writes /out.elf — then the shell execs that freshly
+        // compiled program. Both lines are written back-to-back; ish's
+        // fork+exec+wait serializes them (it reads the run line only after tcc
+        // exits). The printf line proves compile+link+exec end-to-end.
+        eprintln!("console-test: typing `/bin/tcc … /hello.c -o /out.elf` then `/out.elf`");
+        stdin
+            .write_all(b"/bin/tcc -B/usr/lib/tcc -static /hello.c -o /out.elf\n/out.elf\n")
+            .context("write tcc compile + run")?;
+        stdin.flush().ok();
+        wait_for_output(&buf, "hello from a tcc-compiled program on Frame OS!", 90)?;
         eprintln!("console-test: C program ran on Frame OS; typing `exit`");
         stdin.write_all(b"exit\n").context("write exit")?;
         stdin.flush().ok();
