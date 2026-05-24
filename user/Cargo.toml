@@ -37,6 +37,13 @@ path = "src/spawner.rs"
 name = "waiter"
 path = "src/waiter.rs"
 
+# Concurrent exec regression test: forks two children that exec different
+# programs from disk at once, stressing the per-exec scratch buffers (the fix
+# for the shared ELF_BUF/ARGV_BUF race).
+[[bin]]
+name = "coexec"
+path = "src/coexec.rs"
+
 # Growable heap: grows its heap by 1 MiB via the brk syscall, then writes and
 # verifies a pattern across it (B9-1). Allocator-free — calls brk directly.
 [[bin]]

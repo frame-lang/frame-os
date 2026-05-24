@@ -1529,6 +1529,24 @@ const SMOKE_TESTS: &[SmokeTest] = &[
         timeout_secs: 20,
     },
     SmokeTest {
+        // Concurrent exec — the regression guard for the per-exec scratch buffers
+        // (the shared ELF_BUF/ARGV_BUF race, same class as the B11 trap-frame
+        // race). `coexec` forks two children that `exec_argv` *different* programs
+        // from disk *at the same time*: child A → /bin/hello, child B →
+        // /bin/argtest "Z". `exec` does a blocking virtio read that yields, so the
+        // two loads interleave — each must read its ELF (and its argv) into its
+        // own buffer or one child's read clobbers the other's image. The proof is
+        // `argtest`'s "argv[1]=Z": it can only appear if child B loaded argtest
+        // *and* its argv survived child A's concurrent exec uncorrupted (a clobber
+        // or a swap would lose it). The parent then reaps both ("coexec: all
+        // done"), and no process faulted. With the old shared statics this load
+        // would race; with per-exec heap buffers both programs load cleanly.
+        name: "concurrent_exec_buffers",
+        expect_contains: &["[elf] loaded coexec", "argv[1]=Z", "coexec: all done"],
+        expect_absent: &["KERNEL EXCEPTION", "KERNEL PANIC", "triple fault"],
+        timeout_secs: 20,
+    },
+    SmokeTest {
         // B9-1: the growable heap. `brktest` queries its program break, then
         // grows the heap by 1 MiB via the `brk` syscall (#10) — the kernel
         // demand-maps fresh USER|WRITABLE pages into the process's own address

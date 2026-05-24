@@ -40,6 +40,9 @@
 
 use core::arch::{asm, global_asm};
 
+use alloc::boxed::Box;
+use alloc::vec::Vec;
+
 use crate::frame_systems::{ElfLoader, ProcessTable, SyscallDispatcher};
 use crate::{frames, paging, sched, serial};
 
@@ -120,6 +123,9 @@ static USER_FORKER_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/user_f
 static USER_SPAWNER_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/user_spawner.elf"));
 // `waiter` (B3 Step 5d) forks a child and wait()s to reap it.
 static USER_WAITER_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/user_waiter.elf"));
+// `coexec` forks two children that exec *different programs from disk at once* —
+// the regression test for the per-exec scratch buffers (the ELF_BUF/ARGV_BUF race).
+static USER_COEXEC_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/user_coexec.elf"));
 // `brktest` (B9-1) grows its heap by 1 MiB via `brk` and verifies the new memory.
 static USER_BRKTEST_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/user_brktest.elf"));
 // `fwtest` (B9-3) exercises the file write path: write/lseek/fstat/dup/read-back.
@@ -136,18 +142,20 @@ static USER_FRAMESHELL_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/us
 #[cfg(feature = "interactive")]
 static USER_ISH_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/user_ish.elf"));
 
-// Scratch buffer for `exec`-from-disk: the ELF is read off the filesystem into
-// this static, then handed to the loader as a `'static` slice. Single-flight
-// (IF=0 in syscalls, one process exec'ing at a time), so one buffer is safe.
-// 64 KiB comfortably holds the freestanding user programs.
-static mut ELF_BUF: [u8; 64 * 1024] = [0u8; 64 * 1024];
+// `exec`'s scratch buffers (the ELF image + the packed argv) are now allocated
+// **per-exec on the kernel heap**, not in shared statics — see `read_exec_elf`
+// and `do_exec_argv`. The old `ELF_BUF`/`ARGV_BUF` statics assumed single-flight
+// exec, but `exec` does a *blocking* virtio read that re-enables interrupts and
+// yields (the same hazard the B11 trap-frame race exposed): a second process
+// exec'ing concurrently would overwrite the shared buffer mid-read, so the first
+// process's loader would map the second's program. A distinct heap buffer per
+// in-flight exec removes the race the same way the codebase prefers — per-process
+// state, not a global serialization lock.
 
-// Scratch buffer for `exec_argv` (B9-2): the packed argv (argc NUL-terminated
-// strings, argv[0] = path) is copied here from user memory, then the strings are
-// laid onto the new program's initial stack. Single-flight like ELF_BUF.
+// Caps for `exec_argv` (B9-2): the packed argv copy is bounded to ARGV_BUF_SIZE
+// bytes, and at most MAX_ARGS argument pointers are laid onto the new stack.
 const ARGV_BUF_SIZE: usize = 1024;
 const MAX_ARGS: usize = 32;
-static mut ARGV_BUF: [u8; ARGV_BUF_SIZE] = [0u8; ARGV_BUF_SIZE];
 
 global_asm!(
     // syscall entry: rcx=user RIP, r11=user RFLAGS, rax=num, rdi/rsi=args.
@@ -638,11 +646,51 @@ fn do_exec(frame: *mut TrapFrame, prog_id: u64) -> u64 {
     exec_image(frame, elf)
 }
 
+/// Read the regular file `ino` into a freshly heap-allocated buffer, returned as
+/// a leaked `'static` slice plus the byte count read; `None` if the heap can't
+/// hold the file (a clean failure — `exec` returns `u64::MAX` and the caller
+/// keeps running).
+///
+/// Per-exec (heap) rather than the old shared `ELF_BUF` static: `exec`'s disk
+/// read *blocks* (re-enables interrupts and yields), so two processes exec'ing
+/// concurrently across that read would clobber a single shared buffer — the
+/// first process's loader would then map the second's program. A distinct buffer
+/// per in-flight exec removes the race.
+///
+/// The caller MUST return the buffer to `free_exec_elf` once the (synchronous,
+/// non-blocking) ELF load has consumed the bytes. Freeing is safe at that point
+/// precisely because the load never blocks: no other exec can be reading into
+/// *this* buffer between here and the loader finishing with it. The handle is a
+/// raw `*mut [u8]` (a `Copy` value) so the caller can hold a `&'static` view of
+/// the bytes for the loader and still free the same allocation afterwards.
+fn read_exec_elf(ino: u32) -> Option<(*mut [u8], usize)> {
+    let size = crate::fs::size_of(ino);
+    // Fallible allocation: a file too big for the heap fails the exec cleanly
+    // rather than aborting the kernel via the global alloc-error handler.
+    let mut v: Vec<u8> = Vec::new();
+    if v.try_reserve_exact(size).is_err() {
+        return None;
+    }
+    v.resize(size, 0);
+    let buf: &'static mut [u8] = Box::leak(v.into_boxed_slice());
+    let len = crate::fs::read_file(ino, buf);
+    Some((buf as *mut [u8], len))
+}
+
+/// Free a buffer obtained from `read_exec_elf` (reconstitute the leaked `Box` so
+/// it is dropped). Call only after the ELF load has consumed the bytes.
+fn free_exec_elf(buf: *mut [u8]) {
+    // SAFETY: `buf` is exactly the boxed slice `read_exec_elf` produced via
+    // `Box::leak`. Reconstructing the `Box` from it and dropping it frees it,
+    // and it is called once per `read_exec_elf` after the load is complete.
+    drop(unsafe { Box::from_raw(buf) });
+}
+
 /// `exec(path)`: replace the calling process's image with a program loaded from
-/// the filesystem by path (B4 Step 4). Reads the ELF into `ELF_BUF`, then hands
-/// it to the shared `exec_image`. Returns u64::MAX if the path doesn't resolve
-/// to a regular file or the image doesn't fit `ELF_BUF` (the caller keeps
-/// running and sees the failure).
+/// the filesystem by path (B4 Step 4). Reads the ELF into a per-exec heap buffer
+/// (see `read_exec_elf`), hands it to the shared `exec_image`, then frees the
+/// buffer. Returns u64::MAX if the path doesn't resolve to a regular file or the
+/// image doesn't fit the heap (the caller keeps running and sees the failure).
 fn do_exec_path(frame: *mut TrapFrame, path_ptr: u64, path_len: u64) -> u64 {
     let mut path = [0u8; 256];
     let n = unsafe { copy_from_user(path_ptr, path_len as usize, &mut path) };
@@ -652,14 +700,13 @@ fn do_exec_path(frame: *mut TrapFrame, path_ptr: u64, path_len: u64) -> u64 {
     if !crate::fs::is_file(ino) {
         return u64::MAX;
     }
-    // Read the whole file into the scratch buffer; reborrow it as 'static for
-    // the loader (single-flight: only one exec is in flight at a time).
-    let elf: &'static [u8] = unsafe {
-        let buf = &raw mut ELF_BUF;
-        let len = crate::fs::read_file(ino, &mut *buf);
-        let full: &'static [u8] = &*buf; // explicit deref+borrow (no implicit autoref)
-        &full[..len]
+    let Some((buf, len)) = read_exec_elf(ino) else {
+        return u64::MAX;
     };
+    // SAFETY: `buf` is a live boxed slice from `read_exec_elf`; the bytes stay
+    // valid until `free_exec_elf` below, which runs after the synchronous load.
+    let full: &'static [u8] = unsafe { &*buf }; // explicit deref+borrow (no autoref)
+    let elf: &'static [u8] = &full[..len];
 
     serial::write_str("[exec] pid ");
     serial::write_u32_decimal(sched::current_pid());
@@ -670,7 +717,9 @@ fn do_exec_path(frame: *mut TrapFrame, path_ptr: u64, path_len: u64) -> u64 {
     serial::write_str(" from disk (");
     serial::write_u32_decimal(elf.len() as u32);
     serial::writeln(" bytes)");
-    exec_image(frame, elf)
+    let r = exec_image(frame, elf);
+    free_exec_elf(buf); // load done (synchronous, non-blocking) — safe to free
+    r
 }
 
 /// `exec_argv(buf_ptr, buf_len, argc)` — exec a program *with arguments* (B9-2).
@@ -681,12 +730,17 @@ fn do_exec_path(frame: *mut TrapFrame, path_ptr: u64, path_len: u64) -> u64 {
 fn do_exec_argv(frame: *mut TrapFrame, buf_ptr: u64, buf_len: u64, argc: u64) -> u64 {
     let n = (buf_len as usize).min(ARGV_BUF_SIZE);
     let argc = (argc as usize).min(MAX_ARGS);
-    let argv: &'static [u8] = unsafe {
-        let ptr = (&raw mut ARGV_BUF) as *mut u8;
-        let dst = core::slice::from_raw_parts_mut(ptr, n);
-        let copied = copy_from_user(buf_ptr, n, dst);
-        core::slice::from_raw_parts(ptr as *const u8, copied)
-    };
+    // Per-exec heap copy of the packed argv (was the shared `ARGV_BUF` static):
+    // it must survive the blocking disk read below, during which a concurrent
+    // exec could otherwise overwrite a shared copy before we lay it onto the new
+    // program's stack. Bounded to ARGV_BUF_SIZE, so this never out-allocates.
+    let mut argv_vec: Vec<u8> = Vec::new();
+    if argv_vec.try_reserve_exact(n).is_err() {
+        return u64::MAX;
+    }
+    argv_vec.resize(n, 0);
+    let copied = unsafe { copy_from_user(buf_ptr, n, &mut argv_vec) };
+    let argv: &[u8] = &argv_vec[..copied];
     // argv[0] is the path: the first NUL-terminated string.
     let path_end = argv.iter().position(|&b| b == 0).unwrap_or(argv.len());
     let path = &argv[..path_end];
@@ -696,13 +750,15 @@ fn do_exec_argv(frame: *mut TrapFrame, buf_ptr: u64, buf_len: u64, argc: u64) ->
     if !crate::fs::is_file(ino) {
         return u64::MAX;
     }
-    let elf: &'static [u8] = unsafe {
-        let buf = &raw mut ELF_BUF;
-        let len = crate::fs::read_file(ino, &mut *buf);
-        let full: &'static [u8] = &*buf;
-        &full[..len]
+    let Some((buf, len)) = read_exec_elf(ino) else {
+        return u64::MAX;
     };
-    exec_image_args(frame, elf, argv, argc)
+    // SAFETY: see `do_exec_path` — valid until `free_exec_elf` after the load.
+    let full: &'static [u8] = unsafe { &*buf }; // explicit deref+borrow (no autoref)
+    let elf: &'static [u8] = &full[..len];
+    let r = exec_image_args(frame, elf, argv, argc);
+    free_exec_elf(buf); // load + stack build done (non-blocking) — safe to free
+    r
 }
 
 /// Build a System V x86-64 initial process stack on the (now-current, post-
@@ -981,6 +1037,15 @@ pub fn run() {
     // (no_std + a bump heap). It cats a quoted path (`cat "/motd"`, exercising
     // the Parser's $InQuotedString state in userspace) then execs `/bin/hello`.
     run_one(USER_FRAMESHELL_ELF, "frameshell");
+
+    // Concurrent exec: `coexec` forks two children that `exec_argv` *different*
+    // programs from disk at the same time (child A → /bin/hello, child B →
+    // /bin/argtest "Z"). Their blocking disk reads interleave, so each must load
+    // its own image from a per-exec scratch buffer — the old shared ELF_BUF /
+    // ARGV_BUF statics would let one child's read clobber the other's. The
+    // parent reaps both and prints "coexec: all done"; the smoke test checks
+    // argtest's "argv[1]=Z" survived child A's concurrent exec.
+    run_one(USER_COEXEC_ELF, "coexec");
 }
 
 /// Launch the interactive shell (B8). Sets up the syscall path + process table,
