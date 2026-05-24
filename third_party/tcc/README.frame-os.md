@@ -27,10 +27,28 @@ suite, or the bundled runtime/headers. The set:
 
 ## How it is built
 
-`tcc` is cross-compiled with `x86_64-linux-gnu-gcc -ffreestanding` against
-`frame-libc` (the same toolchain flow as the B11-2 `chello`, just multi-file)
-and linked with the Frame OS user linker script into `/bin/tcc`. The build
-defines `TCC_TARGET_X86_64` and compiles the units separately (no `ONE_SOURCE`).
+`tcc` is cross-compiled with `x86_64-linux-gnu-gcc -ffreestanding -nostdinc`
+(includes: the compiler's freestanding dir for `stdarg`/`stddef`/`stdint`, then
+`libc/include`, then this dir) against `frame-libc` (the same toolchain flow as
+the B11-2 `chello`, just multi-file) and linked with the Frame OS user linker
+script into `/bin/tcc`. tcc 0.9.27 defaults to `ONE_SOURCE`, so the build is two
+units: `libtcc.c` (`-DONE_SOURCE=1`, pulls in `tccpp`/`tccgen`/`tccelf`/`tccasm`/
+`tccrun`/`x86_64-gen`/`x86_64-link`/`i386-asm`) + `tcc.c` (`-DONE_SOURCE=0`, the
+driver, which `#include`s `tcctools.c`).
+
+Build defines:
+
+- `TCC_TARGET_X86_64` — the only backend we build.
+- `CONFIG_TCC_STATIC` — drop the `dlopen`/`-rdynamic` path (no `dlfcn.h`).
+- `CONFIG_TCCBOOT` — drop tcc's crash-backtrace machinery (it needs `signal`/
+  `ucontext`, which Frame OS has no use for; this is a real tcc config option,
+  not a source patch). The `-run` JIT itself stays compiled (it only needs
+  `mmap`/`mprotect`, stubbed in frame-libc) but is unused — Frame OS's tcc
+  writes its output ELF to disk and the shell execs it.
+
+The vendored files are **unmodified** from upstream — the entire port is the
+`frame-libc` header set (`libc/include`) + the functions it implements (B11-3c),
+so a version bump is a clean re-vendor.
 
 The system headers tcc includes (`stdio`/`stdlib`/`string`/`errno`/`math`/
 `fcntl`/`setjmp`/`time` + `stdarg`/`stddef` from the compiler) are supplied by
