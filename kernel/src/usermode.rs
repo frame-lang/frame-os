@@ -92,6 +92,22 @@ static mut PENDING_WAIT: bool = false;
 static mut PENDING_READLINE_BUF: u64 = 0;
 static mut PENDING_READLINE_LEN: u64 = 0;
 
+// `exec` (3/8/11) reads the program off disk — a *blocking* virtio read (B4)
+// that re-enables interrupts and yields. It must NOT run inside the dispatcher
+// handler: (1) it would block with the shared `SyscallDispatcher` parked in
+// `$Executing`, so a concurrent process's syscall re-enters the non-reentrant
+// FSM; (2) `exec_image*` installs the new program's register frame, and reading
+// the *global* `CURRENT_TRAP_FRAME` after the blocking read picks up whichever
+// process syscalled meanwhile — corrupting the wrong process's saved frame.
+// So, like `wait`/`read_line`, the handler only *records* the request; the
+// blocking load + frame install happen in `syscall_dispatch` (FSM back in
+// `$Validating`), operating on the caller's own `frame` pointer — never the
+// global. `-1` = none; otherwise the syscall number (3/8/11) + its args.
+static mut PENDING_EXEC: i64 = -1;
+static mut PENDING_EXEC_A0: u64 = 0;
+static mut PENDING_EXEC_A1: u64 = 0;
+static mut PENDING_EXEC_A2: u64 = 0;
+
 // The freestanding user programs (B3 Step 4), built by kernel/build.rs from
 // the `user/` crate and baked into the kernel image. `hello` prints "hello
 // from ELF" and exit(42)s; `faulter` reads kernel memory to trigger the
@@ -272,6 +288,28 @@ extern "C" fn syscall_dispatch(frame: *mut TrapFrame) {
     d.request(num, a0, a1);
     f.rax = d.result();
 
+    // Honor a pending exec AFTER the dispatcher is back in $Validating (B11 fix).
+    // The disk read blocks (re-enabling interrupts); doing it inside the handler
+    // would re-enter the non-reentrant dispatcher AND let a concurrent syscall
+    // clobber the global trap-frame pointer before the new image is installed.
+    // Run it on *this* caller's `frame` (captured args first, so a concurrent
+    // exec during the read can't disturb us). On success it has replaced the
+    // image (`f` now holds the new program's frame); on failure rax = u64::MAX.
+    let pending_exec = unsafe { (&raw const PENDING_EXEC).read() };
+    if pending_exec >= 0 {
+        let (ea0, ea1, ea2) = unsafe {
+            (
+                (&raw const PENDING_EXEC_A0).read(),
+                (&raw const PENDING_EXEC_A1).read(),
+                (&raw const PENDING_EXEC_A2).read(),
+            )
+        };
+        unsafe {
+            (&raw mut PENDING_EXEC).write(-1);
+        }
+        f.rax = run_pending_exec(frame, pending_exec, ea0, ea1, ea2);
+    }
+
     // Honor a pending wait AFTER the dispatcher is back in $Validating — the
     // block must not happen inside the handler. do_wait_loop blocks until a
     // child exits, reaps it, and returns the status into the caller's frame.
@@ -409,6 +447,33 @@ fn do_brk(new_end: u64) -> u64 {
     target
 }
 
+/// Record a deferred `exec` request (syscall `num` = 3/8/11 + its args). The
+/// blocking load + frame install happens in `syscall_dispatch` after the
+/// dispatcher returns to `$Validating` (see `PENDING_EXEC`).
+fn record_pending_exec(num: u64, a0: u64, a1: u64, a2: u64) {
+    unsafe {
+        (&raw mut PENDING_EXEC_A0).write(a0);
+        (&raw mut PENDING_EXEC_A1).write(a1);
+        (&raw mut PENDING_EXEC_A2).write(a2);
+        (&raw mut PENDING_EXEC).write(num as i64);
+    }
+}
+
+/// Run a deferred `exec` on the caller's own `frame` (B11 fix). Called from
+/// `syscall_dispatch` with the dispatcher already back in `$Validating`, so the
+/// blocking disk read can't re-enter the FSM and the frame install targets the
+/// caller — not whatever the global `CURRENT_TRAP_FRAME` points at after the read.
+/// Returns the exec result (`u64::MAX` on failure; on success it has installed
+/// the new program's frame and the value is irrelevant).
+fn run_pending_exec(frame: *mut TrapFrame, num: i64, a0: u64, a1: u64, a2: u64) -> u64 {
+    match num {
+        3 => do_exec(frame, a0),
+        8 => do_exec_path(frame, a0, a1),
+        11 => do_exec_argv(frame, a0, a1, a2),
+        _ => u64::MAX,
+    }
+}
+
 /// Perform a (validated) syscall, called by the dispatcher's `$Executing`
 /// enter handler. `write_char` returns 1; `exit` marks the process `$Zombie`
 /// and yields to the scheduler (never returns); `fork` returns the child pid.
@@ -428,7 +493,12 @@ pub fn perform_syscall(num: u64, a0: u64, _a1: u64) -> u64 {
             0
         }
         2 => do_fork(),
-        3 => do_exec(a0),
+        3 => {
+            // Defer exec (it blocks on disk + installs the new program's frame);
+            // syscall_dispatch runs it after the dispatcher is back in $Validating.
+            record_pending_exec(3, a0, 0, 0);
+            0
+        }
         4 => {
             // Record the wait; syscall_dispatch runs the (blocking) reap loop
             // after the dispatcher returns to $Validating.
@@ -463,7 +533,10 @@ pub fn perform_syscall(num: u64, a0: u64, _a1: u64) -> u64 {
             crate::vfs::close(a0 as usize);
             0
         }
-        8 => do_exec_path(a0, _a1),
+        8 => {
+            record_pending_exec(8, a0, _a1, 0); // exec from disk by path (deferred)
+            0
+        }
         9 => {
             // read_line(buf_ptr=a0, len=a1) → bytes read (B8). Blocks until a
             // line is typed; like wait, the actual block happens in
@@ -475,7 +548,10 @@ pub fn perform_syscall(num: u64, a0: u64, _a1: u64) -> u64 {
             0
         }
         10 => do_brk(a0), // brk(new_end) → current/new program break (B9-1)
-        11 => do_exec_argv(a0, _a1, arg2()), // exec with argv (B9-2)
+        11 => {
+            record_pending_exec(11, a0, _a1, arg2()); // exec with argv (deferred, B9-2)
+            0
+        }
         12 => {
             // write(fd=a0, buf=a1, len=rdx) → bytes written (B9-3). The buffer is
             // a user VA mapped in the current address space.
@@ -548,7 +624,7 @@ fn exec_elf(prog_id: u64) -> Option<&'static [u8]> {
 /// selected by id (B3, no filesystem). Returns u64::MAX on an unknown id (the
 /// caller keeps running); otherwise never "returns" to the old image — the
 /// syscall resumes into the new program. See `exec_image`.
-fn do_exec(prog_id: u64) -> u64 {
+fn do_exec(frame: *mut TrapFrame, prog_id: u64) -> u64 {
     let Some(elf) = exec_elf(prog_id) else {
         return u64::MAX;
     };
@@ -557,7 +633,7 @@ fn do_exec(prog_id: u64) -> u64 {
     serial::write_str(" exec'd program ");
     serial::write_u32_decimal(prog_id as u32);
     serial::writeln("");
-    exec_image(elf)
+    exec_image(frame, elf)
 }
 
 /// `exec(path)`: replace the calling process's image with a program loaded from
@@ -565,7 +641,7 @@ fn do_exec(prog_id: u64) -> u64 {
 /// it to the shared `exec_image`. Returns u64::MAX if the path doesn't resolve
 /// to a regular file or the image doesn't fit `ELF_BUF` (the caller keeps
 /// running and sees the failure).
-fn do_exec_path(path_ptr: u64, path_len: u64) -> u64 {
+fn do_exec_path(frame: *mut TrapFrame, path_ptr: u64, path_len: u64) -> u64 {
     let mut path = [0u8; 256];
     let n = unsafe { copy_from_user(path_ptr, path_len as usize, &mut path) };
     let Some(ino) = crate::fs::namei(&path[..n]) else {
@@ -592,7 +668,7 @@ fn do_exec_path(path_ptr: u64, path_len: u64) -> u64 {
     serial::write_str(" from disk (");
     serial::write_u32_decimal(elf.len() as u32);
     serial::writeln(" bytes)");
-    exec_image(elf)
+    exec_image(frame, elf)
 }
 
 /// `exec_argv(buf_ptr, buf_len, argc)` — exec a program *with arguments* (B9-2).
@@ -600,7 +676,7 @@ fn do_exec_path(path_ptr: u64, path_len: u64) -> u64 {
 /// load (so `argv[0]` is the program name, the Unix convention). Reads the ELF
 /// off disk like `do_exec_path`, then loads it with the argv laid onto the new
 /// program's initial stack. Returns `u64::MAX` on a bad path / load failure.
-fn do_exec_argv(buf_ptr: u64, buf_len: u64, argc: u64) -> u64 {
+fn do_exec_argv(frame: *mut TrapFrame, buf_ptr: u64, buf_len: u64, argc: u64) -> u64 {
     let n = (buf_len as usize).min(ARGV_BUF_SIZE);
     let argc = (argc as usize).min(MAX_ARGS);
     let argv: &'static [u8] = unsafe {
@@ -624,7 +700,7 @@ fn do_exec_argv(buf_ptr: u64, buf_len: u64, argc: u64) -> u64 {
         let full: &'static [u8] = &*buf;
         &full[..len]
     };
-    exec_image_args(elf, argv, argc)
+    exec_image_args(frame, elf, argv, argc)
 }
 
 /// Build a System V x86-64 initial process stack on the (now-current, post-
@@ -675,7 +751,13 @@ unsafe fn build_initial_stack(top: u64, argv: &[u8], argc: usize) -> u64 {
 
 /// Like `exec_image`, but lays `argv` onto the new program's initial stack
 /// (B9-2). The process enters the new program with `rsp` pointing at `argc`.
-fn exec_image_args(elf: &'static [u8], argv: &[u8], argc: usize) -> u64 {
+///
+/// `frame` is the *caller's own* trap frame (its kernel-stack location), passed
+/// down from `syscall_dispatch` rather than read from the global
+/// `CURRENT_TRAP_FRAME`: this runs after a blocking disk read, during which a
+/// concurrent process's syscall may have overwritten the global, so using it
+/// here would install the new image into the wrong process's frame.
+fn exec_image_args(frame: *mut TrapFrame, elf: &'static [u8], argv: &[u8], argc: usize) -> u64 {
     let new_pml4 = unsafe { paging::new_address_space() };
     crate::elf::prepare(elf, new_pml4);
     let mut loader = ElfLoader::__create();
@@ -687,7 +769,7 @@ fn exec_image_args(elf: &'static [u8], argv: &[u8], argc: usize) -> u64 {
     unsafe {
         sched::exec_into(new_pml4); // CR3 = new space; the user stack is now mapped
         let new_rsp = build_initial_stack(top, argv, argc);
-        let f = &mut *(&raw const CURRENT_TRAP_FRAME).read();
+        let f = &mut *frame;
         *f = TrapFrame {
             rip: entry,
             rsp: new_rsp,
@@ -704,8 +786,10 @@ fn exec_image_args(elf: &'static [u8], argv: &[u8], argc: usize) -> u64 {
 /// space, swap the process onto it, and reset its trap frame to enter the new
 /// program (zeroed GPRs, new RIP/RSP). The process keeps its pid + kernel stack.
 /// The syscall stub's `iretq` then resumes into the new program; `rax` is set to
-/// 0 by `syscall_dispatch`. Returns u64::MAX if the ELF fails to load.
-fn exec_image(elf: &'static [u8]) -> u64 {
+/// 0 by `syscall_dispatch`. Returns u64::MAX if the ELF fails to load. `frame`
+/// is the caller's own trap frame (see `exec_image_args` for why it's passed in
+/// rather than read from the global).
+fn exec_image(frame: *mut TrapFrame, elf: &'static [u8]) -> u64 {
     let new_pml4 = unsafe { paging::new_address_space() };
     crate::elf::prepare(elf, new_pml4);
     let mut loader = ElfLoader::__create();
@@ -717,7 +801,7 @@ fn exec_image(elf: &'static [u8]) -> u64 {
 
     unsafe {
         sched::exec_into(new_pml4);
-        let f = &mut *(&raw const CURRENT_TRAP_FRAME).read();
+        let f = &mut *frame;
         *f = TrapFrame {
             rip: entry,
             rsp: user_rsp,

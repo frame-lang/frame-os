@@ -650,12 +650,12 @@ fn build_c_disk_elf(workspace: &Path, name: &str) -> Result<Vec<u8>> {
     let status = Command::new("x86_64-linux-gnu-ld")
         .arg("-T")
         .arg(&linker_script)
-        // gc unused .a sections. NOTE: `--strip-all` produces a byte-identical
-        // PT_LOAD image (verified) yet makes the loaded program fault in-kernel —
-        // an unexplained interaction (the ELF loader reads only program headers,
-        // so stripping sections "shouldn't" matter). Left unstripped until that's
-        // understood; the ELF is larger (symtab rides along) but correct.
-        .args(["-z", "max-page-size=0x1000", "--gc-sections"])
+        // gc unused .a sections + strip symbols → a lean (~41 KiB) ELF. (B11-2
+        // briefly shipped unstripped after `--strip-all` *appeared* to cause an
+        // in-kernel fault; that was a misdiagnosis — the real bug was a kernel
+        // exec/trap-frame race exposed by timing, fixed since. Stripping is fine:
+        // the loader reads only program headers, which strip leaves untouched.)
+        .args(["-z", "max-page-size=0x1000", "--gc-sections", "--strip-all"])
         .arg("-o")
         .arg(&elf)
         .arg(&obj)
