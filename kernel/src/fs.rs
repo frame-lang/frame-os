@@ -346,15 +346,23 @@ pub fn create(name: &[u8]) -> Option<u32> {
     node.kind = fs::T_FILE;
     node.nlink = 1;
     write_inode(ino, &node);
-    // Add a dirent to the root directory's first data block.
+    // Append a dirent to the root directory, growing it into a new data block
+    // when the current one fills. DIRENT_SIZE (32) evenly divides BLOCK_SIZE
+    // (512 = 16 dirents), so entries never straddle a block boundary; the new
+    // entry goes at logical offset root.size, whose block is allocated on demand
+    // via block_for. (Earlier this used only direct[0] — a 16-entry cap — but
+    // dir_lookup/unlink already iterate all of dir.direct, so the read side was
+    // always multi-block; this makes creation match.)
     let mut root = read_inode(fs::ROOT_INODE);
-    let dblk = root.direct[0];
-    let mut data = read_block(dblk);
     let off = root.size as usize;
-    if off + fs::DIRENT_SIZE > fs::BLOCK_SIZE {
-        return None; // root dir full (single block at Step 2)
-    }
-    fs::write_dirent(&mut data, off, name, ino);
+    let bi = off / fs::BLOCK_SIZE;
+    let within = off % fs::BLOCK_SIZE;
+    let Some(dblk) = block_for(&mut root, bi, true) else {
+        write_inode(ino, &fs::Inode::empty()); // out of space — release the inode
+        return None;
+    };
+    let mut data = read_block(dblk);
+    fs::write_dirent(&mut data, within, name, ino);
     write_block(dblk, &data);
     root.size += fs::DIRENT_SIZE as u32;
     write_inode(fs::ROOT_INODE, &root);
