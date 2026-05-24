@@ -15,6 +15,7 @@ extern crate alloc;
 use core::alloc::{GlobalAlloc, Layout};
 use core::arch::{asm, global_asm};
 
+mod cfloat;
 mod cstdlib;
 mod cstring;
 mod frame_systems;

@@ -441,37 +441,42 @@ pub fn fprintf_args(f: *mut FILE, fmt: &str, args: &[Arg]) {
 }
 
 /// Rust target of the `fprintf` trampoline: `rdi` = stream, `rsi` = fmt,
-/// `rdx` = saved-reg area (rdx,rcx,r8,r9), `rcx` = stack overflow.
+/// `rdx` = GP-vararg area (rdx,rcx,r8,r9), `rcx` = SSE area (xmm0-7), `r8` =
+/// stack overflow. Reads integer args from the GP area and float args from the
+/// SSE area (B11-3c).
 extern "C" fn vfprintf_impl(
     f: *mut FILE,
     fmt: *const u8,
-    regs: *const u64,
-    overflow: *const u64,
+    gp: *const u8,
+    fp: *const u8,
+    ov: *const u8,
 ) -> i32 {
-    let mut va = crate::printf::VaArgs::new(regs, 4, overflow);
+    let mut va = crate::printf::VaArgs::from_spill(gp, 4, fp, ov);
     let bytes = crate::printf::vformat_va(fmt, &mut va);
     unsafe { fwrite(bytes.as_ptr(), 1, bytes.len(), f) };
     bytes.len() as i32
 }
 
-/// C `fprintf(FILE *f, const char *fmt, ...)`. Naked: stream stays in rdi and
-/// fmt in rsi; spill the 4 vararg integer registers (rdx,rcx,r8,r9). Four pushes
-/// from a post-`call` rsp leave it ≡8 mod 16, so one extra 8-byte pad aligns the
-/// inner call (B11-1).
+/// C `fprintf(FILE *f, const char *fmt, ...)`. Naked: stream stays in rdi, fmt
+/// in rsi; spill the 4 GP vararg registers (rdx,rcx,r8,r9) + xmm0-7, then call
+/// the impl with pointers to the GP area, the SSE area, and the stack overflow.
 #[no_mangle]
 #[unsafe(naked)]
 pub unsafe extern "C" fn fprintf(_f: *mut FILE, _fmt: *const u8) -> i32 {
     core::arch::naked_asm!(
-        "push r9",
-        "push r8",
-        "push rcx",
-        "push rdx",
-        "mov rdx, rsp",        // arg2 = saved-reg area [rdx,rcx,r8,r9]
-        "lea rcx, [rsp + 40]", // arg3 = overflow (32 pushed + 8 return addr)
-        "sub rsp, 8",          // 16-align the call
+        "push r9", "push r8", "push rcx", "push rdx", // GP area (32)
+        "sub rsp, 128",                                // SSE area (8*16)
+        "movups [rsp + 0], xmm0", "movups [rsp + 16], xmm1",
+        "movups [rsp + 32], xmm2", "movups [rsp + 48], xmm3",
+        "movups [rsp + 64], xmm4", "movups [rsp + 80], xmm5",
+        "movups [rsp + 96], xmm6", "movups [rsp + 112], xmm7",
+        "lea rdx, [rsp + 128]", // arg2 = GP area
+        "mov rcx, rsp",         // arg3 = SSE area
+        "lea r8, [rsp + 168]",  // arg4 = overflow (128 SSE + 32 GP + 8 ret)
+        "sub rsp, 8",           // 16-align the call
         "call {f}",
         "add rsp, 8",
-        "add rsp, 32",         // pop the 4 saved regs
+        "add rsp, 160",
         "ret",
         f = sym vfprintf_impl,
     );

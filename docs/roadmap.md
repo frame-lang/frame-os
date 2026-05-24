@@ -1041,3 +1041,72 @@ This file is updated as milestones are completed and as scope decisions change. 
 Decisions to expand or contract scope are documented here, with reasoning — as the 2026-05-20 re-baseline note at the top of Track B does. If a committed milestone (e.g. B6/B7) is dropped, this file should explain why. If a new milestone (say, "B8 — AArch64 / Raspberry Pi port") is added, this file should explain its goals and dependencies.
 
 The roadmap is a project artifact, not a marketing document. It should be accurate enough that someone reading it knows what the project is, what it isn't, and what's actually working today.
+
+## B11-3 decisions & short-term follow-ups (tech debt)
+
+Recorded 2026-05-24, while porting `frame-libc` for the on-device C compiler
+(tcc, B11-3). Two parts: a design decision (floating point), and an honest list
+of the shortcuts/stubs taken to get tcc linking, each scheduled to be paid off.
+
+### Decision: floating point in frame-libc
+
+The B11-3 float scope was chosen as **full float** (the earlier "enable FPU +
+save state" call, B11-3a). The implementation splits by what each language owns:
+
+- **Pure Rust (the bulk):** the variadic printf trampolines spill `xmm0–7` so
+  `%f`/`%e`/`%g` arguments — which the SysV ABI passes in SSE registers — are
+  readable; `strtod`/`strtof` parse; `ldexp` scales; the printf engine renders
+  `f64`. This is the real work, in Rust, on top of the B11-3a FPU-save.
+- **One-function gcc C shim for `strtold`:** x86 `long double` is the 80-bit x87
+  extended type, which **Rust has no type for**. gcc implements it natively, so
+  `strtold` lives in `libc/csrc/strtold.c`, compiled by the cross-gcc and linked
+  alongside the Rust staticlib by xtask. This is *correct*, not a shortcut — the
+  shortcut would be faking `long double` as `f64` (wrong precision + wrong ABI:
+  f64 returns in xmm0, `long double` in st0). It is quarantined to build wiring
+  so the Rust crate stays pure Rust, and it is the *only* 80-bit surface tcc
+  needs (tcc's formatting is all `double` — no `%Lf` — and it uses `ldexp`, not
+  `ldexpl`). Downside accepted: frame-libc is no longer 100% Rust; mitigated by
+  keeping the C surface to a single, quarantined function.
+
+### Short-term follow-ups (pay these off next)
+
+Shortcuts taken to get tcc to link/compile, in rough priority order. None are
+load-bearing for *integer* C compilation, but each is a real gap:
+
+1. **`assert` is a no-op** (`libc/include/assert.h`) — disables tcc's internal
+   sanity checks, which could mask a real miscompile. Make it `abort` on failure
+   (needs a minimal `__assert_fail`).
+2. **`unlink`/`remove` return -1** (`libc/src/posix.rs`) — Frame OS has no
+   file-delete syscall. Add one (kernel `fs::unlink` + a syscall) so tcc temp
+   files and overwrite paths work.
+3. **`getcwd` returns "/"** — Frame OS has no per-process cwd. Add a real cwd
+   (per-process state + `chdir`/`getcwd` syscalls) when the shell needs it.
+4. **`time`/`localtime`/`gettimeofday` return a fixed epoch** — no RTC/clock
+   source yet. Wire a real time source (PIT/HPET/TSC or CMOS RTC) so `__DATE__`/
+   `__TIME__` and timing are real.
+5. **`execvp`/`mprotect` are stubs** — `execvp` is genuinely unused (tcc is
+   self-contained, no external `as`/`ld`); `mprotect` only serves tcc's unused
+   `-run` JIT. Acceptable as stubs, but documented so they aren't mistaken for
+   working.
+6. **tcc's `-run` JIT is compiled but unused** — `CONFIG_TCCBOOT` drops the
+   backtrace path; the in-memory `-run` path remains (needs only the `mprotect`
+   stub). Frame OS's tcc writes ELF to disk + the shell execs it, so `-run` is
+   dead weight. Could be excluded entirely with a small upstream-config change.
+7. **`ELF_BUF`/`ARGV_BUF` single-flight** — RESOLVED. The exec scratch buffers
+   were shared statics that assumed one `exec` in flight; but `exec`'s disk read
+   *blocks* (re-enables interrupts and yields), so two processes exec'ing
+   concurrently across that read could clobber the shared buffer (the first
+   process's loader would then map the second's program). Fixed by allocating the
+   ELF image and the packed argv *per-exec on the kernel heap*
+   (`read_exec_elf`/`free_exec_elf` plus a per-call argv `Vec` in
+   `kernel/src/usermode.rs`), freed after the synchronous load. Regression guard:
+   the `coexec` program + `concurrent_exec_buffers` smoke test (two children exec
+   different disk programs at once; argtest's `argv[1]=Z` must survive).
+8. **User stack is one page** (`kernel/src/elf.rs`) — likely too small for tcc's
+   recursive-descent parser; enlarge the loader's user stack for B11-3d.
+9. **`strtod`/`strtof` precision** — the Rust implementations target correctness
+   for common cases, not last-bit IEEE rounding; revisit if a float program's
+   output proves sensitive.
+
+These are tracked here rather than silently carried; B11-3d/e and beyond should
+burn them down (especially #2/#3/#4, which the toolchain genuinely wants).

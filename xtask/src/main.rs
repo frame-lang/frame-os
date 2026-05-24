@@ -581,6 +581,41 @@ fn build_user_disk_elf(workspace: &Path, bin: &str) -> Result<Vec<u8>> {
     std::fs::read(&elf).with_context(|| format!("failed to read user ELF {}", elf.display()))
 }
 
+/// Compile frame-libc's C shims (`libc/csrc/*.c`) into objects, returning their
+/// paths. These are the parts of frame-libc that must be C, not Rust — currently
+/// only `strtold` (80-bit `long double`, which Rust has no type for, B11-3c).
+/// Built with the same freestanding flags as the C programs and linked into any
+/// C program built against frame-libc (`--gc-sections` drops unused ones).
+fn build_libc_cshims(workspace: &Path, include: &Path, out_dir: &Path) -> Result<Vec<PathBuf>> {
+    let csrc = workspace.join("libc").join("csrc");
+    let mut objs = Vec::new();
+    for name in ["strtold"] {
+        let src = csrc.join(format!("{name}.c"));
+        let obj = out_dir.join(format!("libc_{name}.o"));
+        let status = Command::new("x86_64-linux-gnu-gcc")
+            .args([
+                "-ffreestanding",
+                "-fno-stack-protector",
+                "-fno-pie",
+                "-fno-pic",
+                "-O2",
+                "-c",
+            ])
+            .arg("-I")
+            .arg(include)
+            .arg(&src)
+            .arg("-o")
+            .arg(&obj)
+            .status()
+            .with_context(|| format!("failed to invoke gcc for libc shim {name}"))?;
+        if !status.success() {
+            bail!("gcc compile of libc/csrc/{name}.c failed");
+        }
+        objs.push(obj);
+    }
+    Ok(objs)
+}
+
 /// Cross-compile a C program in `csrc/<name>.c` against frame-libc and return
 /// the Frame-OS ELF bytes (B11-2). Three steps, all in the container:
 ///   1. build frame-os-libc as a staticlib (`libframe_os_libc.a`);
@@ -644,24 +679,30 @@ fn build_c_disk_elf(workspace: &Path, name: &str) -> Result<Vec<u8>> {
         bail!("gcc compile of csrc/{name}.c failed");
     }
 
+    // 2b. Compile frame-libc's C shim(s) — the bits that must be C, not Rust
+    //     (currently just `strtold`, 80-bit long double; Rust has no f80). Linked
+    //     alongside the Rust staticlib; --gc-sections drops them if unused.
+    let shims = build_libc_cshims(workspace, &include, &out_dir)?;
+
     // 3. Link with the Frame OS user linker script; gc unused .a sections.
     //    x86_64 cross ld (the .a + the linker script's OUTPUT_FORMAT are x86-64).
     let linker_script = workspace.join("user").join("linker.ld");
-    let status = Command::new("x86_64-linux-gnu-ld")
-        .arg("-T")
+    let mut ld = Command::new("x86_64-linux-gnu-ld");
+    ld.arg("-T")
         .arg(&linker_script)
-        // gc unused .a sections + strip symbols → a lean (~41 KiB) ELF. (B11-2
-        // briefly shipped unstripped after `--strip-all` *appeared* to cause an
-        // in-kernel fault; that was a misdiagnosis — the real bug was a kernel
-        // exec/trap-frame race exposed by timing, fixed since. Stripping is fine:
-        // the loader reads only program headers, which strip leaves untouched.)
+        // gc unused .a sections + strip symbols → a lean ELF. (B11-2 briefly
+        // shipped unstripped after `--strip-all` *appeared* to cause an in-kernel
+        // fault; that was a misdiagnosis — the real bug was a kernel exec/trap-
+        // frame race exposed by timing, fixed since. Stripping is fine: the
+        // loader reads only program headers, which strip leaves untouched.)
         .args(["-z", "max-page-size=0x1000", "--gc-sections", "--strip-all"])
         .arg("-o")
         .arg(&elf)
-        .arg(&obj)
-        .arg(&lib_a)
-        .status()
-        .context("failed to invoke ld")?;
+        .arg(&obj);
+    for shim in &shims {
+        ld.arg(shim);
+    }
+    let status = ld.arg(&lib_a).status().context("failed to invoke ld")?;
     if !status.success() {
         bail!("ld link of {name} failed");
     }

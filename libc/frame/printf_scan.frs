@@ -44,6 +44,8 @@
                     self.f_zero = false;
                     self.f_left = false;
                     self.width = 0;
+                    self.prec = -1;
+                    self.long_arg = false;
                     -> $Percent
                 } else {
                     self.dirs.push(PfDir::Lit(c));
@@ -65,6 +67,16 @@
                 } else if c == '-' {
                     self.f_left = true;
                     -> $Width
+                } else if c == '+' || c == ' ' || c == '#' {
+                    // Sign/alternate flags: accepted, no effect on our output.
+                    -> $Width
+                } else if c == '.' {
+                    self.prec = 0;
+                    -> $Precision
+                } else if is_length_mod(c) {
+                    if c == 'l' {
+                        self.long_arg = true;
+                    }
                 } else if c.is_ascii_digit() {
                     self.width = c as u32 - '0' as u32;
                     -> $Width
@@ -73,6 +85,8 @@
                         zero: self.f_zero,
                         left: self.f_left,
                         width: self.width,
+                        prec: self.prec,
+                        long_arg: self.long_arg,
                         conv: c,
                     });
                     -> $Literal
@@ -94,16 +108,53 @@
                     self.width = self.width * 10 + (c as u32 - '0' as u32);
                 } else if c == '-' {
                     self.f_left = true;
+                } else if c == '.' {
+                    self.prec = 0;
+                    -> $Precision
+                } else if is_length_mod(c) {
+                    if c == 'l' {
+                        self.long_arg = true;
+                    }
                 } else if is_conv(c) {
                     self.dirs.push(PfDir::Conv {
                         zero: self.f_zero,
                         left: self.f_left,
                         width: self.width,
+                        prec: self.prec,
+                        long_arg: self.long_arg,
                         conv: c,
                     });
                     -> $Literal
                 } else {
                     // Malformed spec — show the stray char and resume literals.
+                    self.dirs.push(PfDir::Lit(c));
+                    -> $Literal
+                }
+            }
+            finalize() {
+                -> $Done
+            }
+        }
+
+        $Precision {
+            consume(c: char) {
+                if c.is_ascii_digit() {
+                    self.prec = self.prec * 10 + (c as i32 - '0' as i32);
+                } else if is_length_mod(c) {
+                    if c == 'l' {
+                        self.long_arg = true;
+                    }
+                } else if is_conv(c) {
+                    self.dirs.push(PfDir::Conv {
+                        zero: self.f_zero,
+                        left: self.f_left,
+                        width: self.width,
+                        prec: self.prec,
+                        long_arg: self.long_arg,
+                        conv: c,
+                    });
+                    -> $Literal
+                } else {
                     self.dirs.push(PfDir::Lit(c));
                     -> $Literal
                 }
@@ -123,4 +174,6 @@
         f_zero: bool = false
         f_left: bool = false
         width: u32 = 0
+        prec: i32 = -1
+        long_arg: bool = false
 }
