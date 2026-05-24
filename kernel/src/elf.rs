@@ -185,7 +185,16 @@ pub fn map_segments(hdr: ElfHeader) -> bool {
 
 fn map_one_segment(p_offset: u64, p_vaddr: u64, p_filesz: u64, p_memsz: u64, flags: u64) -> bool {
     let seg_end = p_vaddr + p_memsz;
-    let mut va = p_vaddr & !(PAGE - 1); // align down (our linker keeps p_vaddr aligned)
+    // Align the *page* down, but keep the segment's sub-page offset: ELF only
+    // guarantees `p_offset ≡ p_vaddr (mod PAGE)`, NOT that p_vaddr is page
+    // aligned. (Our own linker emits aligned segments, but tcc's output does
+    // not — its data segment starts mid-page, e.g. 0x…bc8.) For each page we
+    // zero it (covering .bss / the bytes outside file content) and copy only
+    // the file bytes that overlap this page, placed at their correct in-page
+    // offset. Getting this wrong shifts .data/.got by the sub-page delta —
+    // every absolute pointer in the image then points into garbage.
+    let file_end = p_vaddr + p_filesz; // VA one past the last file-backed byte
+    let mut va = p_vaddr & !(PAGE - 1); // page containing the segment start
     while va < seg_end {
         let Some(frame) = frames::alloc_frame() else {
             return false;
@@ -193,14 +202,16 @@ fn map_one_segment(p_offset: u64, p_vaddr: u64, p_filesz: u64, p_memsz: u64, fla
         unsafe {
             let dst = frames::phys_to_virt(frame);
             core::ptr::write_bytes(dst, 0, PAGE as usize); // zero (covers .bss)
-                                                           // Copy whatever file bytes fall in this page.
-            let seg_off = va.saturating_sub(p_vaddr); // page-aligned multiple
-            if seg_off < p_filesz {
-                let n = core::cmp::min(PAGE, p_filesz - seg_off) as usize;
-                let src_off = (p_offset + seg_off) as usize;
+            // Overlap of this page [va, va+PAGE) with file content [p_vaddr, file_end).
+            let content_start = core::cmp::max(va, p_vaddr);
+            let content_end = core::cmp::min(va + PAGE, file_end);
+            if content_start < content_end {
+                let dst_in_page = (content_start - va) as usize;
+                let src_off = (p_offset + (content_start - p_vaddr)) as usize;
+                let n = (content_end - content_start) as usize;
                 let e = elf();
                 if let Some(src) = e.bytes.get(src_off..src_off + n) {
-                    core::ptr::copy_nonoverlapping(src.as_ptr(), dst, n);
+                    core::ptr::copy_nonoverlapping(src.as_ptr(), dst.add(dst_in_page), n);
                 } else {
                     frames::free_frame(frame);
                     return false; // file offsets out of range — corrupt

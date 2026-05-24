@@ -21,12 +21,17 @@ pub enum PfDir {
     /// (left-justified if `left`, zero-filled if `zero` and not left). `prec` is
     /// the precision (`-1` = none): min digits for integers, max length for `%s`.
     /// `long_arg` is set by an `l`/`ll` length modifier (read a 64-bit argument).
+    /// `star_width`/`star_prec` mean the width / precision is `*` — read from an
+    /// `int` argument at format time (before the value arg), per C. A negative
+    /// `*` width means left-justify (the engine handles that).
     Conv {
         zero: bool,
         left: bool,
         width: u32,
         prec: i32,
         long_arg: bool,
+        star_width: bool,
+        star_prec: bool,
         conv: char,
     },
 }

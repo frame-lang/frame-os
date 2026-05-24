@@ -176,8 +176,30 @@ pub(crate) fn vformat_va(fmt: *const u8, va: &mut VaArgs) -> Vec<u8> {
                 width,
                 prec,
                 long_arg,
+                star_width,
+                star_prec,
                 conv,
             } => {
+                // `*` width / precision read an `int` arg first, in C order:
+                // width, then precision, then the value. A negative `*` width
+                // means left-justify with its magnitude; a negative `*`
+                // precision is treated as if omitted.
+                let mut eff_left = *left;
+                let mut eff_width = *width as usize;
+                if *star_width {
+                    let w = va.next_gp() as u32 as i32;
+                    if w < 0 {
+                        eff_left = true;
+                        eff_width = w.unsigned_abs() as usize;
+                    } else {
+                        eff_width = w as usize;
+                    }
+                }
+                let mut eff_prec = *prec;
+                if *star_prec {
+                    let p = va.next_gp() as u32 as i32;
+                    eff_prec = if p < 0 { -1 } else { p };
+                }
                 let arg = match conv {
                     'd' | 'i' => Arg::Int(if *long_arg {
                         va.next_gp() as i64
@@ -195,7 +217,7 @@ pub(crate) fn vformat_va(fmt: *const u8, va: &mut VaArgs) -> Vec<u8> {
                     'p' => Arg::Ptr(va.next_gp() as usize),
                     _ => continue, // unknown: consume nothing
                 };
-                render_conv(&mut out, *conv, *zero, *left, *width as usize, *prec, Some(&arg));
+                render_conv(&mut out, *conv, *zero, eff_left, eff_width, eff_prec, Some(&arg));
             }
         }
     }

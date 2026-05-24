@@ -534,10 +534,17 @@ pub fn perform_syscall(num: u64, a0: u64, _a1: u64) -> u64 {
         6 => {
             // read(fd=a0, buf_ptr=a1, len=rdx) → bytes read. The buffer is a
             // user VA, mapped in the current address space (CR3 unchanged
-            // during a syscall), so we write into it directly.
+            // during a syscall), so we write into it directly. A 0-length read
+            // is valid POSIX and returns 0 *without* touching the buffer — tcc
+            // issues `read(fd, NULL, 0)`, and forming a slice from a null pointer
+            // is UB (a debug-build precondition panic), so guard it here.
             let len = arg2() as usize;
-            let buf = unsafe { core::slice::from_raw_parts_mut(_a1 as *mut u8, len) };
-            crate::vfs::read(a0 as usize, buf) as u64
+            if len == 0 {
+                0
+            } else {
+                let buf = unsafe { core::slice::from_raw_parts_mut(_a1 as *mut u8, len) };
+                crate::vfs::read(a0 as usize, buf) as u64
+            }
         }
         7 => {
             crate::vfs::close(a0 as usize);
@@ -564,10 +571,15 @@ pub fn perform_syscall(num: u64, a0: u64, _a1: u64) -> u64 {
         }
         12 => {
             // write(fd=a0, buf=a1, len=rdx) → bytes written (B9-3). The buffer is
-            // a user VA mapped in the current address space.
+            // a user VA mapped in the current address space. Like read, a
+            // 0-length write returns 0 without forming a (possibly null) slice.
             let len = arg2() as usize;
-            let buf = unsafe { core::slice::from_raw_parts(_a1 as *const u8, len) };
-            crate::vfs::write(a0 as usize, buf) as u64
+            if len == 0 {
+                0
+            } else {
+                let buf = unsafe { core::slice::from_raw_parts(_a1 as *const u8, len) };
+                crate::vfs::write(a0 as usize, buf) as u64
+            }
         }
         13 => {
             // lseek(fd=a0, offset=a1, whence=rdx) → new offset, or u64::MAX (B9-3).

@@ -265,16 +265,42 @@ fn init_boot() {
 }
 
 /// Add a worker thread; fires the Frame Scheduler's `task_ready`.
+/// Allocate a scheduler slot for a new thread/process: **reuse** the lowest
+/// freed worker slot (`reap_dead_child` resets exited slots to `TCB_INIT` ⇒
+/// `Free`), or append a fresh one. Returns the slot index; `N` (the high-water
+/// mark the round-robin iterates and the per-slot kernel-stack index derive
+/// from) is bumped only when appending.
+///
+/// Reuse is the fix for a slot *leak*: every `spawn_user_from_frame` (fork) used
+/// to append (`N += 1`) and reap never shrank `N`, so a shell running enough
+/// programs in sequence drove `N` past `MAX_THREADS` and wrote `TCBS[8]` /
+/// `KSTACKS[9]` out of bounds — corrupting kernel memory (it crashed the kernel
+/// after ~7 sequential programs, e.g. the tcc compile run). With reuse, `N`
+/// tracks the *concurrent* thread count (a small number), never the cumulative.
+unsafe fn alloc_slot() -> usize {
+    let t = tcbs();
+    let n = (&raw const N).read();
+    for i in 1..n {
+        if (*t.add(i)).state == RunState::Free {
+            return i; // reuse a reaped slot
+        }
+    }
+    // Append. Slot `n`'s kernel stack is `KSTACKS[n + 1]`, so keep `n + 1`
+    // within the fixed array (`n + 1 < MAX_THREADS`) as well as `n`.
+    assert!(n + 1 < MAX_THREADS, "scheduler: out of TCB/kstack slots");
+    (&raw mut N).write(n + 1);
+    n
+}
+
 unsafe fn spawn(stack_top: *mut u8, entry: extern "C" fn() -> !) {
     let cs = read_cs();
     let ss = read_ss();
     let rsp = init_thread(stack_top, entry, cs, ss);
-    let n = (&raw const N).read();
+    let n = alloc_slot();
     let t = tcbs();
     (*t.add(n)).rsp = rsp;
     (*t.add(n)).state = RunState::Runnable;
     fpu_area(n).write(fpu::clean()); // fresh thread → clean FPU
-    (&raw mut N).write(n + 1);
     with_sched(|s| s.task_ready());
 }
 
@@ -313,7 +339,7 @@ unsafe fn init_user_frame(kstack_top: u64, entry: u64, user_rsp: u64) -> u64 {
 /// # Safety
 /// `pml4` must be a valid address space with `entry`/`user_rsp` mapped USER.
 pub unsafe fn spawn_user(pml4: u64, entry: u64, user_rsp: u64, pid: u32) {
-    let n = (&raw const N).read();
+    let n = alloc_slot();
     // Top of this slot's kernel stack: base + (n+1)*STACK_SIZE, 16-aligned.
     let base = (&raw mut KSTACKS) as *mut u8;
     let kstack_top = (base.add((n + 1) * STACK_SIZE) as u64) & !0xF;
@@ -326,7 +352,6 @@ pub unsafe fn spawn_user(pml4: u64, entry: u64, user_rsp: u64, pid: u32) {
     (*t.add(n)).pid = pid;
     (*t.add(n)).heap_brk = USER_HEAP_BASE; // fresh process: empty brk heap
     fpu_area(n).write(fpu::clean()); // fresh process → clean FPU
-    (&raw mut N).write(n + 1);
     with_sched(|s| s.task_ready());
 }
 
@@ -343,7 +368,7 @@ pub unsafe fn spawn_user_from_frame(
     pid: u32,
     parent_pid: u32,
 ) {
-    let n = (&raw const N).read();
+    let n = alloc_slot();
     let base = (&raw mut KSTACKS) as *mut u8;
     let kstack_top = (base.add((n + 1) * STACK_SIZE) as u64) & !0xF;
     let saved_rsp = kstack_top - 160; // sizeof(TrapFrame)
@@ -362,7 +387,6 @@ pub unsafe fn spawn_user_from_frame(
     // syscall, so its live x87/SSE registers are the state to copy — FXSAVE them
     // straight into the child's save area.
     fpu::save(fpu_area(n));
-    (&raw mut N).write(n + 1);
     with_sched(|s| s.task_ready());
 }
 

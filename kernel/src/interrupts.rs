@@ -324,6 +324,7 @@ global_asm!(
     "  push rbx",
     "  mov rdi, cr2",      // arg0 = faulting address
     "  mov rsi, [rsp+80]", // arg1 = error code (10 pushes = 80 bytes above)
+    "  mov rdx, [rsp+88]", // arg2 = faulting RIP (iretq frame, just above err code)
     "  mov rbx, rsp",      // save rsp across alignment
     "  and rsp, -16",      // align for the SysV call
     "  call page_fault_handler",

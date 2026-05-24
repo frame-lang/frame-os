@@ -46,6 +46,8 @@
                     self.width = 0;
                     self.prec = -1;
                     self.long_arg = false;
+                    self.star_width = false;
+                    self.star_prec = false;
                     -> $Percent
                 } else {
                     self.dirs.push(PfDir::Lit(c));
@@ -73,6 +75,10 @@
                 } else if c == '.' {
                     self.prec = 0;
                     -> $Precision
+                } else if c == '*' {
+                    // Width from an int argument (e.g. `%*s`).
+                    self.star_width = true;
+                    -> $Width
                 } else if is_length_mod(c) {
                     if c == 'l' {
                         self.long_arg = true;
@@ -87,6 +93,8 @@
                         width: self.width,
                         prec: self.prec,
                         long_arg: self.long_arg,
+                        star_width: self.star_width,
+                        star_prec: self.star_prec,
                         conv: c,
                     });
                     -> $Literal
@@ -122,6 +130,8 @@
                         width: self.width,
                         prec: self.prec,
                         long_arg: self.long_arg,
+                        star_width: self.star_width,
+                        star_prec: self.star_prec,
                         conv: c,
                     });
                     -> $Literal
@@ -140,6 +150,9 @@
             consume(c: char) {
                 if c.is_ascii_digit() {
                     self.prec = self.prec * 10 + (c as i32 - '0' as i32);
+                } else if c == '*' {
+                    // Precision from an int argument (e.g. `%.*f`).
+                    self.star_prec = true;
                 } else if is_length_mod(c) {
                     if c == 'l' {
                         self.long_arg = true;
@@ -151,6 +164,8 @@
                         width: self.width,
                         prec: self.prec,
                         long_arg: self.long_arg,
+                        star_width: self.star_width,
+                        star_prec: self.star_prec,
                         conv: c,
                     });
                     -> $Literal
@@ -176,4 +191,7 @@
         width: u32 = 0
         prec: i32 = -1
         long_arg: bool = false
+        // `*` width / precision — the value comes from an int arg at format time.
+        star_width: bool = false
+        star_prec: bool = false
 }

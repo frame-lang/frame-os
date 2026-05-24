@@ -91,7 +91,7 @@ pub fn lazy_map(addr: u64) -> bool {
 ///   - otherwise recoverable (e.g. demand fault mapped): return so the stub
 ///     `iretq`s and retries the faulting instruction.
 #[no_mangle]
-extern "C" fn page_fault_handler(addr: u64, error_code: u64) {
+extern "C" fn page_fault_handler(addr: u64, error_code: u64, rip: u64) {
     let pfh = unsafe {
         let p = &raw mut PFH;
         (*p).as_mut().expect("PageFaultHandler initialized")
@@ -104,10 +104,17 @@ extern "C" fn page_fault_handler(addr: u64, error_code: u64) {
     pfh.fault(addr, error_code);
     if pfh.is_killing() {
         // The HSM already printed the "user fault → killing process" line.
+        // Also print the faulting RIP — for diagnosing a crash in a user
+        // program (e.g. tcc) against its unstripped symbol table (B11-3d).
+        serial::write_str("[#PF] faulting RIP=");
+        serial::write_hex_u64(rip);
+        serial::writeln("");
         crate::usermode::kill_current_user_process(); // never returns
     }
     if pfh.is_fatal() {
-        serial::writeln("[#PF] halting.");
+        serial::write_str("[#PF] halting. RIP=");
+        serial::write_hex_u64(rip);
+        serial::writeln("");
         crate::halt_forever();
     }
     // Recoverable (e.g. demand fault mapped): return → iretq → retry.
