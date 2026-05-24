@@ -1,0 +1,88 @@
+// frame/builddriver.frs
+//
+// BuildDriver — the on-device C toolchain pipeline as a Frame state machine
+// (B11-3e). This is *Frame's* turn on the B11-3 track: B11-3a–d were native
+// register/loader/libc mechanics (the ~70%); the build *lifecycle* —
+// compile → link → run, with a failure funnel — is exactly what a state machine
+// is for, so it's modeled in Frame and generated to Rust (the same "Frame owns
+// the lifecycle, native owns the mechanism" split as the kernel's ElfLoader).
+//
+// The pipeline drives the on-device `tcc`: compile the C source to an object,
+// link the object into a Frame OS ELF, then run that ELF and capture its exit
+// code. Each phase is a `$>()` enter handler that calls a native action
+// (`crate::actions::*` — fork/exec/wait of `/bin/tcc` or the output) and, on
+// failure, drops to the `$Failed` sink recording which phase broke. The driving
+// program (`user/src/build.rs`) sets the paths, constructs the system, fires
+// `start()`, then reads `is_done()`/`is_failed()`/`failed_phase()`/`program_exit()`.
+//
+// State graph:
+//   $Idle ──start()──► $Compiling ──ok──► $Linking ──ok──► $Running ──► $Done
+//                          │ fail            │ fail
+//                          ▼                 ▼
+//                        $Failed ◄───────────┘
+//
+// `actions::compile`/`link` return bool (tcc exit 0 = ok); `actions::run`
+// returns the compiled program's exit code (i32). They're defined in the
+// driving program and called by name, the same way ElfLoader calls
+// `crate::elf::*`.
+
+@@[target("rust")]
+
+@@system BuildDriver {
+    interface:
+        start()
+        is_done(): bool = false
+        is_failed(): bool = false
+        failed_phase(): String = self.failed.clone()
+        program_exit(): i32 = self.code
+
+    machine:
+        $Idle {
+            start() {
+                -> $Compiling
+            }
+        }
+
+        $Compiling {
+            $>() {
+                if crate::actions::compile() {
+                    -> $Linking
+                } else {
+                    self.failed = "compile".to_string();
+                    -> $Failed
+                }
+            }
+        }
+
+        $Linking {
+            $>() {
+                if crate::actions::link() {
+                    -> $Running
+                } else {
+                    self.failed = "link".to_string();
+                    -> $Failed
+                }
+            }
+        }
+
+        $Running {
+            $>() {
+                self.code = crate::actions::run();
+                -> $Done
+            }
+        }
+
+        $Done {
+            is_done(): bool { @@:(true) }
+        }
+
+        $Failed {
+            is_failed(): bool { @@:(true) }
+        }
+
+    domain:
+        // Which phase dropped us into $Failed ("compile"/"link"); empty if none.
+        failed: String = String::new()
+        // The compiled program's exit code (valid once $Done).
+        code: i32 = 0
+}

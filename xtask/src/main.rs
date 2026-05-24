@@ -188,6 +188,7 @@ const DIAGRAMS: &[(&str, &str)] = &[
     ("usb_transfer.frs", "usb_transfer.svg"),
     ("usb_msd.frs", "usb_msd.svg"),
     ("event_counter.frs", "event_counter.svg"),
+    ("builddriver.frs", "builddriver.svg"),
 ];
 
 fn diagrams(mode: DiagramMode) -> Result<()> {
@@ -373,6 +374,8 @@ fn prepare_qemu_artifacts_features(workspace: &Path, interactive: bool) -> Resul
     let hello_elf = build_user_disk_elf(workspace, "hello")?;
     let argtest_elf = build_user_disk_elf(workspace, "argtest")?;
     let cmain_elf = build_user_disk_elf(workspace, "cmain")?;
+    // B11-3e: the BuildDriver-FSM-driven build tool (compile→link→run via tcc).
+    let build_elf = build_user_disk_elf(workspace, "buildc")?;
     // B11-2: a C program cross-compiled (gcc + ld) against frame-libc.
     let chello_elf = build_c_disk_elf(workspace, "hello")?;
     // B11-3d: the on-device C compiler itself, cross-built against frame-libc.
@@ -387,6 +390,7 @@ fn prepare_qemu_artifacts_features(workspace: &Path, interactive: bool) -> Resul
     files.push(("/bin/cmain", &cmain_elf));
     files.push(("/bin/chello", &chello_elf));
     files.push(("/bin/tcc", &tcc_elf));
+    files.push(("/bin/buildc", &build_elf));
     for (path, data) in &sysroot {
         files.push((path.as_str(), data.as_slice()));
     }
@@ -1326,6 +1330,15 @@ fn run_console_test() -> Result<()> {
             .context("write tcc compile + run")?;
         stdin.flush().ok();
         wait_for_output(&buf, "hello from a tcc-compiled program on Frame OS!", 90)?;
+        // B11-3e: the BuildDriver Frame FSM drives the whole pipeline. `/bin/build`
+        // runs compile→link→run (tcc -c, tcc -static, then exec /out.elf) as an
+        // explicit state machine with a $Failed sink; the compiled program prints
+        // its message and exits 7, which the driver reports. Proves the Frame-owned
+        // toolchain lifecycle end to end.
+        eprintln!("console-test: typing `/bin/buildc`");
+        stdin.write_all(b"/bin/buildc\n").context("write buildc")?;
+        stdin.flush().ok();
+        wait_for_output(&buf, "[build] pipeline ok; /out.elf exited with code 7", 90)?;
         eprintln!("console-test: C program ran on Frame OS; typing `exit`");
         stdin.write_all(b"exit\n").context("write exit")?;
         stdin.flush().ok();

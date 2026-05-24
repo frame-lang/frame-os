@@ -94,6 +94,15 @@ path = "src/frameshell.rs"
 name = "ish"
 path = "src/ish.rs"
 
+# Build driver (B11-3e): drives the on-device C toolchain (compile→link→run)
+# through the BuildDriver Frame FSM (frame/builddriver.frs). Forks /bin/tcc to
+# compile + link /hello.c → /out.elf, then runs it. Disk-only (the shell runs
+# /bin/buildc); needs the heap (the Frame system allocates), hence mod mem.
+# (Named `buildc`, not `build` — cargo reserves the bin name `build`.)
+[[bin]]
+name = "buildc"
+path = "src/buildc.rs"
+
 # Heap allocator for the Frame-generated code (Vec/String/Rc/BTreeMap).
 # Only `frameshell` pulls it in (via `mod mem`); the other bins stay
 # allocator-free. Same crate + version the kernel uses.

@@ -55,6 +55,7 @@ These run inside the bare-metal kernel image. They do not appear in the hosted-m
 | [`UsbEnumeration`](usb_enumeration.md) | B6 | Documented | A device's full enumeration lifecycle: `$Powered → $SlotEnabled → $AddressAssigned → $DeviceDescribed → $Configured`, fail funneled via an `$Enumerating` parent. Enter handlers issue xHCI commands / EP0 control transfers; completion events advance the FSM. Enumerates the qemu-xhci usb-kbd end to end. |
 | [`UsbTransfer`](usb_transfer.md) | B6 | Documented | One transfer's lifecycle: `$Idle → $InFlight → ($Complete \| $Failed)`. `$InFlight` queues the transfer; a Transfer Event advances the FSM; `$Complete` reads the result. Completes a real interrupt-IN HID key report from the qemu-xhci usb-kbd (closes B6-3). |
 | [`EventCounter`](event_counter.md) | B7 | Documented | A tiny `$Counting → $Closed` system driven by **cross-core posts**: other cores enqueue `tick(n)` into a `SpinLock` MPSC queue, the owner core drains + dispatches. Demonstrates cross-core safety with the instance pinned + only `Send` data crossing — no framec `Send`/`Sync` change. |
+| [`BuildDriver`](builddriver.md) | B11-3e | Documented | The on-device C toolchain pipeline (ring 3): `$Idle → $Compiling → $Linking → $Running → $Done`, fallible phases funneled to `$Failed`. Enter handlers fork/exec/wait `/bin/tcc` (`-c`, then `-static` link) + run `/out.elf`; the `buildc` program drives it. The Frame half of B11-3 (native owns the fork/exec mechanism). |
 
 ## Shared systems
 

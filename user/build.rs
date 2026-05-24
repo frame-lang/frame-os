@@ -15,7 +15,12 @@ use std::process::Command;
 
 // (module_name, source_filename_relative_to_../frame). module_name is the
 // generated .rs stem in OUT_DIR; it must match the input stem.
-const FRAME_SYSTEMS: &[(&str, &str)] = &[("parser", "parser.frs")];
+const FRAME_SYSTEMS: &[(&str, &str)] = &[
+    ("parser", "parser.frs"),
+    // BuildDriver (B11-3e): the on-device toolchain pipeline FSM, driven by the
+    // `build` bin. Generated to OUT_DIR; `src/build_frame.rs` include!s it.
+    ("builddriver", "builddriver.frs"),
+];
 
 fn main() {
     let manifest = PathBuf::from(env("CARGO_MANIFEST_DIR"));
