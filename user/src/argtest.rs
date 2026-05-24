@@ -8,7 +8,7 @@
 // argc / argv and echoes them back. Disk-only: the shell loads it from
 // `/bin/argtest`; it is not baked into the kernel.
 //
-// Syscall ABI: 0 = write_char, 1 = exit.
+// Syscall ABI: 1 = exit, 12 = write(fd, buf, len) (fd 1 = console, atomic line).
 
 #![no_std]
 #![no_main]
@@ -43,28 +43,44 @@ unsafe fn syscall3(num: u64, a0: u64, a1: u64, a2: u64) -> u64 {
     ret
 }
 
-fn write_char(b: u8) {
-    unsafe { syscall3(0, b as u64, 0, 0) };
+/// Write `buf` to fd as a SINGLE syscall (#12). For the console (fd 1) the
+/// kernel emits the whole buffer in one syscall — atomically, with no
+/// preemption point between bytes — so a line can't be split mid-way by a
+/// concurrent process on the shared console (unlike byte-at-a-time write_char).
+/// That determinism is what `coexec`'s `argv[1]=Z` assertion relies on.
+fn write(fd: u64, buf: &[u8]) {
+    unsafe { syscall3(12, fd, buf.as_ptr() as u64, buf.len() as u64) };
 }
-fn print(s: &[u8]) {
-    for &b in s {
-        write_char(b);
-    }
-}
-fn print_u64(mut n: u64) {
-    let mut buf = [0u8; 20];
-    let mut i = buf.len();
+
+/// Append the decimal of `n` to `buf` at `*len`, advancing `*len`.
+fn put_u64(buf: &mut [u8], len: &mut usize, mut n: u64) {
     if n == 0 {
-        write_char(b'0');
+        buf[*len] = b'0';
+        *len += 1;
         return;
     }
+    let mut tmp = [0u8; 20];
+    let mut i = tmp.len();
     while n > 0 {
         i -= 1;
-        buf[i] = b'0' + (n % 10) as u8;
+        tmp[i] = b'0' + (n % 10) as u8;
         n /= 10;
     }
-    print(&buf[i..]);
+    while i < tmp.len() {
+        buf[*len] = tmp[i];
+        *len += 1;
+        i += 1;
+    }
 }
+
+/// Append the literal bytes `s` to `buf` at `*len`.
+fn put(buf: &mut [u8], len: &mut usize, s: &[u8]) {
+    for &b in s {
+        buf[*len] = b;
+        *len += 1;
+    }
+}
+
 fn exit(code: u64) -> ! {
     unsafe { syscall3(1, code, 0, 0) };
     loop {
@@ -72,34 +88,39 @@ fn exit(code: u64) -> ! {
     }
 }
 
-/// Print the NUL-terminated string at `p` (a pointer the kernel put in argv[]).
-fn print_cstr(p: *const u8) {
-    let mut q = p;
-    loop {
-        let c = unsafe { *q };
-        if c == 0 {
-            break;
-        }
-        write_char(c);
-        q = unsafe { q.add(1) };
-    }
-}
-
 #[no_mangle]
 extern "C" fn argtest_main(sp: *const u64) -> ! {
     let argc = unsafe { *sp };
-    print(b"argtest: argc=");
-    print_u64(argc);
-    write_char(b'\n');
+    // Each line is built in a buffer and emitted with one write() so it prints
+    // atomically (see `write` above) — critical under concurrent exec (coexec).
+    let mut line = [0u8; 128];
+    let mut n = 0usize;
+    put(&mut line, &mut n, b"argtest: argc=");
+    put_u64(&mut line, &mut n, argc);
+    put(&mut line, &mut n, b"\n");
+    write(1, &line[..n]);
+
     let mut i = 0u64;
     while i < argc {
         // argv[i] lives at sp[1 + i].
         let arg = unsafe { *sp.add(1 + i as usize) } as *const u8;
-        print(b"  argv[");
-        print_u64(i);
-        print(b"]=");
-        print_cstr(arg);
-        write_char(b'\n');
+        let mut n = 0usize;
+        put(&mut line, &mut n, b"  argv[");
+        put_u64(&mut line, &mut n, i);
+        put(&mut line, &mut n, b"]=");
+        // Copy the NUL-terminated argv string (bounded so a long arg can't
+        // overflow the line buffer; leave room for the trailing newline).
+        let mut q = arg;
+        unsafe {
+            while *q != 0 && n < line.len() - 1 {
+                line[n] = *q;
+                n += 1;
+                q = q.add(1);
+            }
+        }
+        line[n] = b'\n';
+        n += 1;
+        write(1, &line[..n]);
         i += 1;
     }
     exit(0);

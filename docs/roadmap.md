@@ -1297,3 +1297,13 @@ aren't adjacent. It reproduces ~1/4 **in isolation** (rate rises with host load)
 and `fs::create` (the only kernel delta here) is never on its path. Follow-up:
 make that test robust to console interleaving (or give the console a per-line
 lock) — tracked separately, not a capstone regression.
+
+**Flake fixed (2026-05-24).** Root cause: `argtest` printed one byte per
+`write_char` syscall (#0), each preemptible, so a concurrent process's output
+(the kernel's `[wait] … reaped …`) landed mid-line. Fix: the `write` syscall
+(#12) now handles fd 1/2 — it emits the whole buffer to the console in one
+syscall, which (ring-3 is single-core, syscalls run `IF=0`) prints with no
+preemption point, i.e. an **atomic line**. `argtest` now builds each line in a
+buffer and writes it with one `write(1, …)`. A real capability (a program can
+write an atomic line), not a test-only patch; the test keeps its strong
+`argv[1]=Z` assertion. Validated 8/8 isolated (was ~1/4) + full suite 49/49.

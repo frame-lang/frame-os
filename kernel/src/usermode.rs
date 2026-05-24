@@ -603,7 +603,23 @@ pub fn perform_syscall(num: u64, a0: u64, _a1: u64) -> u64 {
                 0
             } else {
                 let buf = unsafe { core::slice::from_raw_parts(_a1 as *const u8, len) };
-                crate::vfs::write(a0 as usize, buf) as u64
+                if a0 == 1 || a0 == 2 {
+                    // Console (stdout/stderr): emit the whole buffer in this one
+                    // syscall. Syscalls run with IF=0 and ring-3 processes are
+                    // scheduled on a single core, so the bytes go out without a
+                    // preemption point — a process's line can't be split mid-way
+                    // by a concurrent process (or a kernel print) on the shared
+                    // serial console. Lets a program write an atomic line, vs the
+                    // byte-at-a-time write_char (#0) which is preemptible between
+                    // bytes. (frame-libc still loops write_char; a program wanting
+                    // atomicity uses write() directly, as `argtest` now does.)
+                    for &b in buf {
+                        serial::write_byte(b);
+                    }
+                    buf.len() as u64
+                } else {
+                    crate::vfs::write(a0 as usize, buf) as u64
+                }
             }
         }
         13 => {
