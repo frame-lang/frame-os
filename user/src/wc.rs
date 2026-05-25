@@ -80,18 +80,23 @@ fn put_u64(buf: &mut [u8], n: &mut usize, mut v: u64) {
 #[no_mangle]
 extern "C" fn wc_main(sp: *const u64) -> ! {
     let argc = unsafe { *sp };
-    if argc < 2 {
-        write(1, b"wc: usage: wc <file>\n");
-        exit(1);
-    }
-    let path = cstr(unsafe { *sp.add(2) } as *const u8);
-    let fd = open_read(path);
-    if fd == u64::MAX {
-        write(1, b"wc: cannot open '");
-        write(1, path);
-        write(1, b"'\n");
-        exit(1);
-    }
+    // No file argument → read from stdin (fd 0), so `wc < file` works via the
+    // shell's input redirection (S5). With a file argument, open it and also
+    // echo the name after the counts (classic `wc <file>` output).
+    let from_stdin = argc < 2;
+    let (fd, path): (u64, &[u8]) = if from_stdin {
+        (0, b"")
+    } else {
+        let p = cstr(unsafe { *sp.add(2) } as *const u8);
+        let fd = open_read(p);
+        if fd == u64::MAX {
+            write(1, b"wc: cannot open '");
+            write(1, p);
+            write(1, b"'\n");
+            exit(1);
+        }
+        (fd, p)
+    };
     let (mut lines, mut words, mut bytes) = (0u64, 0u64, 0u64);
     let mut in_word = false;
     let mut chunk = [0u8; 512];
@@ -114,7 +119,9 @@ extern "C" fn wc_main(sp: *const u64) -> ! {
             }
         }
     }
-    close(fd);
+    if !from_stdin {
+        close(fd);
+    }
     let mut out = [0u8; 96];
     let mut n = 0;
     put_u64(&mut out, &mut n, lines);
@@ -124,10 +131,13 @@ extern "C" fn wc_main(sp: *const u64) -> ! {
     out[n] = b' ';
     n += 1;
     put_u64(&mut out, &mut n, bytes);
-    out[n] = b' ';
-    n += 1;
     write(1, &out[..n]);
-    write(1, path);
+    // With a file argument, append " <name>" (classic wc); reading stdin prints
+    // just the counts.
+    if !from_stdin {
+        write(1, b" ");
+        write(1, path);
+    }
     write(1, b"\n");
     exit(0);
 }

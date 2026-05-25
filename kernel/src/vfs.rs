@@ -1,31 +1,94 @@
 // kernel/src/vfs.rs
 //
-// The VFS layer (B4 Step 3): an open-file table over the filesystem. It
-// resolves paths (fs::namei), tracks per-fd state (inode + byte offset), and
-// drives an `OpenFile` Frame system per descriptor so the access mode is
-// enforced — a read-only fd's writes are dropped, a closed fd is inert.
+// The VFS layer (B4 Step 3): a *per-process* open-file table over the
+// filesystem. It resolves paths (fs::namei), tracks per-fd state (inode + byte
+// offset), and drives an `OpenFile` Frame system per file descriptor so the
+// access mode is enforced — a read-only fd's writes are dropped, a closed fd is
+// inert.
 //
-// With one filesystem the "dispatch" is trivial, but the fd-table + OpenFile
-// structure is the seam a real VFS needs (multiple mounts/FS types at B5+).
+// S5 (I/O redirection) made the table per-process and gave it real stdio:
+//   - There is one `[Option<Slot>; MAX_OPEN]` table per scheduler slot, indexed
+//     by `sched::current_slot()`. `fork` copies the parent's table
+//     (`clone_fds`), `exec` keeps it (same slot), a fresh process gets the
+//     standard console descriptors (`init_console_fds`), and a reaped slot is
+//     cleared (`clear_fds`).
+//   - fd 0/1/2 are console descriptors by convention (`Slot::ConsoleIn` /
+//     `Slot::ConsoleOut`); `write` to a ConsoleOut emits to the serial console,
+//     so a program's `write(1, …)` reaches the screen. `open` allocates the
+//     lowest *free* fd, which is ≥ 3 once the console fds are installed.
+//   - `dup2(old, new)` repoints `new` at `old`, which is how the shell wires
+//     redirection: in the forked child it opens the target file, `dup2`s it onto
+//     fd 1 (`>`/`>>`) or fd 0 (`<`), then execs. exec preserves the table, so
+//     the program inherits the redirected descriptor transparently.
+//
 // The on-disk mechanics live in fs.rs; this owns "which fds are open and how".
 
 use crate::frame_systems::OpenFile;
-use crate::{fs, serial};
+use crate::{fs, sched, serial};
 
 const MAX_OPEN: usize = 16;
+/// One fd table per scheduler slot. Mirrors `sched`'s `MAX_THREADS`.
+const MAX_PROCS: usize = 8;
 
-struct Slot {
-    inode: u32,
-    offset: usize,
-    writable: bool,
-    file: OpenFile,
+/// One open descriptor: a console stream or a regular file.
+enum Slot {
+    /// Console input (stdin, fd 0 by convention). `read` yields EOF — interactive
+    /// input comes through the blocking `read_line` syscall (#9), not `read`
+    /// (#6). A program reads real bytes from fd 0 only once it's been redirected
+    /// to a `File` (e.g. `cmd < file`).
+    ConsoleIn,
+    /// Console output (stdout/stderr, fd 1/2 by convention). `write` emits the
+    /// bytes to the serial console.
+    ConsoleOut,
+    /// A regular file opened through the FS, with its own byte offset + mode.
+    File {
+        inode: u32,
+        offset: usize,
+        writable: bool,
+        file: OpenFile,
+    },
 }
 
-static mut OPEN: [Option<Slot>; MAX_OPEN] = [const { None }; MAX_OPEN];
+static mut TABLES: [[Option<Slot>; MAX_OPEN]; MAX_PROCS] =
+    [const { [const { None }; MAX_OPEN] }; MAX_PROCS];
 
+/// The fd table for scheduler slot `slot`.
+fn table_for(slot: usize) -> &'static mut [Option<Slot>; MAX_OPEN] {
+    let p = &raw mut TABLES;
+    unsafe { &mut (*p)[slot] }
+}
+
+/// The current process's fd table.
 fn table() -> &'static mut [Option<Slot>; MAX_OPEN] {
-    let p = &raw mut OPEN;
-    unsafe { &mut *p }
+    table_for(sched::current_slot())
+}
+
+/// Rebuild a fresh copy of `s` (used by `fork`/`dup`/`dup2`). A `File` gets a
+/// new `OpenFile` driven to the same access mode, sharing inode + offset.
+fn clone_slot(s: &Slot) -> Slot {
+    match s {
+        Slot::ConsoleIn => Slot::ConsoleIn,
+        Slot::ConsoleOut => Slot::ConsoleOut,
+        Slot::File {
+            inode,
+            offset,
+            writable,
+            ..
+        } => {
+            let mut file = OpenFile::__create();
+            if *writable {
+                file.open_write();
+            } else {
+                file.open_read();
+            }
+            Slot::File {
+                inode: *inode,
+                offset: *offset,
+                writable: *writable,
+                file,
+            }
+        }
+    }
 }
 
 /// Open the file at absolute `path` for reading. Returns a file descriptor, or
@@ -39,7 +102,7 @@ pub fn open_read(path: &[u8]) -> Option<usize> {
         if slot.is_none() {
             let mut file = OpenFile::__create();
             file.open_read(); // $Open → $Reading
-            *slot = Some(Slot {
+            *slot = Some(Slot::File {
                 inode: ino,
                 offset: 0,
                 writable: false,
@@ -51,22 +114,26 @@ pub fn open_read(path: &[u8]) -> Option<usize> {
     None
 }
 
-/// Open the file at absolute `path` for writing (B9-3): truncate it if it exists,
-/// otherwise create it (single root-level component, e.g. `/out.o`). Returns a
-/// write fd, or None on a bad path / a full table. Drives `OpenFile` → $Writing,
-/// so this fd's reads are gated off and a read-only fd's writes are dropped.
-pub fn open_write(path: &[u8]) -> Option<usize> {
+/// Open the file at absolute `path` for writing (B9-3). With `append` false this
+/// truncates an existing file (or creates it); with `append` true it leaves the
+/// contents and positions the offset at end-of-file (`>>` redirection). Creating
+/// is limited to a single root-level component (e.g. `/out.o`). Returns a write
+/// fd, or None on a bad path / a full table. Drives `OpenFile` → $Writing, so
+/// this fd's reads are gated off.
+pub fn open_write(path: &[u8], append: bool) -> Option<usize> {
     let ino = match fs::namei(path) {
         Some(i) => {
             if !fs::is_file(i) {
                 return None; // a directory
             }
-            fs::truncate(i);
+            if !append {
+                fs::truncate(i);
+            }
             i
         }
         None => {
             // Create at the root directory: the path must be "/<name>" (the FS
-            // supports one directory level; nested create lands with B10+).
+            // supports one directory level for create; nested create lands later).
             if path.first() != Some(&b'/') {
                 return None;
             }
@@ -77,13 +144,14 @@ pub fn open_write(path: &[u8]) -> Option<usize> {
             fs::create(name)?
         }
     };
+    let offset = if append { fs::size_of(ino) } else { 0 };
     for (fd, slot) in table().iter_mut().enumerate() {
         if slot.is_none() {
             let mut file = OpenFile::__create();
             file.open_write(); // $Open → $Writing
-            *slot = Some(Slot {
+            *slot = Some(Slot::File {
                 inode: ino,
-                offset: 0,
+                offset,
                 writable: true,
                 file,
             });
@@ -93,105 +161,181 @@ pub fn open_write(path: &[u8]) -> Option<usize> {
     None
 }
 
-/// Write `buf` to `fd` at its current offset, advancing it (B9-3). Returns the
-/// number of bytes written (0 if the fd isn't open for writing — the OpenFile
-/// access-mode gate drops a non-$Writing write).
+/// Write `buf` to `fd` (B9-3). A `ConsoleOut` fd emits to the serial console; a
+/// `File` fd writes at its current offset, advancing it. Returns the number of
+/// bytes written (0 if the fd can't be written — `ConsoleIn`, a read-only file
+/// whose `OpenFile` gate drops the write, or a closed fd).
 pub fn write(fd: usize, buf: &[u8]) -> usize {
-    let Some(slot) = table().get_mut(fd).and_then(|s| s.as_mut()) else {
-        return 0;
-    };
-    slot.file.write(); // gated: a no-op unless the fd is $Writing
-    if !slot.file.is_writing() {
-        return 0;
+    match table().get_mut(fd).and_then(|s| s.as_mut()) {
+        Some(Slot::ConsoleOut) => {
+            // Syscalls run with IF=0 on a single core, so the whole buffer goes
+            // out without a preemption point — a process's line can't be split
+            // mid-way by a concurrent process (or a kernel print).
+            for &b in buf {
+                serial::write_byte(b);
+            }
+            buf.len()
+        }
+        Some(Slot::File {
+            inode,
+            offset,
+            file,
+            ..
+        }) => {
+            file.write(); // gated: a no-op unless the fd is $Writing
+            if !file.is_writing() {
+                return 0;
+            }
+            let n = fs::write_at(*inode, *offset, buf);
+            *offset += n;
+            n
+        }
+        _ => 0, // ConsoleIn or closed → can't write
     }
-    let n = fs::write_at(slot.inode, slot.offset, buf);
-    slot.offset += n;
-    n
 }
 
-/// Reposition `fd`'s offset (B9-3). `whence`: 0 = SET (absolute), 1 = CUR
+/// Reposition a `File` fd's offset (B9-3). `whence`: 0 = SET (absolute), 1 = CUR
 /// (relative), 2 = END (from file size). Returns the new offset, or None for a
-/// bad fd / whence, or a resulting negative offset.
+/// bad/console fd, a bad whence, or a resulting negative offset.
 pub fn seek(fd: usize, offset: i64, whence: u32) -> Option<usize> {
-    let slot = table().get_mut(fd).and_then(|s| s.as_mut())?;
-    let base = match whence {
-        0 => 0i64,
-        1 => slot.offset as i64,
-        2 => fs::size_of(slot.inode) as i64,
-        _ => return None,
-    };
-    let new = base.checked_add(offset)?;
-    if new < 0 {
-        return None;
+    let s = table().get_mut(fd).and_then(|x| x.as_mut())?;
+    if let Slot::File {
+        inode, offset: off, ..
+    } = s
+    {
+        let base = match whence {
+            0 => 0i64,
+            1 => *off as i64,
+            2 => fs::size_of(*inode) as i64,
+            _ => return None,
+        };
+        let new = base.checked_add(offset)?;
+        if new < 0 {
+            return None;
+        }
+        *off = new as usize;
+        Some(*off)
+    } else {
+        None
     }
-    slot.offset = new as usize;
-    Some(slot.offset)
 }
 
-/// The size in bytes of the file behind `fd` (B9-3) — backs `fstat`.
+/// The size in bytes of the file behind `fd` (B9-3) — backs `fstat`. None for a
+/// console or closed fd.
 pub fn fstat_size(fd: usize) -> Option<usize> {
-    let slot = table().get_mut(fd).and_then(|s| s.as_mut())?;
-    Some(fs::size_of(slot.inode))
+    match table().get_mut(fd).and_then(|s| s.as_mut())? {
+        Slot::File { inode, .. } => Some(fs::size_of(*inode)),
+        _ => None,
+    }
 }
 
-/// Duplicate `fd` onto the lowest free descriptor (B9-3), sharing the same inode
-/// + offset + access mode. Returns the new fd, or None for a bad fd / full table.
+/// Duplicate `fd` onto the lowest free descriptor (B9-3), sharing the same
+/// backing (inode + offset + mode for a file). Returns the new fd, or None for a
+/// bad fd / full table.
 pub fn dup(fd: usize) -> Option<usize> {
-    let (inode, offset, writable) = {
-        let slot = table().get_mut(fd).and_then(|s| s.as_mut())?;
-        (slot.inode, slot.offset, slot.writable)
-    };
+    let cloned = clone_slot(table().get(fd).and_then(|s| s.as_ref())?);
     for (nfd, slot) in table().iter_mut().enumerate() {
         if slot.is_none() {
-            let mut file = OpenFile::__create();
-            if writable {
-                file.open_write();
-            } else {
-                file.open_read();
-            }
-            *slot = Some(Slot {
-                inode,
-                offset,
-                writable,
-                file,
-            });
+            *slot = Some(cloned);
             return Some(nfd);
         }
     }
     None
 }
 
-/// Read up to `buf.len()` bytes from `fd`, advancing its offset. Returns the
-/// number of bytes read (0 at EOF, or if the fd isn't open for reading).
-pub fn read(fd: usize, buf: &mut [u8]) -> usize {
-    let Some(slot) = table().get_mut(fd).and_then(|s| s.as_mut()) else {
-        return 0;
-    };
-    slot.file.read(); // gated: a no-op unless the fd is $Reading
-    if !slot.file.is_reading() {
-        return 0;
+/// Repoint `newfd` at `oldfd` (POSIX `dup2`). Closes `newfd` first if it's open,
+/// then makes it a copy of `oldfd`'s backing. Returns `newfd`, or None for a bad
+/// `oldfd` / out-of-range `newfd`. This is the primitive the shell uses to wire
+/// redirection (`dup2(file, 1)` for `>`, `dup2(file, 0)` for `<`).
+pub fn dup2(oldfd: usize, newfd: usize) -> Option<usize> {
+    if newfd >= MAX_OPEN {
+        return None;
     }
-    let n = fs::read_at(slot.inode, slot.offset, buf);
-    slot.offset += n;
-    n
+    if oldfd == newfd {
+        // Still must be a valid open fd.
+        return table().get(oldfd).and_then(|s| s.as_ref()).map(|_| newfd);
+    }
+    let cloned = clone_slot(table().get(oldfd).and_then(|s| s.as_ref())?);
+    close(newfd);
+    table()[newfd] = Some(cloned);
+    Some(newfd)
 }
 
-/// Close `fd` (OpenFile → $Closed) and free its table slot.
+/// Read up to `buf.len()` bytes from `fd`, advancing a file's offset. Returns the
+/// number of bytes read (0 at EOF, on a console fd, or if the fd isn't open for
+/// reading).
+pub fn read(fd: usize, buf: &mut [u8]) -> usize {
+    match table().get_mut(fd).and_then(|s| s.as_mut()) {
+        Some(Slot::File {
+            inode,
+            offset,
+            file,
+            ..
+        }) => {
+            file.read(); // gated: a no-op unless the fd is $Reading
+            if !file.is_reading() {
+                return 0;
+            }
+            let n = fs::read_at(*inode, *offset, buf);
+            *offset += n;
+            n
+        }
+        _ => 0, // ConsoleIn (EOF here), ConsoleOut, or closed
+    }
+}
+
+/// Close `fd` (a `File`'s `OpenFile` → $Closed) and free its table slot.
 pub fn close(fd: usize) {
-    if let Some(slot) = table().get_mut(fd).and_then(|s| s.as_mut()) {
-        slot.file.close();
+    if let Some(Slot::File { file, .. }) = table().get_mut(fd).and_then(|s| s.as_mut()) {
+        file.close();
     }
     if let Some(s) = table().get_mut(fd) {
         *s = None;
     }
 }
 
-/// Whether `fd` refers to an open file.
+/// Whether `fd` refers to an open descriptor (file or console).
 pub fn is_open(fd: usize) -> bool {
-    match table().get_mut(fd).and_then(|s| s.as_mut()) {
-        Some(slot) => slot.file.is_open(),
-        None => false,
+    table().get(fd).map(|s| s.is_some()).unwrap_or(false)
+}
+
+// --- per-process lifecycle (driven by `sched`) -----------------------------
+
+/// Close every descriptor in `t`, leaving it empty.
+fn clear_table(t: &mut [Option<Slot>; MAX_OPEN]) {
+    for s in t.iter_mut() {
+        if let Some(Slot::File { file, .. }) = s {
+            file.close();
+        }
+        *s = None;
     }
+}
+
+/// Install the standard console descriptors into process `slot`'s table (fd 0 =
+/// stdin, 1 = stdout, 2 = stderr), clearing any stale entries first. Called when
+/// a fresh process is admitted (`sched::spawn_user`).
+pub fn init_console_fds(slot: usize) {
+    let t = table_for(slot);
+    clear_table(t);
+    t[0] = Some(Slot::ConsoleIn);
+    t[1] = Some(Slot::ConsoleOut);
+    t[2] = Some(Slot::ConsoleOut);
+}
+
+/// Copy process `src`'s fd table into `dst` (a `fork`ed child inherits every
+/// descriptor). Clears `dst` first in case it holds a reaped process's leftovers.
+pub fn clone_fds(dst: usize, src: usize) {
+    clear_table(table_for(dst));
+    for fd in 0..MAX_OPEN {
+        let cloned = table_for(src)[fd].as_ref().map(clone_slot);
+        table_for(dst)[fd] = cloned;
+    }
+}
+
+/// Close every descriptor of process `slot` (called when its scheduler slot is
+/// reaped/freed).
+pub fn clear_fds(slot: usize) {
+    clear_table(table_for(slot));
 }
 
 /// B4 Step 3 demo: open files by path through the VFS (including a nested

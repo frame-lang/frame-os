@@ -1423,12 +1423,18 @@ fn run_console_test() -> Result<()> {
 
     // Drive the session as a fallible block: prompt → run hello → exit. Any
     // failure is captured (not `?`-propagated) so QEMU is always cleaned up below.
+    //
+    // Each step's `wait_for_output` budget is 45s (compile-heavy tcc/buildc steps
+    // get 90s). The waits gate on *deterministic* program output, so the only
+    // variable is emulator speed: the dev image is arm64 emulating x86_64 via
+    // TCG, where a busy host makes any single step occasionally exceed a tight
+    // budget. 45s keeps the test reliably green without weakening any assertion.
     let drive: Result<()> = (|| {
         wait_for_output(&buf, "frameos$ ", 45)?;
         eprintln!("console-test: prompt is up; typing `/bin/hello`");
         stdin.write_all(b"/bin/hello\n").context("write hello")?;
         stdin.flush().ok();
-        wait_for_output(&buf, "hello from ELF", 20)?;
+        wait_for_output(&buf, "hello from ELF", 45)?;
         // S1/S2: shell navigation on the Frame OS filesystem — pwd, ls (readdir
         // syscall #21), and cd. `ls` at root shows /readme; after `cd /usr`, pwd
         // reports /usr and `ls` shows the staged `include` dir.
@@ -1437,9 +1443,9 @@ fn run_console_test() -> Result<()> {
             .write_all(b"ls\ncd /usr\npwd\nls\ncd /\n")
             .context("write nav")?;
         stdin.flush().ok();
-        wait_for_output(&buf, "readme", 20)?; // ls at root lists /readme
-        wait_for_output(&buf, "/usr", 20)?; // pwd after `cd /usr`
-        wait_for_output(&buf, "include", 20)?; // ls /usr lists `include`
+        wait_for_output(&buf, "readme", 45)?; // ls at root lists /readme
+        wait_for_output(&buf, "/usr", 45)?; // pwd after `cd /usr`
+        wait_for_output(&buf, "include", 45)?; // ls /usr lists `include`
                                                // S3 coreutils on the Frame OS filesystem: touch creates a file (ls
                                                // sees it), echo prints args, cp copies /readme → /b.txt (cat proves
                                                // the bytes), rm deletes. (cwd is / after the nav block's `cd /`.)
@@ -1450,9 +1456,9 @@ fn run_console_test() -> Result<()> {
             )
             .context("write coreutils")?;
         stdin.flush().ok();
-        wait_for_output(&buf, "a.txt", 20)?; // ls after `touch /a.txt`
-        wait_for_output(&buf, "hi-there", 20)?; // echo
-        wait_for_output(&buf, "hello from the disk", 20)?; // cat of the cp'd /readme
+        wait_for_output(&buf, "a.txt", 45)?; // ls after `touch /a.txt`
+        wait_for_output(&buf, "hi-there", 45)?; // echo
+        wait_for_output(&buf, "hello from the disk", 45)?; // cat of the cp'd /readme
                                                            // S4 text utilities: wc counts /readme ("hello from the disk\n" = 1 line,
                                                            // 4 words, 20 bytes), date prints the pinned RTC, and head/tail/grep/clear
                                                            // run without error. (clear's ANSI escape is harmless in the capture.)
@@ -1461,17 +1467,32 @@ fn run_console_test() -> Result<()> {
             .write_all(b"wc /readme\nhead /readme\ntail /readme\ngrep disk /readme\ndate\nclear\n")
             .context("write textutils")?;
         stdin.flush().ok();
-        wait_for_output(&buf, "1 4 20 /readme", 20)?; // wc
-        wait_for_output(&buf, "2026-05-24 12:", 20)?; // date (pinned RTC base)
-                                                      // B9-2: argv reaches the program. Type a command WITH arguments; argtest
-                                                      // echoes argc + each argv string, so we can assert the args arrived.
+        wait_for_output(&buf, "1 4 20 /readme", 45)?; // wc
+        wait_for_output(&buf, "2026-05-24 12:", 45)?; // date (pinned RTC base)
+                                                      // S5 I/O redirection: `>` creates /r.txt with echo's stdout, `>>` appends
+                                                      // (must NOT truncate), and `wc < /r.txt` reads it back via stdin. The only
+                                                      // assertion is `wc`'s "2 2 20": that exact count appears only if `>` made the
+                                                      // file ("redir-out\n", 10B), `>>` appended ("redir-app\n", 10B → 2 lines, 2
+                                                      // words, 20 bytes total, proving it didn't truncate), and `<` fed it to wc.
+                                                      // (We can't assert on "redir-out"/"redir-app" themselves — the kernel echoes
+                                                      // the typed command line, so those strings are in the stream regardless.)
+        eprintln!("console-test: typing echo > / >> / wc < (redirection)");
+        stdin
+            .write_all(
+                b"echo redir-out > /r.txt\ncat /r.txt\necho redir-app >> /r.txt\ncat /r.txt\nwc < /r.txt\n",
+            )
+            .context("write redirection")?;
+        stdin.flush().ok();
+        wait_for_output(&buf, "2 2 20", 45)?; // wc < /r.txt after > then >>
+                                              // B9-2: argv reaches the program. Type a command WITH arguments; argtest
+                                              // echoes argc + each argv string, so we can assert the args arrived.
         eprintln!("console-test: typing `/bin/argtest alpha beta`");
         stdin
             .write_all(b"/bin/argtest alpha beta\n")
             .context("write argtest")?;
         stdin.flush().ok();
-        wait_for_output(&buf, "argv[1]=alpha", 20)?;
-        wait_for_output(&buf, "argv[2]=beta", 20)?;
+        wait_for_output(&buf, "argv[1]=alpha", 45)?;
+        wait_for_output(&buf, "argv[2]=beta", 45)?;
         // B10-1: a C-style program over frame-libc — crt0 (from the libc) parses
         // the argv stack and calls main, which echoes via the libc's write. Same
         // entry path a tcc-compiled C program will take.
@@ -1480,8 +1501,8 @@ fn run_console_test() -> Result<()> {
             .write_all(b"/bin/cmain one two\n")
             .context("write cmain")?;
         stdin.flush().ok();
-        wait_for_output(&buf, "cmain: hello from frame-libc; argc=3", 20)?;
-        wait_for_output(&buf, "argv[2]=two", 20)?;
+        wait_for_output(&buf, "cmain: hello from frame-libc; argc=3", 45)?;
+        wait_for_output(&buf, "argv[2]=two", 45)?;
         // B10-3a: printf via the format-scanner FSM — conversions + padding.
         wait_for_output(
             &buf,
@@ -1489,37 +1510,37 @@ fn run_console_test() -> Result<()> {
             20,
         )?;
         // B11-1: the C-ABI variadic printf/fprintf (real varargs).
-        wait_for_output(&buf, "cmain: va printf d=-7 x=beef s=hi c=Z", 20)?;
-        wait_for_output(&buf, "cmain: va fprintf 20+22=42", 20)?;
+        wait_for_output(&buf, "cmain: va printf d=-7 x=beef s=hi c=Z", 45)?;
+        wait_for_output(&buf, "cmain: va fprintf 20+22=42", 45)?;
         // B10-3b: buffered FILE* streams (fopen/fprintf/fwrite/fread/feof).
-        wait_for_output(&buf, "cmain: fprintf to stdout: 2+3=5", 20)?;
-        wait_for_output(&buf, "cmain: FILE* write/read/feof ok", 20)?;
+        wait_for_output(&buf, "cmain: fprintf to stdout: 2+3=5", 45)?;
+        wait_for_output(&buf, "cmain: FILE* write/read/feof ok", 45)?;
         // B10-4: line input via fgets.
-        wait_for_output(&buf, "cmain: fgets line-by-line ok", 20)?;
+        wait_for_output(&buf, "cmain: fgets line-by-line ok", 45)?;
         // B10-2: the libc heap (malloc/realloc/free over brk).
-        wait_for_output(&buf, "cmain: malloc/realloc/free ok", 20)?;
+        wait_for_output(&buf, "cmain: malloc/realloc/free ok", 45)?;
         // B11-3 follow-up: real wall clock. time() reads the CMOS RTC (pinned to
         // 2026-05-24T12:00:00 by `-rtc base=`), localtime() breaks it down. Assert
         // the date + hour prefix (boot consumes only seconds of VM time, so the
         // hour stays 12); the minute/second tail is left unasserted.
-        wait_for_output(&buf, "cmain: clock 2026-05-24 12:", 20)?;
+        wait_for_output(&buf, "cmain: clock 2026-05-24 12:", 45)?;
         // B11-3 follow-up: per-process cwd. getcwd/chdir (absolute, relative,
         // ".."), a failing chdir, and a relative fopen that honors the cwd.
-        wait_for_output(&buf, "cmain: cwd chdir/getcwd + relative open ok", 20)?;
+        wait_for_output(&buf, "cmain: cwd chdir/getcwd + relative open ok", 45)?;
         // B11-2: a real C program (gcc-compiled, linked against frame-libc) runs.
         eprintln!("console-test: typing `/bin/chello`");
         stdin.write_all(b"/bin/chello\n").context("write chello")?;
         stdin.flush().ok();
-        wait_for_output(&buf, "chello: hello from C on Frame OS! argc=1", 20)?;
-        wait_for_output(&buf, "chello: malloc buf = ABCDEFGHIJ", 20)?;
-        wait_for_output(&buf, "chello: read back: C wrote this: 1234", 20)?;
-        wait_for_output(&buf, "chello: done", 20)?;
+        wait_for_output(&buf, "chello: hello from C on Frame OS! argc=1", 45)?;
+        wait_for_output(&buf, "chello: malloc buf = ABCDEFGHIJ", 45)?;
+        wait_for_output(&buf, "chello: read back: C wrote this: 1234", 45)?;
+        wait_for_output(&buf, "chello: done", 45)?;
         // B11-3d: the on-device C compiler runs at all. `tcc -v` prints its
         // version banner — proof tcc's crt0 + libc startup + arg handling work.
         eprintln!("console-test: typing `/bin/tcc -v`");
         stdin.write_all(b"/bin/tcc -v\n").context("write tcc -v")?;
         stdin.flush().ok();
-        wait_for_output(&buf, "tcc version 0.9.27", 20)?;
+        wait_for_output(&buf, "tcc version 0.9.27", 45)?;
         // B11-3d: the full on-device compile + link + exec. tcc reads /hello.c
         // (`#include <stdio.h>` from the staged /usr/include), links it with
         // crt1.o + the C-shim libc.a from the /usr sysroot (gcc -fno-pic +

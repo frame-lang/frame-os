@@ -362,6 +362,7 @@ pub unsafe fn spawn_user(pml4: u64, entry: u64, user_rsp: u64, pid: u32) {
     (*t.add(n)).pid = pid;
     (*t.add(n)).heap_brk = USER_HEAP_BASE; // fresh process: empty brk heap
     set_slot_cwd(n, b"/"); // fresh process starts at the root directory
+    crate::vfs::init_console_fds(n); // fd 0/1/2 = console (stdin/stdout/stderr)
     fpu_area(n).write(fpu::clean()); // fresh process → clean FPU
     with_sched(|s| s.task_ready());
 }
@@ -398,6 +399,12 @@ pub unsafe fn spawn_user_from_frame(
     let mut pcwd = [0u8; CWD_MAX];
     let pl = cwd_of_pid(parent_pid, &mut pcwd);
     set_slot_cwd(n, if pl > 0 { &pcwd[..pl] } else { b"/" });
+    // The child inherits the parent's open file descriptors (POSIX fork). If the
+    // parent slot can't be found (shouldn't happen), fall back to fresh console.
+    match slot_of_pid(parent_pid) {
+        Some(ps) => crate::vfs::clone_fds(n, ps),
+        None => crate::vfs::init_console_fds(n),
+    }
     // fork inherits the parent's FPU state: the parent is the one running this
     // syscall, so its live x87/SSE registers are the state to copy — FXSAVE them
     // straight into the child's save area.
@@ -452,6 +459,26 @@ pub fn is_preemption_active() -> bool {
     ACTIVE.load(Ordering::Relaxed)
 }
 
+/// The scheduler slot of the currently-running context. The per-process fd table
+/// (`vfs`) is indexed by this so each process sees its own descriptors.
+pub fn current_slot() -> usize {
+    unsafe { (&raw const CURRENT).read() }
+}
+
+/// The scheduler slot owning process `pid` (skipping freed slots), or None.
+fn slot_of_pid(pid: u32) -> Option<usize> {
+    unsafe {
+        let t = tcbs();
+        let n = (&raw const N).read();
+        for i in 0..n {
+            if (*t.add(i)).pid == pid && (*t.add(i)).state != RunState::Free {
+                return Some(i);
+            }
+        }
+        None
+    }
+}
+
 /// Reap one *dead* (exited) child of `parent_pid`: free its scheduler slot and
 /// return its pid + PML4 so the caller can tear down the address space + the
 /// `Process`. Returns `None` if the parent has no exited-unreaped child.
@@ -464,6 +491,7 @@ pub fn reap_dead_child(parent_pid: u32) -> Option<(u32, u64)> {
                 if (*t.add(i)).parent_pid == parent_pid && (*t.add(i)).state == RunState::Dead {
                     let pid = (*t.add(i)).pid;
                     let pml4 = (*t.add(i)).pml4;
+                    crate::vfs::clear_fds(i); // close the reaped process's fds
                     (*t.add(i)) = TCB_INIT; // free the slot
                     return Some((pid, pml4));
                 }

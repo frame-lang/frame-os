@@ -72,6 +72,15 @@ fn wait() -> u64 {
 fn open(path: &[u8]) -> u64 {
     unsafe { syscall3(5, path.as_ptr() as u64, path.len() as u64, 0) }
 }
+/// open for output (redirection): flags bit0 = write/truncate, bit1 = append.
+fn open_out(path: &[u8], append: bool) -> u64 {
+    let flags = if append { 3 } else { 1 };
+    unsafe { syscall3(5, path.as_ptr() as u64, path.len() as u64, flags) }
+}
+/// dup2 (#22): repoint `newfd` at `oldfd`. Used to wire redirection in the child.
+fn dup2(oldfd: u64, newfd: u64) -> u64 {
+    unsafe { syscall3(22, oldfd, newfd, 0) }
+}
 fn read(fd: u64, buf: &mut [u8]) -> u64 {
     unsafe { syscall3(6, fd, buf.as_mut_ptr() as u64, buf.len() as u64) }
 }
@@ -115,12 +124,16 @@ fn cat(path: &str) {
     close(fd);
 }
 
-/// Run an external program with its arguments. Build a packed argv — `argv[0]`
-/// is the resolved disk path (`/bin/<cmd>` unless `cmd` is already absolute),
-/// followed by the remaining tokens verbatim, each NUL-terminated — then fork:
-/// the child execs it from disk with that argv, the parent waits. The shell
-/// survives because exec replaces the *child's* image.
-fn run_external(toks: &[String]) {
+/// Run an external program with its arguments and optional I/O redirection.
+/// Build a packed argv — `argv[0]` is the resolved disk path (`/bin/<cmd>` unless
+/// `cmd` is already absolute), followed by the remaining tokens verbatim, each
+/// NUL-terminated — then fork: the child applies redirection (open the target,
+/// `dup2` it onto fd 0/1, close the temp) and execs from disk; the parent waits.
+/// The shell survives because exec replaces the *child's* image, and the child's
+/// redirected fd table is inherited across exec (per-process fds, S5). Error
+/// messages use `write_char` (#0), which always reaches the console, so they're
+/// visible even when stdout is redirected.
+fn run_external(toks: &[String], redir_in: &Option<String>, redir_out: &Option<(String, bool)>) {
     let cmd = toks[0].as_str();
     // argv[0]: the resolved path (the program name, Unix-style).
     let mut argv: Vec<u8> = Vec::new();
@@ -137,7 +150,31 @@ fn run_external(toks: &[String]) {
     let argc = toks.len() as u64;
 
     if fork() == 0 {
-        // Child: become the program loaded from disk. exec only returns on failure.
+        // Child. Apply input redirection (`< file`) onto fd 0.
+        if let Some(path) = redir_in {
+            let fd = open(path.as_bytes());
+            if fd == u64::MAX {
+                print(b"ish: cannot open input: ");
+                print(path.as_bytes());
+                write_char(b'\n');
+                exit(1);
+            }
+            dup2(fd, 0);
+            close(fd);
+        }
+        // Apply output redirection (`> file` truncate / `>> file` append) onto fd 1.
+        if let Some((path, append)) = redir_out {
+            let fd = open_out(path.as_bytes(), *append);
+            if fd == u64::MAX {
+                print(b"ish: cannot open output: ");
+                print(path.as_bytes());
+                write_char(b'\n');
+                exit(1);
+            }
+            dup2(fd, 1);
+            close(fd);
+        }
+        // Become the program loaded from disk. exec only returns on failure.
         exec_argv(&argv, argc);
         print(b"ish: command not found: ");
         print(cmd.as_bytes());
@@ -149,6 +186,43 @@ fn run_external(toks: &[String]) {
     }
 }
 
+/// Split tokens into (command words, input redirect, output redirect). The
+/// redirection operators must be their own whitespace-separated tokens:
+/// `< file`, `> file`, `>> file`. The operator + its filename are removed from
+/// the returned command words; `>>` sets the append flag on the output redirect.
+fn parse_redirs(toks: &[String]) -> (Vec<String>, Option<String>, Option<(String, bool)>) {
+    let mut words: Vec<String> = Vec::new();
+    let mut redir_in: Option<String> = None;
+    let mut redir_out: Option<(String, bool)> = None;
+    let mut i = 0;
+    while i < toks.len() {
+        match toks[i].as_str() {
+            ">" | ">>" => {
+                let append = toks[i].as_str() == ">>";
+                if i + 1 < toks.len() {
+                    redir_out = Some((toks[i + 1].clone(), append));
+                    i += 2;
+                } else {
+                    i += 1;
+                }
+            }
+            "<" => {
+                if i + 1 < toks.len() {
+                    redir_in = Some(toks[i + 1].clone());
+                    i += 2;
+                } else {
+                    i += 1;
+                }
+            }
+            _ => {
+                words.push(toks[i].clone());
+                i += 1;
+            }
+        }
+    }
+    (words, redir_in, redir_out)
+}
+
 /// Tokenize one line with the Frame `Parser` FSM and dispatch the first token.
 fn run_line(line: &str) {
     let mut p = Parser::__create();
@@ -156,7 +230,10 @@ fn run_line(line: &str) {
         p.consume(c);
     }
     p.finalize();
-    let toks: Vec<String> = p.tokens();
+    let raw: Vec<String> = p.tokens();
+    // Strip I/O redirection (`> file`, `>> file`, `< file`) from the token list;
+    // it's applied (for external commands) in the forked child before exec.
+    let (toks, redir_in, redir_out) = parse_redirs(&raw);
     if toks.is_empty() {
         return;
     }
@@ -165,6 +242,7 @@ fn run_line(line: &str) {
         "help" => {
             print(b"ish builtins: help, exit, cd [dir], pwd, clear, cat <path>...\n");
             print(b"on disk in /bin: ls, echo, rm, cp, touch, wc, head, tail, grep, date, ...\n");
+            print(b"redirection (external cmds): cmd > file, cmd >> file, cmd < file\n");
         }
         // cd must be a builtin: it changes *this shell's* cwd (per-process in the
         // kernel). No arg → go to root.
@@ -195,7 +273,7 @@ fn run_line(line: &str) {
                 cat(path);
             }
         }
-        _ => run_external(&toks),
+        _ => run_external(&toks, &redir_in, &redir_out),
     }
 }
 

@@ -371,10 +371,11 @@ fn proc_table() -> &'static mut ProcessTable {
 /// Validation predicate, called by the dispatcher's `$Validating` state.
 /// 0=write_char 1=exit 2=fork 3=exec(prog_id) 4=wait 5=open 6=read 7=close
 /// 8=exec(path) 9=read_line 10=brk 11=exec_argv 12=write 13=lseek 14=fstat
-/// 15=stat 16=dup 17=unlink 18=time 19=chdir 20=getcwd 21=readdir. (B4 Step 4
-/// added the file-I/O + exec-from-disk syscalls; 17–21 are B11-3 follow-ups.)
+/// 15=stat 16=dup 17=unlink 18=time 19=chdir 20=getcwd 21=readdir 22=dup2. (B4
+/// Step 4 added the file-I/O + exec-from-disk syscalls; 17–21 are B11-3
+/// follow-ups; 22 is the S5 redirection primitive.)
 pub fn is_known_syscall(num: u64) -> bool {
-    num <= 21
+    num <= 22
 }
 
 /// Block until the console has a complete line, copy it into the user buffer
@@ -553,14 +554,17 @@ pub fn perform_syscall(num: u64, a0: u64, _a1: u64) -> u64 {
         5 => {
             // open(path_ptr=a0, path_len=a1, flags=rdx) → fd, or u64::MAX on
             // failure. flags bit0: 0 = read (default; back-compat), 1 = write
-            // (create/truncate). B9-3 added the write mode.
+            // (create/truncate). bit1: append — open for writing without
+            // truncating, offset at end-of-file (`>>` redirection, S5).
             let mut canon = [0u8; 512];
             let Some(n) = resolve_user_path(a0, _a1 as usize, &mut canon) else {
                 return u64::MAX;
             };
-            let write = arg2() & 1 != 0;
+            let flags = arg2();
+            let append = flags & 2 != 0;
+            let write = flags & 1 != 0 || append;
             let r = if write {
-                crate::vfs::open_write(&canon[..n])
+                crate::vfs::open_write(&canon[..n], append)
             } else {
                 crate::vfs::open_read(&canon[..n])
             };
@@ -613,23 +617,13 @@ pub fn perform_syscall(num: u64, a0: u64, _a1: u64) -> u64 {
                 0
             } else {
                 let buf = unsafe { core::slice::from_raw_parts(_a1 as *const u8, len) };
-                if a0 == 1 || a0 == 2 {
-                    // Console (stdout/stderr): emit the whole buffer in this one
-                    // syscall. Syscalls run with IF=0 and ring-3 processes are
-                    // scheduled on a single core, so the bytes go out without a
-                    // preemption point — a process's line can't be split mid-way
-                    // by a concurrent process (or a kernel print) on the shared
-                    // serial console. Lets a program write an atomic line, vs the
-                    // byte-at-a-time write_char (#0) which is preemptible between
-                    // bytes. (frame-libc still loops write_char; a program wanting
-                    // atomicity uses write() directly, as `argtest` now does.)
-                    for &b in buf {
-                        serial::write_byte(b);
-                    }
-                    buf.len() as u64
-                } else {
-                    crate::vfs::write(a0 as usize, buf) as u64
-                }
+                // Routed through the per-process fd table (S5): fd 1/2 are
+                // console-output descriptors that emit the whole buffer to the
+                // serial console in this one syscall (atomic — syscalls run IF=0
+                // on a single core, so a process's line is never split mid-way by
+                // a concurrent process or a kernel print), while a redirected fd
+                // (e.g. after `dup2(file, 1)`) writes to its file instead.
+                crate::vfs::write(a0 as usize, buf) as u64
             }
         }
         13 => {
@@ -717,6 +711,12 @@ pub fn perform_syscall(num: u64, a0: u64, _a1: u64) -> u64 {
             }
             let buf = unsafe { core::slice::from_raw_parts_mut(arg2() as *mut u8, buf_len) };
             crate::fs::list_dir(&canon[..n], buf).map_or(u64::MAX, |w| w as u64)
+        }
+        22 => {
+            // dup2(oldfd=a0, newfd=a1) → newfd, or u64::MAX. Repoints newfd at
+            // oldfd (closing newfd first). The shell uses this to wire
+            // redirection in the forked child before exec (S5).
+            crate::vfs::dup2(a0 as usize, _a1 as usize).map_or(u64::MAX, |fd| fd as u64)
         }
         _ => u64::MAX, // unreachable: validated by is_known_syscall
     }
