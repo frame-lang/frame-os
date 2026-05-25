@@ -87,7 +87,16 @@
                         -> $Foreground
                     }
                     Err(e) => {
-                        self.spawn_error = e.to_string();
+                        // Classify by ErrorKind, not the OS message: a missing
+                        // command is "No such file or directory" on Unix but
+                        // "The system cannot find the file specified" on Windows.
+                        // Normalize NotFound so the shell's "command not found"
+                        // mapping works cross-platform.
+                        self.spawn_error = if e.kind() == std::io::ErrorKind::NotFound {
+                            "No such file or directory".to_string()
+                        } else {
+                            e.to_string()
+                        };
                         -> $Done
                     }
                 }
@@ -126,7 +135,12 @@
                         -> $Background
                     }
                     Err(e) => {
-                        self.spawn_error = e.to_string();
+                        // Normalize NotFound cross-platform (see spawn() above).
+                        self.spawn_error = if e.kind() == std::io::ErrorKind::NotFound {
+                            "No such file or directory".to_string()
+                        } else {
+                            e.to_string()
+                        };
                         -> $Done
                     }
                 }
