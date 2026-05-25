@@ -315,7 +315,7 @@ fn run_line(line: &str) {
         "exit" => exit(0),
         "help" => {
             print(b"ish builtins: help, exit, cd [dir], pwd, clear, cat <path>...\n");
-            print(b"on disk in /bin: ls, echo, rm, cp, touch, wc, head, tail, grep, date, ...\n");
+            print(b"on disk in /bin: ls, echo, rm, cp, touch, wc, head, tail, grep, date, mkdir, rmdir, ...\n");
             print(b"redirection (external cmds): cmd > file, cmd >> file, cmd < file\n");
             print(b"pipes: cmd1 | cmd2 (connect cmd1's stdout to cmd2's stdin)\n");
         }

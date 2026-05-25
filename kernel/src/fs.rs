@@ -371,37 +371,163 @@ pub fn read_file(ino: u32, out: &mut [u8]) -> usize {
     read_at(ino, 0, out)
 }
 
+/// Append a dirent (`name` → `ino`) at the end of directory `pino`, growing it
+/// into a new data block when the current one fills. DIRENT_SIZE (32) evenly
+/// divides BLOCK_SIZE (512 = 16 dirents), so entries never straddle a block;
+/// the new entry goes at logical offset `dir.size`, whose block is allocated on
+/// demand via `block_for`. Directories use **direct blocks only** (the read side,
+/// `dir_lookup`/`list_dir`, iterates only `dir.direct`), so this caps a directory
+/// at NDIRECT×16 = 448 entries and returns false past that or on out-of-space.
+fn dir_link(pino: u32, name: &[u8], ino: u32) -> bool {
+    let mut dir = read_inode(pino);
+    let off = dir.size as usize;
+    let bi = off / fs::BLOCK_SIZE;
+    if bi >= fs::NDIRECT {
+        return false; // directories are direct-only
+    }
+    let within = off % fs::BLOCK_SIZE;
+    let Some(dblk) = block_for(&mut dir, bi, true) else {
+        return false;
+    };
+    let mut data = read_block(dblk);
+    fs::write_dirent(&mut data, within, name, ino);
+    write_block(dblk, &data);
+    dir.size += fs::DIRENT_SIZE as u32;
+    write_inode(pino, &dir);
+    true
+}
+
+/// Split an absolute path into (parent directory inode, final component name).
+/// `None` if the parent doesn't resolve to a directory.
+fn split_parent(path: &[u8]) -> Option<(u32, &[u8])> {
+    let (parent_path, name): (&[u8], &[u8]) = match path.iter().rposition(|&c| c == b'/') {
+        Some(i) => (&path[..i], &path[i + 1..]),
+        None => (b"", path),
+    };
+    let pino = if parent_path.is_empty() {
+        fs::ROOT_INODE
+    } else {
+        namei(parent_path)?
+    };
+    if !is_dir(pino) {
+        return None;
+    }
+    Some((pino, name))
+}
+
+/// Clear the dirent for (`ino`, `name`) in directory `pino` (set inode 0; lookups
+/// skip it). Returns true if it was found + cleared.
+fn clear_dirent(pino: u32, ino: u32, name: &[u8]) -> bool {
+    let parent = read_inode(pino);
+    let entries = parent.size as usize / fs::DIRENT_SIZE;
+    let mut seen = 0usize;
+    for &blk in parent.direct.iter() {
+        if blk == 0 {
+            continue;
+        }
+        let mut data = read_block(blk);
+        let mut off = 0;
+        while off + fs::DIRENT_SIZE <= fs::BLOCK_SIZE && seen < entries {
+            let (dname, dino) = fs::read_dirent(&data, off);
+            seen += 1;
+            if dino == ino && fs::name_eq(&dname, name) {
+                fs::write_dirent(&mut data, off, b"", 0);
+                write_block(blk, &data);
+                return true;
+            }
+            off += fs::DIRENT_SIZE;
+        }
+    }
+    false
+}
+
+/// Whether directory `ino` has no live entries (this FS has no `.`/`..`, so an
+/// empty directory has zero non-zero dirents).
+fn dir_is_empty(ino: u32) -> bool {
+    let dir = read_inode(ino);
+    let entries = dir.size as usize / fs::DIRENT_SIZE;
+    let mut seen = 0usize;
+    for &blk in dir.direct.iter() {
+        if blk == 0 {
+            continue;
+        }
+        let data = read_block(blk);
+        let mut off = 0;
+        while off + fs::DIRENT_SIZE <= fs::BLOCK_SIZE && seen < entries {
+            let (_, dino) = fs::read_dirent(&data, off);
+            seen += 1;
+            if dino != 0 {
+                return false;
+            }
+            off += fs::DIRENT_SIZE;
+        }
+    }
+    true
+}
+
+/// Allocate a fresh inode of `kind`, returning its number. (nlink = 1, size 0,
+/// no blocks.) None if the inode table is full.
+fn alloc_node(kind: u16) -> Option<u32> {
+    let ino = alloc_inode()?;
+    let mut node = fs::Inode::empty();
+    node.kind = kind;
+    node.nlink = 1;
+    write_inode(ino, &node);
+    Some(ino)
+}
+
 /// Create an empty file `name` in the root directory; returns its inode.
 pub fn create(name: &[u8]) -> Option<u32> {
     if lookup(name).is_some() {
         return None;
     }
-    let ino = alloc_inode()?;
-    let mut node = fs::Inode::empty();
-    node.kind = fs::T_FILE;
-    node.nlink = 1;
-    write_inode(ino, &node);
-    // Append a dirent to the root directory, growing it into a new data block
-    // when the current one fills. DIRENT_SIZE (32) evenly divides BLOCK_SIZE
-    // (512 = 16 dirents), so entries never straddle a block boundary; the new
-    // entry goes at logical offset root.size, whose block is allocated on demand
-    // via block_for. (Earlier this used only direct[0] — a 16-entry cap — but
-    // dir_lookup/unlink already iterate all of dir.direct, so the read side was
-    // always multi-block; this makes creation match.)
-    let mut root = read_inode(fs::ROOT_INODE);
-    let off = root.size as usize;
-    let bi = off / fs::BLOCK_SIZE;
-    let within = off % fs::BLOCK_SIZE;
-    let Some(dblk) = block_for(&mut root, bi, true) else {
-        write_inode(ino, &fs::Inode::empty()); // out of space — release the inode
+    let ino = alloc_node(fs::T_FILE)?;
+    if !dir_link(fs::ROOT_INODE, name, ino) {
+        write_inode(ino, &fs::Inode::empty()); // release on out-of-space
         return None;
-    };
-    let mut data = read_block(dblk);
-    fs::write_dirent(&mut data, within, name, ino);
-    write_block(dblk, &data);
-    root.size += fs::DIRENT_SIZE as u32;
-    write_inode(fs::ROOT_INODE, &root);
+    }
     Some(ino)
+}
+
+/// Create directory `path` (S7). The parent must exist and be a directory; the
+/// final component must not already exist. Returns false on any of those, on a
+/// full inode table, or out-of-space.
+pub fn mkdir(path: &[u8]) -> bool {
+    let Some((pino, name)) = split_parent(path) else {
+        return false;
+    };
+    if name.is_empty() || dir_lookup(pino, name).is_some() {
+        return false;
+    }
+    let Some(ino) = alloc_node(fs::T_DIR) else {
+        return false;
+    };
+    if !dir_link(pino, name, ino) {
+        write_inode(ino, &fs::Inode::empty()); // release
+        return false;
+    }
+    true
+}
+
+/// Remove directory `path` (S7) — must be an existing, empty directory (and not
+/// the root). Frees its blocks + inode and clears its dirent in the parent.
+pub fn rmdir(path: &[u8]) -> bool {
+    let Some(ino) = namei(path) else {
+        return false;
+    };
+    if ino == fs::ROOT_INODE || !is_dir(ino) || !dir_is_empty(ino) {
+        return false;
+    }
+    let Some((pino, name)) = split_parent(path) else {
+        return false;
+    };
+    if name.is_empty() {
+        return false;
+    }
+    let node = read_inode(ino);
+    free_all_blocks(&node);
+    write_inode(ino, &fs::Inode::empty());
+    clear_dirent(pino, ino, name)
 }
 
 /// Overwrite file `ino` with `data` (allocating blocks as needed).
@@ -523,54 +649,22 @@ pub fn delete(name: &[u8]) -> bool {
 /// false if the path doesn't resolve to a regular file. Directories are not
 /// removed (only `T_FILE`). The syscall layer (`unlink`) calls this.
 pub fn unlink(path: &[u8]) -> bool {
-    // Split into the parent directory path and the final component name.
-    let (parent_path, name): (&[u8], &[u8]) = match path.iter().rposition(|&c| c == b'/') {
-        Some(i) => (&path[..i], &path[i + 1..]),
-        None => (b"", path),
+    let Some((parent_ino, name)) = split_parent(path) else {
+        return false;
     };
     if name.is_empty() {
         return false;
     }
-    let parent_ino = if parent_path.is_empty() {
-        fs::ROOT_INODE
-    } else {
-        match namei(parent_path) {
-            Some(i) => i,
-            None => return false,
-        }
-    };
     let Some(ino) = dir_lookup(parent_ino, name) else {
         return false;
     };
     let node = read_inode(ino);
     if node.kind != fs::T_FILE {
-        return false; // don't unlink directories
+        return false; // don't unlink directories (use rmdir)
     }
     free_all_blocks(&node);
     write_inode(ino, &fs::Inode::empty()); // mark $free
-
-    // Clear the dirent in the parent's data blocks (set inode 0; lookup skips it).
-    let parent = read_inode(parent_ino);
-    let entries = parent.size as usize / fs::DIRENT_SIZE;
-    let mut seen = 0usize;
-    for &blk in parent.direct.iter() {
-        if blk == 0 {
-            continue;
-        }
-        let mut data = read_block(blk);
-        let mut off = 0;
-        while off + fs::DIRENT_SIZE <= fs::BLOCK_SIZE && seen < entries {
-            let (dname, dino) = fs::read_dirent(&data, off);
-            seen += 1;
-            if dino == ino && fs::name_eq(&dname, name) {
-                fs::write_dirent(&mut data, off, b"", 0);
-                write_block(blk, &data);
-                return true;
-            }
-            off += fs::DIRENT_SIZE;
-        }
-    }
-    true
+    clear_dirent(parent_ino, ino, name)
 }
 
 // --- mount -----------------------------------------------------------------

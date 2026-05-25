@@ -421,6 +421,9 @@ fn prepare_qemu_artifacts_features(workspace: &Path, interactive: bool) -> Resul
     let tail_elf = build_user_disk_elf(workspace, "tail")?;
     let grep_elf = build_user_disk_elf(workspace, "grep")?;
     let date_elf = build_user_disk_elf(workspace, "date")?;
+    // S7 directory ops.
+    let mkdir_elf = build_user_disk_elf(workspace, "mkdir")?;
+    let rmdir_elf = build_user_disk_elf(workspace, "rmdir")?;
     // B11-3e: the BuildDriver-FSM-driven build tool (compile→link→run via tcc).
     let build_elf = build_user_disk_elf(workspace, "buildc")?;
     // V1.0 capstone: the Hello Frame system (frame/hello.frs) transpiled to Rust
@@ -453,6 +456,8 @@ fn prepare_qemu_artifacts_features(workspace: &Path, interactive: bool) -> Resul
     files.push(("/bin/tail", &tail_elf));
     files.push(("/bin/grep", &grep_elf));
     files.push(("/bin/date", &date_elf));
+    files.push(("/bin/mkdir", &mkdir_elf));
+    files.push(("/bin/rmdir", &rmdir_elf));
     files.push(("/bin/chello", &chello_elf));
     files.push(("/bin/tcc", &tcc_elf));
     files.push(("/bin/buildc", &build_elf));
@@ -1517,8 +1522,20 @@ fn run_console_test() -> Result<()> {
             .context("write pipe")?;
         stdin.flush().ok();
         wait_for_output(&buf, "1 3 13", 45)?; // wc counting echo's piped stdout
-                                              // B9-2: argv reaches the program. Type a command WITH arguments; argtest
-                                              // echoes argc + each argv string, so we can assert the args arrived.
+                                              // S7 directories: mkdir /zsub creates it; the *second* mkdir fails
+                                              // ("cannot create directory") which proves the first one created it;
+                                              // rmdir removes it, after which `cd /zsub` fails ("no such directory")
+                                              // proving it's gone. Both asserted strings are program/shell output, not
+                                              // in the typed commands, so they can't be satisfied by the input echo.
+        eprintln!("console-test: typing mkdir / rmdir (directories)");
+        stdin
+            .write_all(b"mkdir /zsub\nmkdir /zsub\nrmdir /zsub\ncd /zsub\n")
+            .context("write mkdir/rmdir")?;
+        stdin.flush().ok();
+        wait_for_output(&buf, "cannot create directory", 45)?; // 2nd mkdir → dir exists ⇒ 1st made it
+        wait_for_output(&buf, "no such directory: /zsub", 45)?; // cd after rmdir ⇒ rmdir removed it
+                                                                // B9-2: argv reaches the program. Type a command WITH arguments; argtest
+                                                                // echoes argc + each argv string, so we can assert the args arrived.
         eprintln!("console-test: typing `/bin/argtest alpha beta`");
         stdin
             .write_all(b"/bin/argtest alpha beta\n")

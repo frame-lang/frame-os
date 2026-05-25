@@ -98,6 +98,15 @@ path = "src/grep.rs"
 name = "date"
 path = "src/date.rs"
 
+# S7 directory ops.
+[[bin]]
+name = "mkdir"
+path = "src/mkdir.rs"
+
+[[bin]]
+name = "rmdir"
+path = "src/rmdir.rs"
+
 # File write path (B9-3): creates /tmp.txt and exercises write, lseek, fstat,
 # dup, and read-back. Baked into the kernel; run by usermode::run.
 [[bin]]

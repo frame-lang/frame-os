@@ -393,10 +393,11 @@ fn proc_table() -> &'static mut ProcessTable {
 /// 0=write_char 1=exit 2=fork 3=exec(prog_id) 4=wait 5=open 6=read 7=close
 /// 8=exec(path) 9=read_line 10=brk 11=exec_argv 12=write 13=lseek 14=fstat
 /// 15=stat 16=dup 17=unlink 18=time 19=chdir 20=getcwd 21=readdir 22=dup2
-/// 23=pipe. (B4 Step 4 added the file-I/O + exec-from-disk syscalls; 17–21 are
-/// B11-3 follow-ups; 22 is the S5 redirection primitive; 23 is the S6 pipe.)
+/// 23=pipe 24=mkdir 25=rmdir. (B4 Step 4 added the file-I/O + exec-from-disk
+/// syscalls; 17–21 are B11-3 follow-ups; 22 is the S5 redirection primitive; 23
+/// is the S6 pipe; 24/25 are the S7 directory ops.)
 pub fn is_known_syscall(num: u64) -> bool {
-    num <= 23
+    num <= 25
 }
 
 /// Block until the console has a complete line, copy it into the user buffer
@@ -789,6 +790,31 @@ pub fn perform_syscall(num: u64, a0: u64, _a1: u64) -> u64 {
                     0
                 }
                 None => u64::MAX,
+            }
+        }
+        24 => {
+            // mkdir(path_ptr=a0, path_len=a1) → 0, or u64::MAX (parent missing /
+            // not a dir, name exists, or no space). Path resolves against cwd (S7).
+            let mut canon = [0u8; 512];
+            let Some(n) = resolve_user_path(a0, _a1 as usize, &mut canon) else {
+                return u64::MAX;
+            };
+            if crate::fs::mkdir(&canon[..n]) {
+                0
+            } else {
+                u64::MAX
+            }
+        }
+        25 => {
+            // rmdir(path_ptr=a0, path_len=a1) → 0, or u64::MAX (not an empty dir).
+            let mut canon = [0u8; 512];
+            let Some(n) = resolve_user_path(a0, _a1 as usize, &mut canon) else {
+                return u64::MAX;
+            };
+            if crate::fs::rmdir(&canon[..n]) {
+                0
+            } else {
+                u64::MAX
             }
         }
         _ => u64::MAX, // unreachable: validated by is_known_syscall
