@@ -387,6 +387,11 @@ fn prepare_qemu_artifacts_features(workspace: &Path, interactive: bool) -> Resul
     let cmain_elf = build_user_disk_elf(workspace, "cmain")?;
     // S1: `ls` lists a directory via the readdir syscall (#21).
     let ls_elf = build_user_disk_elf(workspace, "ls")?;
+    // S3 coreutils.
+    let echo_elf = build_user_disk_elf(workspace, "echo")?;
+    let rm_elf = build_user_disk_elf(workspace, "rm")?;
+    let touch_elf = build_user_disk_elf(workspace, "touch")?;
+    let cp_elf = build_user_disk_elf(workspace, "cp")?;
     // B11-3e: the BuildDriver-FSM-driven build tool (compile→link→run via tcc).
     let build_elf = build_user_disk_elf(workspace, "buildc")?;
     // V1.0 capstone: the Hello Frame system (frame/hello.frs) transpiled to Rust
@@ -410,6 +415,10 @@ fn prepare_qemu_artifacts_features(workspace: &Path, interactive: bool) -> Resul
     files.push(("/bin/argtest", &argtest_elf));
     files.push(("/bin/cmain", &cmain_elf));
     files.push(("/bin/ls", &ls_elf));
+    files.push(("/bin/echo", &echo_elf));
+    files.push(("/bin/rm", &rm_elf));
+    files.push(("/bin/touch", &touch_elf));
+    files.push(("/bin/cp", &cp_elf));
     files.push(("/bin/chello", &chello_elf));
     files.push(("/bin/tcc", &tcc_elf));
     files.push(("/bin/buildc", &build_elf));
@@ -1403,8 +1412,21 @@ fn run_console_test() -> Result<()> {
         wait_for_output(&buf, "readme", 20)?; // ls at root lists /readme
         wait_for_output(&buf, "/usr", 20)?; // pwd after `cd /usr`
         wait_for_output(&buf, "include", 20)?; // ls /usr lists `include`
-                                               // B9-2: argv reaches the program. Type a command WITH arguments; argtest
-                                               // echoes argc + each argv string, so we can assert the args arrived.
+                                               // S3 coreutils on the Frame OS filesystem: touch creates a file (ls
+                                               // sees it), echo prints args, cp copies /readme → /b.txt (cat proves
+                                               // the bytes), rm deletes. (cwd is / after the nav block's `cd /`.)
+        eprintln!("console-test: typing touch / echo / cp / cat / rm");
+        stdin
+            .write_all(
+                b"touch /a.txt\nls\necho hi-there\ncp /readme /b.txt\ncat /b.txt\nrm /a.txt\n",
+            )
+            .context("write coreutils")?;
+        stdin.flush().ok();
+        wait_for_output(&buf, "a.txt", 20)?; // ls after `touch /a.txt`
+        wait_for_output(&buf, "hi-there", 20)?; // echo
+        wait_for_output(&buf, "hello from the disk", 20)?; // cat of the cp'd /readme
+                                                           // B9-2: argv reaches the program. Type a command WITH arguments; argtest
+                                                           // echoes argc + each argv string, so we can assert the args arrived.
         eprintln!("console-test: typing `/bin/argtest alpha beta`");
         stdin
             .write_all(b"/bin/argtest alpha beta\n")

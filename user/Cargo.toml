@@ -60,6 +60,23 @@ path = "src/argtest.rs"
 name = "ls"
 path = "src/ls.rs"
 
+# S3 coreutils: file-op programs over the existing syscalls.
+[[bin]]
+name = "echo"
+path = "src/echo.rs"
+
+[[bin]]
+name = "rm"
+path = "src/rm.rs"
+
+[[bin]]
+name = "touch"
+path = "src/touch.rs"
+
+[[bin]]
+name = "cp"
+path = "src/cp.rs"
+
 # File write path (B9-3): creates /tmp.txt and exercises write, lseek, fstat,
 # dup, and read-back. Baked into the kernel; run by usermode::run.
 [[bin]]
