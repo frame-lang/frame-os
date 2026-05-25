@@ -385,6 +385,8 @@ fn prepare_qemu_artifacts_features(workspace: &Path, interactive: bool) -> Resul
     let hello_elf = build_user_disk_elf(workspace, "hello")?;
     let argtest_elf = build_user_disk_elf(workspace, "argtest")?;
     let cmain_elf = build_user_disk_elf(workspace, "cmain")?;
+    // S1: `ls` lists a directory via the readdir syscall (#21).
+    let ls_elf = build_user_disk_elf(workspace, "ls")?;
     // B11-3e: the BuildDriver-FSM-driven build tool (compile→link→run via tcc).
     let build_elf = build_user_disk_elf(workspace, "buildc")?;
     // V1.0 capstone: the Hello Frame system (frame/hello.frs) transpiled to Rust
@@ -407,6 +409,7 @@ fn prepare_qemu_artifacts_features(workspace: &Path, interactive: bool) -> Resul
     files.push(("/bin/hello", &hello_elf));
     files.push(("/bin/argtest", &argtest_elf));
     files.push(("/bin/cmain", &cmain_elf));
+    files.push(("/bin/ls", &ls_elf));
     files.push(("/bin/chello", &chello_elf));
     files.push(("/bin/tcc", &tcc_elf));
     files.push(("/bin/buildc", &build_elf));
@@ -1389,8 +1392,19 @@ fn run_console_test() -> Result<()> {
         stdin.write_all(b"/bin/hello\n").context("write hello")?;
         stdin.flush().ok();
         wait_for_output(&buf, "hello from ELF", 20)?;
-        // B9-2: argv reaches the program. Type a command WITH arguments; argtest
-        // echoes argc + each argv string, so we can assert the args arrived.
+        // S1/S2: shell navigation on the Frame OS filesystem — pwd, ls (readdir
+        // syscall #21), and cd. `ls` at root shows /readme; after `cd /usr`, pwd
+        // reports /usr and `ls` shows the staged `include` dir.
+        eprintln!("console-test: typing pwd / ls / cd /usr");
+        stdin
+            .write_all(b"ls\ncd /usr\npwd\nls\ncd /\n")
+            .context("write nav")?;
+        stdin.flush().ok();
+        wait_for_output(&buf, "readme", 20)?; // ls at root lists /readme
+        wait_for_output(&buf, "/usr", 20)?; // pwd after `cd /usr`
+        wait_for_output(&buf, "include", 20)?; // ls /usr lists `include`
+                                               // B9-2: argv reaches the program. Type a command WITH arguments; argtest
+                                               // echoes argc + each argv string, so we can assert the args arrived.
         eprintln!("console-test: typing `/bin/argtest alpha beta`");
         stdin
             .write_all(b"/bin/argtest alpha beta\n")

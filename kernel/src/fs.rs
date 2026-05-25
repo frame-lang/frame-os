@@ -231,6 +231,45 @@ pub fn lookup(name: &[u8]) -> Option<u32> {
     dir_lookup(fs::ROOT_INODE, name)
 }
 
+/// List the entries of directory `path` into `out` as NUL-separated names,
+/// returning the bytes written (truncated if `out` fills). `None` if `path`
+/// doesn't resolve to a directory. Backs the `readdir` syscall (#21) / `ls`.
+pub fn list_dir(path: &[u8], out: &mut [u8]) -> Option<usize> {
+    let ino = namei(path)?;
+    let dir = read_inode(ino);
+    if dir.kind != fs::T_DIR {
+        return None;
+    }
+    let entries = dir.size as usize / fs::DIRENT_SIZE;
+    let mut seen = 0usize;
+    let mut w = 0usize;
+    for &blk in dir.direct.iter() {
+        if blk == 0 {
+            continue;
+        }
+        let data = read_block(blk);
+        let mut off = 0;
+        while off + fs::DIRENT_SIZE <= fs::BLOCK_SIZE && seen < entries {
+            let (dname, dino) = fs::read_dirent(&data, off);
+            seen += 1;
+            off += fs::DIRENT_SIZE;
+            if dino == 0 {
+                continue; // free/cleared slot (e.g. after unlink)
+            }
+            // The name field is NUL-padded within NAME_LEN; take up to the NUL.
+            let nlen = dname.iter().position(|&c| c == 0).unwrap_or(dname.len());
+            if w + nlen + 1 > out.len() {
+                return Some(w); // out of space — return what fit
+            }
+            out[w..w + nlen].copy_from_slice(&dname[..nlen]);
+            w += nlen;
+            out[w] = 0; // NUL separator
+            w += 1;
+        }
+    }
+    Some(w)
+}
+
 /// Resolve an absolute path (`/a/b/c`) to an inode by walking directories from
 /// the root. Empty components (leading/trailing/double slashes) are skipped.
 pub fn namei(path: &[u8]) -> Option<u32> {

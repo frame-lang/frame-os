@@ -42,6 +42,8 @@
 //                                                read from the CMOS RTC (B11-3)
 //  19 = chdir(rdi = path, rsi = len)          → 0 ok / MAX; set the cwd (B11-3)
 //  20 = getcwd(rdi = buf, rsi = len)          → path bytes written / MAX (B11-3)
+//  21 = readdir(rdi = path, rsi = len,        → bytes of NUL-separated entry
+//               rdx = buf, r10 = buflen)         names / MAX if not a dir (S1)
 
 use core::arch::{asm, global_asm};
 
@@ -369,10 +371,10 @@ fn proc_table() -> &'static mut ProcessTable {
 /// Validation predicate, called by the dispatcher's `$Validating` state.
 /// 0=write_char 1=exit 2=fork 3=exec(prog_id) 4=wait 5=open 6=read 7=close
 /// 8=exec(path) 9=read_line 10=brk 11=exec_argv 12=write 13=lseek 14=fstat
-/// 15=stat 16=dup 17=unlink 18=time 19=chdir 20=getcwd. (B4 Step 4 added the
-/// file-I/O + exec-from-disk syscalls; 17–20 are B11-3 follow-ups.)
+/// 15=stat 16=dup 17=unlink 18=time 19=chdir 20=getcwd 21=readdir. (B4 Step 4
+/// added the file-I/O + exec-from-disk syscalls; 17–21 are B11-3 follow-ups.)
 pub fn is_known_syscall(num: u64) -> bool {
-    num <= 20
+    num <= 21
 }
 
 /// Block until the console has a complete line, copy it into the user buffer
@@ -397,6 +399,13 @@ fn do_read_line_loop(buf: u64, len: u64) -> u64 {
 /// extra arg here, the same way `fork`/`exec` read the frame directly.
 fn arg2() -> u64 {
     unsafe { (*(&raw const CURRENT_TRAP_FRAME).read()).rdx }
+}
+
+/// The fourth syscall argument, read from the current trap frame. Per the
+/// SysV/Linux syscall convention the 4th arg is in r10 (rcx is clobbered by the
+/// `syscall` instruction). Used by 4-arg syscalls like `readdir` (#21).
+fn arg3() -> u64 {
+    unsafe { (*(&raw const CURRENT_TRAP_FRAME).read()).r10 }
 }
 
 /// Copy up to `out.len()` bytes from a user pointer into `out`, returning the
@@ -693,6 +702,21 @@ pub fn perform_syscall(num: u64, a0: u64, _a1: u64) -> u64 {
                 }
                 src.len() as u64
             }
+        }
+        21 => {
+            // readdir(path_ptr=a0, path_len=a1, buf_ptr=rdx, buf_len=r10) → bytes
+            // of NUL-separated entry names written to buf, or u64::MAX if the path
+            // isn't a directory. Path resolves relative to the caller's cwd.
+            let mut canon = [0u8; 512];
+            let Some(n) = resolve_user_path(a0, _a1 as usize, &mut canon) else {
+                return u64::MAX;
+            };
+            let buf_len = arg3() as usize;
+            if buf_len == 0 {
+                return u64::MAX;
+            }
+            let buf = unsafe { core::slice::from_raw_parts_mut(arg2() as *mut u8, buf_len) };
+            crate::fs::list_dir(&canon[..n], buf).map_or(u64::MAX, |w| w as u64)
         }
         _ => u64::MAX, // unreachable: validated by is_known_syscall
     }

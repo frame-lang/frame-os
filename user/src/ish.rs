@@ -16,6 +16,7 @@
 //
 // Syscall ABI: 0=write_char 1=exit 2=fork 4=wait 5=open 6=read 7=close
 //              8=exec_path(path_ptr,len) 9=read_line(buf_ptr,len)
+//              11=exec_argv 19=chdir 20=getcwd
 
 #![no_std]
 #![no_main]
@@ -84,6 +85,14 @@ fn exec_argv(buf: &[u8], argc: u64) -> u64 {
 }
 fn read_line(buf: &mut [u8]) -> usize {
     unsafe { syscall3(9, buf.as_mut_ptr() as u64, buf.len() as u64, 0) as usize }
+}
+/// chdir (#19): set this shell's cwd. Returns u64::MAX if the path isn't a dir.
+fn chdir(path: &[u8]) -> u64 {
+    unsafe { syscall3(19, path.as_ptr() as u64, path.len() as u64, 0) }
+}
+/// getcwd (#20): write the cwd into `buf`, returning its byte length (no NUL).
+fn getcwd(buf: &mut [u8]) -> u64 {
+    unsafe { syscall3(20, buf.as_mut_ptr() as u64, buf.len() as u64, 0) }
 }
 
 /// `cat`: stream a file's bytes to the console.
@@ -154,8 +163,30 @@ fn run_line(line: &str) {
     match toks[0].as_str() {
         "exit" => exit(0),
         "help" => {
-            print(b"ish builtins: help, exit, cat <path>...\n");
-            print(b"anything else runs /bin/<cmd> <args...> from disk (fork+exec+wait)\n");
+            print(b"ish builtins: help, exit, cd [dir], pwd, cat <path>...\n");
+            print(b"anything else runs /bin/<cmd> <args...> from disk (e.g. ls, rm, cp)\n");
+        }
+        // cd must be a builtin: it changes *this shell's* cwd (per-process in the
+        // kernel). No arg → go to root.
+        "cd" => {
+            let target = if toks.len() > 1 {
+                toks[1].as_str()
+            } else {
+                "/"
+            };
+            if chdir(target.as_bytes()) == u64::MAX {
+                print(b"cd: no such directory: ");
+                print(target.as_bytes());
+                write_char(b'\n');
+            }
+        }
+        "pwd" => {
+            let mut buf = [0u8; 256];
+            let n = getcwd(&mut buf);
+            if n != u64::MAX {
+                print(&buf[..n as usize]);
+                write_char(b'\n');
+            }
         }
         "cat" => {
             for path in &toks[1..] {
