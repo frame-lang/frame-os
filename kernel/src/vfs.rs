@@ -26,7 +26,12 @@
 use crate::frame_systems::OpenFile;
 use crate::{fs, sched, serial};
 
-const MAX_OPEN: usize = 16;
+// Per-process descriptor capacity. fd 0/1/2 are the console (S5), so this many
+// minus 3 are available for files/pipes. Bumped to 32 when the console fds moved
+// *into* the table: before S5 the console was a magic fd outside the table, so
+// all 16 slots were files; reserving 3 would have cut tcc (which opens many
+// files: source, headers, archives, output) below its old headroom.
+const MAX_OPEN: usize = 32;
 /// One fd table per scheduler slot. Mirrors `sched`'s `MAX_THREADS`.
 const MAX_PROCS: usize = 8;
 
@@ -47,6 +52,11 @@ enum Slot {
         writable: bool,
         file: OpenFile,
     },
+    /// One end of an anonymous pipe (S6). `write_end` selects which end: the
+    /// write end accepts `write`, the read end yields bytes via `read` (blocking
+    /// in the syscall layer until data arrives or every writer closes). `id`
+    /// indexes the kernel pipe pool (`crate::pipe`).
+    Pipe { id: usize, write_end: bool },
 }
 
 static mut TABLES: [[Option<Slot>; MAX_OPEN]; MAX_PROCS] =
@@ -86,6 +96,18 @@ fn clone_slot(s: &Slot) -> Slot {
                 offset: *offset,
                 writable: *writable,
                 file,
+            }
+        }
+        Slot::Pipe { id, write_end } => {
+            // A new descriptor onto the same pipe end → bump that end's ref count.
+            if *write_end {
+                crate::pipe::inc_writer(*id);
+            } else {
+                crate::pipe::inc_reader(*id);
+            }
+            Slot::Pipe {
+                id: *id,
+                write_end: *write_end,
             }
         }
     }
@@ -190,7 +212,11 @@ pub fn write(fd: usize, buf: &[u8]) -> usize {
             *offset += n;
             n
         }
-        _ => 0, // ConsoleIn or closed → can't write
+        Some(Slot::Pipe {
+            id,
+            write_end: true,
+        }) => crate::pipe::write(*id, buf),
+        _ => 0, // ConsoleIn, a pipe read end, or closed → can't write
     }
 }
 
@@ -280,14 +306,27 @@ pub fn read(fd: usize, buf: &mut [u8]) -> usize {
             *offset += n;
             n
         }
-        _ => 0, // ConsoleIn (EOF here), ConsoleOut, or closed
+        Some(Slot::Pipe {
+            id,
+            write_end: false,
+        }) => crate::pipe::read(*id, buf),
+        _ => 0, // ConsoleIn (EOF here), ConsoleOut, a pipe write end, or closed
     }
 }
 
-/// Close `fd` (a `File`'s `OpenFile` → $Closed) and free its table slot.
+/// Close `fd` and free its table slot: a `File`'s `OpenFile` goes to $Closed; a
+/// `Pipe` end drops its ref count (freeing the pipe when both ends are gone).
 pub fn close(fd: usize) {
-    if let Some(Slot::File { file, .. }) = table().get_mut(fd).and_then(|s| s.as_mut()) {
-        file.close();
+    match table().get_mut(fd).and_then(|s| s.as_mut()) {
+        Some(Slot::File { file, .. }) => file.close(),
+        Some(Slot::Pipe { id, write_end }) => {
+            if *write_end {
+                crate::pipe::dec_writer(*id);
+            } else {
+                crate::pipe::dec_reader(*id);
+            }
+        }
+        _ => {}
     }
     if let Some(s) = table().get_mut(fd) {
         *s = None;
@@ -299,13 +338,80 @@ pub fn is_open(fd: usize) -> bool {
     table().get(fd).map(|s| s.is_some()).unwrap_or(false)
 }
 
+/// Create an anonymous pipe in the current process, returning (read_fd,
+/// write_fd) installed at the two lowest free descriptors. None if the pool or
+/// the fd table is exhausted (S6). The shell uses this to wire `cmd1 | cmd2`.
+pub fn make_pipe() -> Option<(usize, usize)> {
+    let id = crate::pipe::alloc()?;
+    let t = table();
+    let mut ends: [Option<usize>; 2] = [None, None];
+    let mut k = 0usize;
+    for (fd, s) in t.iter_mut().enumerate() {
+        if s.is_none() {
+            *s = Some(Slot::Pipe {
+                id,
+                write_end: k == 1, // ends[0] = read end, ends[1] = write end
+            });
+            ends[k] = Some(fd);
+            k += 1;
+            if k == 2 {
+                break;
+            }
+        }
+    }
+    match (ends[0], ends[1]) {
+        (Some(r), Some(w)) => Some((r, w)),
+        _ => {
+            // Not enough free fds: undo the partial install and free the pipe.
+            if let Some(r) = ends[0] {
+                t[r] = None;
+            }
+            crate::pipe::dec_reader(id);
+            crate::pipe::dec_writer(id);
+            None
+        }
+    }
+}
+
+/// Whether `fd` is the read end of a pipe (so `read` may need to block until
+/// data arrives or every writer closes — handled by the syscall layer).
+pub fn is_pipe_read(fd: usize) -> bool {
+    matches!(
+        table().get(fd).and_then(|s| s.as_ref()),
+        Some(Slot::Pipe {
+            write_end: false,
+            ..
+        })
+    )
+}
+
+/// Whether the pipe behind read-end `fd` still has an open writer. False (→
+/// end-of-file) once `fd` isn't a pipe read end or all writers have closed.
+pub fn pipe_writers_open(fd: usize) -> bool {
+    match table().get(fd).and_then(|s| s.as_ref()) {
+        Some(Slot::Pipe {
+            id,
+            write_end: false,
+        }) => crate::pipe::has_writers(*id),
+        _ => false,
+    }
+}
+
 // --- per-process lifecycle (driven by `sched`) -----------------------------
 
 /// Close every descriptor in `t`, leaving it empty.
 fn clear_table(t: &mut [Option<Slot>; MAX_OPEN]) {
     for s in t.iter_mut() {
-        if let Some(Slot::File { file, .. }) = s {
-            file.close();
+        match s {
+            Some(Slot::File { file, .. }) => file.close(),
+            Some(Slot::Pipe { id, write_end }) => {
+                if *write_end {
+                    crate::pipe::dec_writer(*id);
+                } else {
+                    crate::pipe::dec_reader(*id);
+                }
+            }
+            _ => {}
         }
         *s = None;
     }

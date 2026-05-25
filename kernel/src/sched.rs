@@ -24,7 +24,7 @@
 use core::arch::asm;
 use core::sync::atomic::{AtomicBool, Ordering};
 
-use crate::frame_systems::Scheduler;
+use crate::frame_systems::{IoScheduler, Scheduler};
 use crate::{fpu, gdt, interrupts, paging, serial};
 
 const MAX_THREADS: usize = 8;
@@ -116,6 +116,13 @@ fn fpu_area(n: usize) -> *mut fpu::FpuState {
 // non-reentrant and shared across preemptible threads).
 static mut SCHED: Option<Scheduler> = None;
 
+// The IoScheduler supervisor (S6 follow-up): sequences blocking I/O — currently
+// the single-flight disk engine's access (who holds it, who's queued, who's
+// next). Like SCHED it's a shared non-reentrant Frame system, so every touch is
+// inside `without_interrupts` and only ever from syscall/drained context (never
+// an ISR).
+static mut IO_SCHED: Option<IoScheduler> = None;
+
 fn tcbs() -> *mut Tcb {
     (&raw mut TCBS) as *mut Tcb
 }
@@ -127,6 +134,44 @@ fn with_sched<R>(f: impl FnOnce(&mut Scheduler) -> R) -> R {
         let s = (*p).as_mut().expect("scheduler initialized");
         f(s)
     })
+}
+
+/// Run `f` with the IoScheduler supervisor, in a critical section.
+fn with_io_sched<R>(f: impl FnOnce(&mut IoScheduler) -> R) -> R {
+    interrupts::without_interrupts(|| unsafe {
+        let p = &raw mut IO_SCHED;
+        let s = (*p).as_mut().expect("io scheduler initialized");
+        f(s)
+    })
+}
+
+/// Acquire the single-flight disk engine, blocking (yielding) until this process
+/// is its owner. The supervisor decides grant-vs-queue; we then block until it
+/// names us owner. The check-and-block in `block_current_until` is atomic, and on
+/// any wake we re-ask the supervisor — so a hand-off that races the block is
+/// never lost. (S6: replaces the ad-hoc native disk lock.)
+pub fn acquire_disk() {
+    let pid = current_pid();
+    // Boot / non-process context (early boot fs::mount, the idle slot): there's
+    // no concurrency and the supervisor may not exist yet — skip it. (pid 0 is
+    // also the "no owner" sentinel, so it must never enter the queue.)
+    if !is_preemption_active() || pid == 0 {
+        return;
+    }
+    with_io_sched(|s| s.acquire_disk(pid));
+    block_current_until(|| with_io_sched(|s| s.disk_owner(pid)));
+}
+
+/// Release the disk engine and wake the next queued owner (if any) so it can
+/// claim it. Called by the holder after its transaction completes.
+pub fn release_disk() {
+    if !is_preemption_active() || current_pid() == 0 {
+        return; // paired with the bypass in `acquire_disk`
+    }
+    let next = with_io_sched(|s| s.release_disk());
+    if next != 0 {
+        wake_pid(next);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -434,6 +479,41 @@ pub fn block_current() {
     }
 }
 
+/// Block the current process until `ready()` returns true, yielding the CPU
+/// between checks. Unlike `block_current`, the decision to keep waiting is made
+/// *atomically* with marking the task Blocked (interrupts off), and `ready()` is
+/// re-evaluated after every wake — so this is immune to lost wakeups (a wake that
+/// arrives between the check and the block) and to early/spurious wakes (it
+/// sleeps again while `ready()` is still false). The disk driver uses it to wait
+/// on a real DMA completion (the device-written status byte) rather than on the
+/// mere fact of being woken, which previously let a sector write return before it
+/// had committed. Restores IF=0 on return (the caller is a syscall handler).
+pub fn block_current_until(ready: impl Fn() -> bool) {
+    unsafe {
+        let cur = (&raw const CURRENT).read();
+        loop {
+            // Check the completion condition and decide to block in one
+            // interrupts-off step: a completion IRQ can't slip in between.
+            let done = interrupts::without_interrupts(|| {
+                if ready() {
+                    true
+                } else {
+                    (*tcbs().add(cur)).state = RunState::Blocked;
+                    false
+                }
+            });
+            if done {
+                interrupts::disable();
+                return;
+            }
+            // Yield until something wakes us, then loop to re-check `ready()`.
+            while (*tcbs().add(cur)).state == RunState::Blocked {
+                interrupts::wait_for_interrupt_enabled();
+            }
+        }
+    }
+}
+
 /// Wake the (Blocked) task whose process pid is `pid`, marking it Runnable so the
 /// scheduler will pick it again. Single-writer-ish (called from the device IRQ to
 /// wake a process blocked on I/O, or from a waker); a no-op if no such Blocked
@@ -631,6 +711,8 @@ pub fn init() {
     unsafe {
         let p = &raw mut SCHED;
         *p = Some(Scheduler::__create());
+        let q = &raw mut IO_SCHED;
+        *q = Some(IoScheduler::__create());
     }
     init_boot();
 }

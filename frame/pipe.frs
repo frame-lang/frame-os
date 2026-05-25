@@ -1,0 +1,81 @@
+// frame/pipe.frs
+//
+// Pipe — the lifecycle of one anonymous pipe (S6). The *writer presence* is the
+// state, because it changes what a read on an empty pipe means: while a writer
+// is still open, more bytes may yet arrive (a reader must block); once every
+// writer has closed, the pipe is drained — a read past the buffered bytes is
+// end-of-file. That is genuine state-dependent dispatch, the same shape as
+// OpenFile's read/write modes, so it earns states.
+//
+// The kernel (`pipe.rs`) owns the ring buffer and does the byte copies; this
+// owns "are there still writers, and is the pipe fully closed". Reader/writer
+// reference counts live in the domain so the FSM knows when the last writer
+// closes ($Writable -> $Drained) and when both ends are gone (is_free -> the
+// kernel frees the buffer). `fork` (vfs::clone_fds) fires `*_opened` as it
+// copies a pipe fd into the child; `close` / process reap fire `*_closed`.
+//
+// State graph:
+//
+//   ┌──────────────┐  writer_closed (writers → 0)   ┌──────────────┐
+//   │  $Writable   │ ─────────────────────────────► │  $Drained    │
+//   │ has_writers  │ ◄───────────────────────────── │ read → EOF   │
+//   └──────────────┘        writer_opened           └──────────────┘
+//   (reader_opened / reader_closed adjust the reader count in both states;
+//    is_free, a query over the counts, holds in either state)
+
+@@[target("rust")]
+
+@@system Pipe {
+    interface:
+        reader_opened()
+        reader_closed()
+        writer_opened()
+        writer_closed()
+        // A read that finds the buffer empty blocks iff a writer may still
+        // write; once this is false the reader takes EOF instead.
+        has_writers(): bool = false
+        // Both ends fully closed → the kernel can free the buffer + slot.
+        is_free(): bool = self.readers <= 0 && self.writers <= 0
+
+    machine:
+        // At least one writer is open: an empty read should block (more may come).
+        $Writable {
+            reader_opened() {
+                self.readers += 1;
+            }
+            writer_opened() {
+                self.writers += 1;
+            }
+            reader_closed() {
+                self.readers -= 1;
+            }
+            writer_closed() {
+                self.writers -= 1;
+                if self.writers <= 0 {
+                    -> $Drained
+                }
+            }
+            has_writers(): bool {
+                @@:(true)
+            }
+        }
+
+        // All writers have closed: reads drain the remaining bytes, then EOF.
+        // (`has_writers` keeps its default `false` here.)
+        $Drained {
+            reader_opened() {
+                self.readers += 1;
+            }
+            reader_closed() {
+                self.readers -= 1;
+            }
+            writer_opened() {
+                self.writers += 1;
+                -> $Writable
+            }
+        }
+
+    domain:
+        readers: i32 = 1
+        writers: i32 = 1
+}

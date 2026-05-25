@@ -81,6 +81,17 @@ fn open_out(path: &[u8], append: bool) -> u64 {
 fn dup2(oldfd: u64, newfd: u64) -> u64 {
     unsafe { syscall3(22, oldfd, newfd, 0) }
 }
+/// pipe (#23): create an anonymous pipe → (read_fd, write_fd), or None on
+/// failure. The kernel writes the two fds into the array we pass.
+fn pipe() -> Option<(u64, u64)> {
+    let mut fds = [0u64; 2];
+    let r = unsafe { syscall3(23, fds.as_mut_ptr() as u64, 0, 0) };
+    if r == u64::MAX {
+        None
+    } else {
+        Some((fds[0], fds[1]))
+    }
+}
 fn read(fd: u64, buf: &mut [u8]) -> u64 {
     unsafe { syscall3(6, fd, buf.as_mut_ptr() as u64, buf.len() as u64) }
 }
@@ -133,21 +144,27 @@ fn cat(path: &str) {
 /// redirected fd table is inherited across exec (per-process fds, S5). Error
 /// messages use `write_char` (#0), which always reaches the console, so they're
 /// visible even when stdout is redirected.
-fn run_external(toks: &[String], redir_in: &Option<String>, redir_out: &Option<(String, bool)>) {
+/// Build a packed argv for `toks`: `argv[0]` is the resolved disk path
+/// (`/bin/<cmd>` unless `cmd` is absolute), followed by the remaining tokens
+/// verbatim, each NUL-terminated. Returns (packed bytes, argc).
+fn build_argv(toks: &[String]) -> (Vec<u8>, u64) {
     let cmd = toks[0].as_str();
-    // argv[0]: the resolved path (the program name, Unix-style).
     let mut argv: Vec<u8> = Vec::new();
     if !cmd.starts_with('/') {
         argv.extend_from_slice(b"/bin/");
     }
     argv.extend_from_slice(cmd.as_bytes());
     argv.push(0);
-    // argv[1..]: the remaining tokens, verbatim.
     for t in &toks[1..] {
         argv.extend_from_slice(t.as_bytes());
         argv.push(0);
     }
-    let argc = toks.len() as u64;
+    (argv, toks.len() as u64)
+}
+
+fn run_external(toks: &[String], redir_in: &Option<String>, redir_out: &Option<(String, bool)>) {
+    let cmd = toks[0].as_str();
+    let (argv, argc) = build_argv(toks);
 
     if fork() == 0 {
         // Child. Apply input redirection (`< file`) onto fd 0.
@@ -184,6 +201,48 @@ fn run_external(toks: &[String], redir_in: &Option<String>, redir_out: &Option<(
         // Parent (the shell): reap the child, then loop back to the prompt.
         wait();
     }
+}
+
+/// Run `left | right`: connect left's stdout to right's stdin through a pipe
+/// (S6). Fork the writer (stdout → pipe write end) and the reader (stdin → pipe
+/// read end); the parent closes *both* pipe ends — otherwise the reader never
+/// sees EOF, since the shell would still count as a writer — and reaps both.
+/// Both sides are external programs (builtins aren't piped).
+fn run_pipeline(left: &[String], right: &[String]) {
+    let (lv, lc) = build_argv(left);
+    let (rv, rc) = build_argv(right);
+    let Some((rfd, wfd)) = pipe() else {
+        print(b"ish: pipe failed\n");
+        return;
+    };
+    // Writer: stdout → pipe write end.
+    if fork() == 0 {
+        dup2(wfd, 1);
+        close(rfd);
+        close(wfd);
+        exec_argv(&lv, lc);
+        print(b"ish: command not found: ");
+        print(left[0].as_bytes());
+        write_char(b'\n');
+        exit(127);
+    }
+    // Reader: stdin → pipe read end.
+    if fork() == 0 {
+        dup2(rfd, 0);
+        close(rfd);
+        close(wfd);
+        exec_argv(&rv, rc);
+        print(b"ish: command not found: ");
+        print(right[0].as_bytes());
+        write_char(b'\n');
+        exit(127);
+    }
+    // Parent: drop both ends so the reader gets EOF when the writer exits, then
+    // reap both children.
+    close(rfd);
+    close(wfd);
+    wait();
+    wait();
 }
 
 /// Split tokens into (command words, input redirect, output redirect). The
@@ -231,6 +290,21 @@ fn run_line(line: &str) {
     }
     p.finalize();
     let raw: Vec<String> = p.tokens();
+    if raw.is_empty() {
+        return;
+    }
+    // Pipeline: a single `|` connects two external commands (S6). Handled before
+    // redirection/builtins — `left | right` runs both with a pipe between them.
+    if let Some(pos) = raw.iter().position(|t| t == "|") {
+        let left = &raw[..pos];
+        let right = &raw[pos + 1..];
+        if left.is_empty() || right.is_empty() {
+            print(b"ish: syntax error near '|'\n");
+        } else {
+            run_pipeline(left, right);
+        }
+        return;
+    }
     // Strip I/O redirection (`> file`, `>> file`, `< file`) from the token list;
     // it's applied (for external commands) in the forked child before exec.
     let (toks, redir_in, redir_out) = parse_redirs(&raw);
@@ -243,6 +317,7 @@ fn run_line(line: &str) {
             print(b"ish builtins: help, exit, cd [dir], pwd, clear, cat <path>...\n");
             print(b"on disk in /bin: ls, echo, rm, cp, touch, wc, head, tail, grep, date, ...\n");
             print(b"redirection (external cmds): cmd > file, cmd >> file, cmd < file\n");
+            print(b"pipes: cmd1 | cmd2 (connect cmd1's stdout to cmd2's stdin)\n");
         }
         // cd must be a builtin: it changes *this shell's* cwd (per-process in the
         // kernel). No arg → go to root.

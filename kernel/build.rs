@@ -30,6 +30,8 @@ const FRAME_SYSTEMS: &[(&str, &str)] = &[
     ("block_request", "block_request.frs"),
     ("mount", "mount.frs"),
     ("open_file", "open_file.frs"),
+    ("pipe", "pipe.frs"),
+    ("io_scheduler", "io_scheduler.frs"),
     ("arp_resolver", "arp_resolver.frs"),
     ("rx_pipeline", "rx_pipeline.frs"),
     ("udp_socket", "udp_socket.frs"),

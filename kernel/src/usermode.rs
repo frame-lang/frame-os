@@ -102,6 +102,15 @@ static mut PENDING_WAIT: bool = false;
 static mut PENDING_READLINE_BUF: u64 = 0;
 static mut PENDING_READLINE_LEN: u64 = 0;
 
+// A `read` (#6) on a pipe read end (S6) BLOCKS until data arrives or every
+// writer closes — and, like `read_line`, must not block inside the dispatcher
+// handler (the shared FSM would be parked in `$Executing`). The handler records
+// the read end fd (`u64::MAX` = none) + the user buffer + length; the blocking
+// pipe read runs in `syscall_dispatch` afterward, yielding to the writer.
+static mut PENDING_PIPEREAD_FD: u64 = u64::MAX;
+static mut PENDING_PIPEREAD_BUF: u64 = 0;
+static mut PENDING_PIPEREAD_LEN: u64 = 0;
+
 // `exec` (3/8/11) reads the program off disk — a *blocking* virtio read (B4)
 // that re-enables interrupts and yields. It must NOT run inside the dispatcher
 // handler: (1) it would block with the shared `SyscallDispatcher` parked in
@@ -349,6 +358,18 @@ extern "C" fn syscall_dispatch(frame: *mut TrapFrame) {
         f.rax = do_read_line_loop(rl_buf, rl_len);
     }
 
+    // Honor a pending pipe read AFTER the dispatcher settles (S6): block until
+    // the pipe has data or every writer has closed, then return the byte count.
+    let pr_fd = unsafe { (&raw const PENDING_PIPEREAD_FD).read() };
+    if pr_fd != u64::MAX {
+        let pr_buf = unsafe { (&raw const PENDING_PIPEREAD_BUF).read() };
+        let pr_len = unsafe { (&raw const PENDING_PIPEREAD_LEN).read() };
+        unsafe {
+            (&raw mut PENDING_PIPEREAD_FD).write(u64::MAX);
+        }
+        f.rax = do_pipe_read_loop(pr_fd, pr_buf, pr_len);
+    }
+
     // Honor a pending exit AFTER the dispatcher has returned to $Validating —
     // diverging inside the handler would leave it stuck in $Executing.
     let pending = unsafe { (&raw const PENDING_EXIT).read() };
@@ -371,11 +392,11 @@ fn proc_table() -> &'static mut ProcessTable {
 /// Validation predicate, called by the dispatcher's `$Validating` state.
 /// 0=write_char 1=exit 2=fork 3=exec(prog_id) 4=wait 5=open 6=read 7=close
 /// 8=exec(path) 9=read_line 10=brk 11=exec_argv 12=write 13=lseek 14=fstat
-/// 15=stat 16=dup 17=unlink 18=time 19=chdir 20=getcwd 21=readdir 22=dup2. (B4
-/// Step 4 added the file-I/O + exec-from-disk syscalls; 17–21 are B11-3
-/// follow-ups; 22 is the S5 redirection primitive.)
+/// 15=stat 16=dup 17=unlink 18=time 19=chdir 20=getcwd 21=readdir 22=dup2
+/// 23=pipe. (B4 Step 4 added the file-I/O + exec-from-disk syscalls; 17–21 are
+/// B11-3 follow-ups; 22 is the S5 redirection primitive; 23 is the S6 pipe.)
 pub fn is_known_syscall(num: u64) -> bool {
-    num <= 22
+    num <= 23
 }
 
 /// Block until the console has a complete line, copy it into the user buffer
@@ -392,6 +413,37 @@ fn do_read_line_loop(buf: u64, len: u64) -> u64 {
             return n as u64;
         }
         crate::interrupts::wait_for_interrupt_enabled(); // sti + hlt; RX IRQ fills the line
+    }
+}
+
+/// Record a deferred pipe read (S6): a `read` on a pipe read end that may block.
+fn record_pending_pipe_read(fd: u64, buf: u64, len: u64) {
+    unsafe {
+        (&raw mut PENDING_PIPEREAD_FD).write(fd);
+        (&raw mut PENDING_PIPEREAD_BUF).write(buf);
+        (&raw mut PENDING_PIPEREAD_LEN).write(len);
+    }
+}
+
+/// Block until pipe read-end `fd` has bytes (copy + return them) or every writer
+/// has closed (return 0 = EOF). Runs after the dispatcher settles. Waits
+/// interrupt-enabled between polls so the timer preempts and the *writer* process
+/// gets the CPU — the producer side of the pipe runs on the same single core.
+fn do_pipe_read_loop(fd: u64, buf: u64, len: u64) -> u64 {
+    let fd = fd as usize;
+    let len = len as usize;
+    loop {
+        let dst = unsafe { core::slice::from_raw_parts_mut(buf as *mut u8, len) };
+        let n = crate::vfs::read(fd, dst);
+        if n > 0 {
+            crate::interrupts::disable();
+            return n as u64;
+        }
+        if !crate::vfs::pipe_writers_open(fd) {
+            crate::interrupts::disable();
+            return 0; // empty + no writers ⇒ end-of-file
+        }
+        crate::interrupts::wait_for_interrupt_enabled(); // yield: let the writer run
     }
 }
 
@@ -580,6 +632,12 @@ pub fn perform_syscall(num: u64, a0: u64, _a1: u64) -> u64 {
             let len = arg2() as usize;
             if len == 0 {
                 0
+            } else if crate::vfs::is_pipe_read(a0 as usize) {
+                // Pipe read: may block until data arrives or every writer closes.
+                // Defer to the post-dispatch loop (like read_line) so it can yield
+                // to the writer process; the result overwrites rax there.
+                record_pending_pipe_read(a0, _a1, arg2());
+                0
             } else {
                 let buf = unsafe { core::slice::from_raw_parts_mut(_a1 as *mut u8, len) };
                 crate::vfs::read(a0 as usize, buf) as u64
@@ -717,6 +775,21 @@ pub fn perform_syscall(num: u64, a0: u64, _a1: u64) -> u64 {
             // oldfd (closing newfd first). The shell uses this to wire
             // redirection in the forked child before exec (S5).
             crate::vfs::dup2(a0 as usize, _a1 as usize).map_or(u64::MAX, |fd| fd as u64)
+        }
+        23 => {
+            // pipe(fds_ptr=a0) → 0, writing [read_fd, write_fd] as two u64 to the
+            // user array; u64::MAX if the pipe pool or fd table is exhausted (S6).
+            match crate::vfs::make_pipe() {
+                Some((r, w)) => {
+                    let arr = a0 as *mut u64;
+                    unsafe {
+                        arr.write(r as u64);
+                        arr.add(1).write(w as u64);
+                    }
+                    0
+                }
+                None => u64::MAX,
+            }
         }
         _ => u64::MAX, // unreachable: validated by is_known_syscall
     }

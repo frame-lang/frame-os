@@ -12,7 +12,7 @@
 // `write_sector`'s wait loop), reading the used ring and driving the
 // `BlockRequest` Frame system to $Complete/$Error.
 
-use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use core::sync::atomic::{AtomicU32, Ordering};
 
 use crate::frame_systems::BlockRequest;
 use crate::{frames, interrupts, io, pci, pic, sched, serial};
@@ -79,8 +79,9 @@ static mut DEV: Device = Device {
     present: false,
 };
 
-// Posted by the IRQ handler, drained by the wait loop.
-static IRQ_PENDING: AtomicBool = AtomicBool::new(false);
+// (The completion signal is the device-written status byte in the scratch
+// buffer, polled by `wait_and_drain`; the IRQ's only job is to wake a blocked
+// waiter promptly via `DISK_WAITER`.)
 
 fn dev() -> &'static mut Device {
     let p = &raw mut DEV;
@@ -212,13 +213,23 @@ pub fn on_irq() {
     let d = dev();
     if d.present {
         let _ = io::inb(d.io_base + R_ISR); // read-to-ack
-        IRQ_PENDING.store(true, Ordering::SeqCst);
         let waiter = DISK_WAITER.swap(0, Ordering::SeqCst);
         if waiter != 0 {
             sched::wake_pid(waiter);
         }
     }
 }
+
+// Disk transaction serialization (S6): the driver is single-flight — one shared
+// scratch buffer (header/data/status) and a single completion `DISK_WAITER`.
+// That holds when only one process does disk I/O at a time (sequential shell
+// commands), but NOT once two run concurrently (a pipeline forks two children
+// that both `exec`, reading their ELFs at once); overlapping transactions would
+// clobber the shared scratch buffer. `read_sector`/`write_sector` therefore hold
+// the disk engine for the whole transaction via the `IoScheduler` supervisor
+// (`sched::acquire_disk`/`release_disk`): a process that finds it busy is queued
+// and blocks, and the holder hands off to the next on release. The sequencing
+// (owner, queue, hand-off) lives in that FSM; here we just bracket the txn.
 
 /// Submit a 3-descriptor request (header, data, status) for `sector` and ring
 /// the doorbell. `write` selects BLK_T_OUT (memory → device) vs BLK_T_IN.
@@ -258,30 +269,47 @@ unsafe fn submit(sector: u64, write: bool) {
     io::outw(d.io_base + R_QUEUE_NOTIFY, 0);
 }
 
-/// Wait (interrupts enabled) for the completion IRQ to post, then drain the
-/// used ring and read the device status byte (0 = OK).
+/// Wait for the in-flight request to complete, then return the device status
+/// byte (0 = OK).
+///
+/// The completion signal is the **used-ring index** advancing — NOT the status
+/// byte. Virtio only guarantees that the device has written *all* of a request's
+/// buffers (data + status) once it bumps `used.idx`; the order in which the
+/// individual buffers are written is unspecified. Polling the status byte alone
+/// can therefore observe the status before the data DMA has landed — harmless for
+/// a one-sector read, but tcc's heavy multi-sector reads occasionally got stale
+/// data, producing a corrupt/missing `/out.elf`. Waiting on `used.idx` (then
+/// reading status) is the spec-correct, race-free completion test, and — polled
+/// via `block_current_until`, re-checked after every wake — it's also immune to a
+/// lost/early wakeup (the bug that intermittently dropped the S5 redirect's
+/// directory-entry write). Single-flight (the IoScheduler serializes whole
+/// transactions), so `used.idx` advances exactly one per completed request.
 fn wait_and_drain() -> u8 {
-    IRQ_PENDING.store(false, Ordering::SeqCst);
+    let d = dev();
+    let status_ptr = (d.scratch_virt + OFF_STATUS) as *const u8;
+    let used_idx_ptr = unsafe { (used_base() as *const u8).add(2) as *const u16 };
+    let start = d.last_used; // device's used.idx before this request
+    let done = move || unsafe { core::ptr::read_volatile(used_idx_ptr) } != start;
     let pid = sched::current_pid();
     if sched::is_preemption_active() && pid != 0 {
-        // B8 blocking I/O: a scheduled process blocks (yields the CPU) until the
-        // completion IRQ wakes it (`on_irq` → `wake_pid`), instead of busy-waiting.
+        // Blocking I/O: yield until the DMA completion. `on_irq` wakes us promptly
+        // via DISK_WAITER, but correctness comes from `block_current_until`
+        // re-checking `used.idx` — a wake can't make us return before completion.
         DISK_WAITER.store(pid, Ordering::SeqCst);
-        sched::block_current();
+        sched::block_current_until(done);
         DISK_WAITER.store(0, Ordering::SeqCst);
     } else {
         // Boot / non-process context (no scheduler yet): busy-wait, interrupts on.
         interrupts::enable();
-        while !IRQ_PENDING.load(Ordering::SeqCst) {
+        while !done() {
             interrupts::wait_for_interrupt();
         }
         interrupts::disable();
     }
-    let d = dev();
-    // Advance our used cursor past the completion(s).
-    let used_idx = unsafe { (used_base().add(2) as *const u16).read() };
-    d.last_used = used_idx;
-    unsafe { ((d.scratch_virt + OFF_STATUS) as *const u8).read() }
+    // The request is fully written (used.idx advanced); record the new cursor and
+    // read the now-valid status byte.
+    d.last_used = unsafe { core::ptr::read_volatile(used_idx_ptr) };
+    unsafe { core::ptr::read_volatile(status_ptr) }
 }
 
 /// Read one 512-byte sector into `out`. Returns true on success. Drives a
@@ -290,6 +318,7 @@ pub fn read_sector(sector: u64, out: &mut [u8; SECTOR_SIZE]) -> bool {
     if !dev().present {
         return false;
     }
+    sched::acquire_disk(); // serialize: hold the single-flight engine for this whole txn
     let mut br = BlockRequest::__create();
     br.submit(); // $Queued → $InFlight
     unsafe { submit(sector, false) };
@@ -299,7 +328,7 @@ pub fn read_sector(sector: u64, out: &mut [u8; SECTOR_SIZE]) -> bool {
     } else {
         br.fail();
     }
-    if br.is_complete() {
+    let ok = if br.is_complete() {
         unsafe {
             core::ptr::copy_nonoverlapping(
                 (dev().scratch_virt + OFF_DATA) as *const u8,
@@ -310,7 +339,9 @@ pub fn read_sector(sector: u64, out: &mut [u8; SECTOR_SIZE]) -> bool {
         true
     } else {
         false
-    }
+    };
+    sched::release_disk();
+    ok
 }
 
 /// Write one 512-byte sector from `data`. Returns true on success.
@@ -318,6 +349,7 @@ pub fn write_sector(sector: u64, data: &[u8; SECTOR_SIZE]) -> bool {
     if !dev().present {
         return false;
     }
+    sched::acquire_disk(); // serialize: hold the single-flight engine for this whole txn
     let mut br = BlockRequest::__create();
     br.submit();
     unsafe {
@@ -334,7 +366,9 @@ pub fn write_sector(sector: u64, data: &[u8; SECTOR_SIZE]) -> bool {
     } else {
         br.fail();
     }
-    br.is_complete()
+    let ok = br.is_complete();
+    sched::release_disk();
+    ok
 }
 
 /// B4 Step 1 demo: init the device, write a known pattern to a sector, read it

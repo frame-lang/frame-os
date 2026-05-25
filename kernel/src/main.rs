@@ -56,6 +56,7 @@ mod pci;
 mod pcsched;
 mod percpu;
 mod pic;
+mod pipe;
 mod pit;
 mod reactor;
 mod rtc;

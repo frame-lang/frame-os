@@ -1,0 +1,92 @@
+// frame/io_scheduler.frs
+//
+// IoScheduler — the kernel's single authority for blocking-I/O *sequencing* (S6
+// follow-up). Stateful coordination kept drifting out of sync when it lived in
+// scattered native flags (a disk-busy bool, a waiter array, per-syscall PENDING_*
+// statics), producing lost-wakeup / early-return / single-flight-clobber bugs.
+// This supervisor owns that sequencing as explicit states + queues so it is
+// correct by construction.
+//
+// Scope (built out incrementally): the genuinely *serialized* resource — the
+// single-flight virtio-blk engine — is the stateful core ($Idle/$Busy), since
+// `acquire` does different things by mode (grant vs enqueue). Reader/waiter
+// FIFOs for the other blocking paths (pipe-read, console read_line, wait())
+// live in the domain and are added as those paths migrate.
+//
+// Native/Frame split (load-bearing): this FSM is touched ONLY from syscall /
+// drained context, never an ISR (Frame dispatch is non-reentrant — the project's
+// standing rule). The actual TCB block/unblock is native (`block_current_until` /
+// `wake_pid`); IRQ-sourced wakes (disk *completion*, console RX) stay native
+// shims that wake a cached pid. So this owns the *logic* (who holds the engine,
+// who's queued, who's next); native owns the *mechanism* (mark Blocked, flip
+// Runnable, DMA).
+//
+// Disk-engine state graph:
+//
+//   ┌─────────┐  acquire(pid)  [grant: owner=pid]   ┌──────────┐
+//   │ $Idle   │ ─────────────────────────────────► │  $Busy   │
+//   │         │ ◄───────────────────────────────── │ owner set│
+//   └─────────┘  release() when the queue is empty  └──────────┘
+//      ▲ acquire(pid) while $Busy → enqueue pid (stay $Busy)        │
+//      └──── release() with a queued waiter → hand off to next (stay $Busy)
+
+@@[target("rust")]
+
+@@system IoScheduler {
+    interface:
+        // Disk single-flight engine. `acquire` returns the pid granted the engine
+        // now (== pid if it was idle), or 0 if the caller was enqueued and must
+        // block until it becomes the owner. `release` returns the next owner's
+        // pid to wake (0 if the engine went idle).
+        acquire_disk(pid: u32): u32 = 0
+        release_disk(): u32 = 0
+        disk_owner(pid: u32): bool = self.owner == pid
+
+    machine:
+        $Idle {
+            acquire_disk(pid: u32): u32 {
+                self.owner = pid;
+                @@:(pid)
+                -> $Busy
+            }
+        }
+
+        $Busy {
+            acquire_disk(pid: u32): u32 {
+                // Engine in use — queue this requester; it blocks until handed off.
+                self.disk_q.push_back(pid);
+                @@:(0)
+            }
+            release_disk(): u32 {
+                // Hand the engine to the next waiter (sets `owner`), or 0 if none.
+                let next = self.hand_off();
+                @@:(next)
+                if next == 0 {
+                    -> $Idle
+                }
+            }
+            disk_owner(pid: u32): bool {
+                @@:(self.owner == pid)
+            }
+        }
+
+    actions:
+        // Pop the next queued disk waiter, making it the new owner; returns its
+        // pid, or 0 (and clears the owner) if the queue is empty.
+        hand_off(): u32 {
+            match self.disk_q.pop_front() {
+                Some(next) => {
+                    self.owner = next;
+                    return next;
+                }
+                None => {
+                    self.owner = 0;
+                    return 0;
+                }
+            }
+        }
+
+    domain:
+        owner: u32 = 0
+        disk_q: alloc::collections::VecDeque<u32> = alloc::collections::VecDeque::new()
+}

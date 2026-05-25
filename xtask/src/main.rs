@@ -1484,6 +1484,16 @@ fn run_console_test() -> Result<()> {
             .context("write redirection")?;
         stdin.flush().ok();
         wait_for_output(&buf, "2 2 20", 45)?; // wc < /r.txt after > then >>
+                                              // S6 pipe: connect echo's stdout to wc's stdin. `echo pipe one two` writes
+                                              // "pipe one two\n" (13 bytes, 3 words, 1 line) into the pipe; wc reads it
+                                              // from stdin and prints "1 3 13" — which is not in the typed command, so it
+                                              // only appears if the pipe actually carried the bytes between the two procs.
+        eprintln!("console-test: typing `echo pipe one two | wc` (pipe)");
+        stdin
+            .write_all(b"echo pipe one two | wc\n")
+            .context("write pipe")?;
+        stdin.flush().ok();
+        wait_for_output(&buf, "1 3 13", 45)?; // wc counting echo's piped stdout
                                               // B9-2: argv reaches the program. Type a command WITH arguments; argtest
                                               // echoes argc + each argv string, so we can assert the args arrived.
         eprintln!("console-test: typing `/bin/argtest alpha beta`");

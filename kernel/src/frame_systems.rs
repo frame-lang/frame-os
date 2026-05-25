@@ -61,6 +61,13 @@ include!(concat!(env!("OUT_DIR"), "/block_request.rs"));
 include!(concat!(env!("OUT_DIR"), "/mount.rs"));
 // OpenFile (B4 Step 3): per-fd lifecycle (access mode as state). Pure.
 include!(concat!(env!("OUT_DIR"), "/open_file.rs"));
+// Pipe (S6): per-pipe lifecycle (writer presence as state → read blocks vs EOF).
+// Reader/writer counts live in its domain; `pipe.rs` owns the ring buffer. Pure.
+include!(concat!(env!("OUT_DIR"), "/pipe.rs"));
+// IoScheduler (S6 follow-up): the single supervisor that sequences blocking I/O.
+// Owns the single-flight disk engine's access state ($Idle/$Busy) + waiter queue;
+// `sched.rs` drives it (acquire→block-until-owner, release→hand-off+wake).
+include!(concat!(env!("OUT_DIR"), "/io_scheduler.rs"));
 // ArpResolver (B5 Step 2a): one IPv4→MAC resolution's lifecycle. Its actions
 // call crate::net::{arp_send_request,arp_arm_timer,arp_on_failed}; the enter
 // handler arms the retransmit timer (the native timer-wheel pattern).
