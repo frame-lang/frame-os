@@ -10,7 +10,7 @@ Frame OS ships in two flavors that share most of their source:
 
 **Hosted mode** — Frame OS as a state-machine shell that runs as a normal application on Linux, macOS, and Windows. `cargo run` launches it. It looks like a small Unix shell, parses commands, runs builtins and external programs, handles signals. The interesting part isn't what it does; it's that every piece of behavior is a Frame state machine whose graph you can render with `framec -l graphviz`.
 
-**Bare-metal mode** — Frame OS as a real kernel that boots in QEMU and on real hardware (Pi Pico, Pi 4/5). It manages tasks, drives a serial console, dispatches syscalls, and loads programs. The Frame systems describe the kernel's control flow; native Rust handles the unsafe primitives (page tables, context switches, register pokes).
+**Bare-metal mode** — Frame OS as a real x86-64 kernel that boots under UEFI in QEMU. It manages tasks, drives a serial console, dispatches syscalls, and loads programs. The Frame systems describe the kernel's control flow; native Rust handles the unsafe primitives (page tables, context switches, register pokes). (Raspberry Pi Pico / Pi 4/5 are *planned* future ports — not yet implemented; see [`docs/portability.md`](docs/portability.md).)
 
 Same `.frs` source files compile to both. The state machines for `Shell` and `Parser` are reused between modes (with different action implementations — `std::process::Command` vs. the kernel's task interface). Hosted-only systems include `JobControl` and `Job`. Bare-metal-only systems include `Kernel`, `Scheduler`, `Task` / `Process`, `ProcessTable`, `SyscallDispatcher`, `ElfLoader`, and the drivers.
 
@@ -43,14 +43,20 @@ cargo build --bin frame-os-shell
 # Run hosted-mode Frame OS
 cargo run --bin frame-os-shell
 
-# Run bare-metal Frame OS in QEMU
+# Run bare-metal Frame OS in QEMU (x86-64 UEFI)
 cargo xtask qemu
 
-# Flash bare-metal Frame OS to a Pi Pico
-cargo xtask pico-flash --port /dev/ttyACM0
+# Headless boot + the full smoke suite (what CI runs)
+cargo xtask qemu-test
 ```
 
+> Bare-metal mode targets **x86-64 under UEFI** and runs in QEMU. The
+> Raspberry Pi / AArch64 targets in [`docs/portability.md`](docs/portability.md)
+> are planned future ports — there is no `pico-flash` step yet.
+
 `framec` must be installed before any `cargo build` step that touches Frame source — the build scripts shell out to it. `cargo xtask install-tools` handles the rest (Rust targets, optional QEMU on systems where it's straightforward to install).
+
+**Full per-platform setup + test instructions (Linux / macOS / Windows):** see [`docs/INSTALL.md`](docs/INSTALL.md).
 
 **Dev container (recommended for bare-metal work).** The bare-metal track builds and runs inside a Linux container — source stays on the host, builds/tests/QEMU run in Docker. This gives dev/CI parity and a working Linux TAP path for the networking tests (which macOS can't provide). See [`docker/README.md`](docker/README.md):
 
@@ -78,7 +84,7 @@ See [`docs/roadmap.md`](docs/roadmap.md) for the milestone-by-milestone plan and
 
 **Hosted-mode runtime:** any platform where you can `cargo run` — same as the build host list above. The Frame OS shell is a single executable.
 
-**Bare-metal runtime:** QEMU x86_64 (primary development target), Raspberry Pi Pico (Tier-1 microcontroller variant), Raspberry Pi 4/5 (Tier-3 application-processor target). Real Mac hardware is *not* a bare-metal runtime target — Apple Silicon boot reverse engineering is out of scope. See [`docs/portability.md`](docs/portability.md) for details on each.
+**Bare-metal runtime:** QEMU x86_64 under UEFI is the implemented target. Raspberry Pi Pico (Tier-1 microcontroller variant) and Raspberry Pi 4/5 (Tier-3 application-processor target) are *planned* future ports — not yet implemented. Real Mac hardware is *not* a bare-metal runtime target — Apple Silicon boot reverse engineering is out of scope. See [`docs/portability.md`](docs/portability.md) for details on each.
 
 ## Project structure
 
