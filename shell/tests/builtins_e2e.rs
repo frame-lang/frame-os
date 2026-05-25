@@ -46,10 +46,18 @@ fn pwd_prints_current_directory() {
     let tmp = TempDir::new().expect("temp dir");
     // canonicalize matches what the shell internally stores (env::current_dir
     // returns the canonical form on most platforms; on macOS /tmp -> /private/tmp).
+    // On Windows, canonicalize() yields a `\\?\` verbatim path while the shell
+    // prints the plain env::current_dir() form — strip the prefix so the match
+    // holds cross-platform (no-op on Unix, where the prefix is absent).
     let canonical = tmp.path().canonicalize().expect("canonicalize tempdir");
+    let full = canonical.display().to_string();
+    let expected = full
+        .strip_prefix(r"\\?\")
+        .unwrap_or(full.as_str())
+        .to_string();
     shell_at(tmp.path(), "pwd\nexit\n")
         .success()
-        .stdout(contains(canonical.display().to_string()));
+        .stdout(contains(expected));
 }
 
 // ---------------------------------------------------------------------------
