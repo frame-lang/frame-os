@@ -44,20 +44,22 @@ fn shell_at(cwd: &Path, input: &str) -> assert_cmd::assert::Assert {
 #[test]
 fn pwd_prints_current_directory() {
     let tmp = TempDir::new().expect("temp dir");
-    // canonicalize matches what the shell internally stores (env::current_dir
-    // returns the canonical form on most platforms; on macOS /tmp -> /private/tmp).
-    // On Windows, canonicalize() yields a `\\?\` verbatim path while the shell
-    // prints the plain env::current_dir() form — strip the prefix so the match
-    // holds cross-platform (no-op on Unix, where the prefix is absent).
-    let canonical = tmp.path().canonicalize().expect("canonicalize tempdir");
-    let full = canonical.display().to_string();
-    let expected = full
-        .strip_prefix(r"\\?\")
-        .unwrap_or(full.as_str())
-        .to_string();
+    // Assert that pwd prints a path ending in this tempdir, matching on its
+    // unique (random) final component rather than the full path. A full-path
+    // match is brittle cross-platform: on Windows env::current_dir() can return
+    // 8.3 short names for parent dirs (e.g. runneradmin -> RUNNER~1) and differs
+    // from canonicalize()'s long/`\\?\` form, while on macOS /tmp -> /private/tmp.
+    // The leaf component is identical in every form, so it's the robust anchor —
+    // and being random, it can't spuriously match anything else.
+    let leaf = tmp
+        .path()
+        .file_name()
+        .expect("tempdir has a final component")
+        .to_string_lossy()
+        .into_owned();
     shell_at(tmp.path(), "pwd\nexit\n")
         .success()
-        .stdout(contains(expected));
+        .stdout(contains(leaf));
 }
 
 // ---------------------------------------------------------------------------
