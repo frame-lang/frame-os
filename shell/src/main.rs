@@ -23,15 +23,19 @@
 // state machine decides what each event means; this loop just routes the
 // events.
 
+use std::io::IsTerminal;
 use std::process::ExitCode;
 
 use frame_os_shell::{signals, Shell};
 use rustyline::error::ReadlineError;
 use rustyline::DefaultEditor;
 
+const PROMPT: &str = "$> ";
+
 fn main() -> ExitCode {
     // Banner — printed once at startup, before the Shell prints its first
-    // prompt. (Shell::__create() runs $Prompting.$> which prints "frame-os> ".)
+    // prompt. (Shell::__create() runs $Prompting.$>, which on non-TTY input
+    // prints the "$> " prompt; on a TTY rustyline renders it — see below.)
     println!("Frame OS shell — H3");
     println!("type 'exit' or 'quit' to leave (Ctrl-D also exits; Ctrl-C cancels current input)");
     println!("trailing `&` runs a command in the background");
@@ -54,20 +58,27 @@ fn main() -> ExitCode {
         }
     };
 
+    // On an interactive TTY, rustyline renders the prompt (so it survives the
+    // editor's line redraws — a prompt printed separately gets erased on the
+    // first refresh). For non-TTY (piped) input rustyline draws nothing, so the
+    // Shell's print_prompt() action emits "$> " to stdout instead; pass "" here
+    // to avoid double-printing. Either way the prompt is "$> ".
+    let prompt = if std::io::stdin().is_terminal() {
+        PROMPT
+    } else {
+        ""
+    };
+
     while !shell.is_done() {
-        // Pass empty prompt to rustyline — the Shell's print_prompt() action
-        // already wrote "frame-os> " to stdout. Rustyline still handles line
-        // editing, history, and Ctrl-C / Ctrl-D interception.
-        //
         // H2 split: Ctrl-C and Ctrl-D map to different Shell events. Ctrl-C
         // is "abort this input" (interrupt — stays at the prompt); Ctrl-D
         // is "I'm done" (eof — transitions to $Exiting).
-        match editor.readline("") {
+        match editor.readline(prompt) {
             Ok(line) => {
                 shell.line(&line);
             }
             Err(ReadlineError::Interrupted) => {
-                // Newline so "frame-os> " isn't glued to the half-typed line.
+                // Newline so the next "$> " prompt isn't glued to the half-typed line.
                 println!();
                 shell.interrupt();
             }

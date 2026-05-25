@@ -43,9 +43,9 @@ fn prints_banner_on_startup() {
 
 #[test]
 fn prints_prompt() {
-    shell_with_input("exit\n")
-        .success()
-        .stdout(contains("frame-os>"));
+    // Piped (non-TTY) input: the Shell's print_prompt() emits "$> " to stdout
+    // (on a TTY, rustyline renders it instead — see shell/src/main.rs).
+    shell_with_input("exit\n").success().stdout(contains("$>"));
 }
 
 #[test]

@@ -221,9 +221,16 @@
 
     actions:
         print_prompt() {
-            use std::io::Write;
-            print!("frame-os> ");
-            let _ = std::io::stdout().flush();
+            use std::io::{IsTerminal, Write};
+            // On an interactive TTY the line editor (rustyline) renders the
+            // prompt, so it survives the editor's line redraws — printing it
+            // here too would just be erased on the first refresh (the prompt
+            // would flash and vanish). Only emit it ourselves for non-TTY
+            // (piped) input, where rustyline reads without drawing a prompt.
+            if !std::io::stdin().is_terminal() {
+                print!("$> ");
+                let _ = std::io::stdout().flush();
+            }
         }
 
         print_goodbye() {
