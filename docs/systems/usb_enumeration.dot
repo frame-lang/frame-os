@@ -1,0 +1,84 @@
+digraph UsbEnumeration {
+    compound=true
+    node [color="deepskyblue4" style="rounded, filled" fillcolor="azure"]
+    edge[color="red"]
+
+    Entry[width=0.2 shape="circle" style="filled" fillcolor="black" label=""]
+    Entry -> Powered
+
+    Failed [label = <
+        <table CELLBORDER="0" CELLPADDING="5" style="rounded">
+            <tr><td><b>Failed</b></td></tr>
+            <hr/>
+            <tr><td align="left"><font point-size="10">
+is_failed()<br ALIGN="LEFT"/>state()<br ALIGN="LEFT"/>
+            </font></td></tr>
+        </table>
+    > margin=0 shape=none]
+    subgraph cluster_Enumerating {
+        label = <
+            <table cellborder="0" border="0">
+                <tr><td>Enumerating</td></tr>
+                <hr/>
+                <tr><td align="left"><font point-size="10">
+fail()<br ALIGN="LEFT"/>
+                </font></td></tr>
+            </table>
+        >
+        style = rounded
+        Enumerating [shape="point" width="0"]
+
+        Powered [label = <
+            <table CELLBORDER="0" CELLPADDING="5" style="rounded">
+                <tr><td><b>Powered</b></td></tr>
+                <hr/>
+                <tr><td align="left"><font point-size="10">
+$&gt;()<br ALIGN="LEFT"/>slot_enabled(slot: u8)<br ALIGN="LEFT"/>state()<br ALIGN="LEFT"/>
+                </font></td></tr>
+            </table>
+        > margin=0 shape=none]
+        SlotEnabled [label = <
+            <table CELLBORDER="0" CELLPADDING="5" style="rounded">
+                <tr><td><b>SlotEnabled</b></td></tr>
+                <hr/>
+                <tr><td align="left"><font point-size="10">
+$&gt;()<br ALIGN="LEFT"/>addressed()<br ALIGN="LEFT"/>state()<br ALIGN="LEFT"/>
+                </font></td></tr>
+            </table>
+        > margin=0 shape=none]
+        AddressAssigned [label = <
+            <table CELLBORDER="0" CELLPADDING="5" style="rounded">
+                <tr><td><b>AddressAssigned</b></td></tr>
+                <hr/>
+                <tr><td align="left"><font point-size="10">
+$&gt;()<br ALIGN="LEFT"/>device_described()<br ALIGN="LEFT"/>is_addressed()<br ALIGN="LEFT"/>state()<br ALIGN="LEFT"/>
+                </font></td></tr>
+            </table>
+        > margin=0 shape=none]
+        DeviceDescribed [label = <
+            <table CELLBORDER="0" CELLPADDING="5" style="rounded">
+                <tr><td><b>DeviceDescribed</b></td></tr>
+                <hr/>
+                <tr><td align="left"><font point-size="10">
+$&gt;()<br ALIGN="LEFT"/>configured()<br ALIGN="LEFT"/>state()<br ALIGN="LEFT"/>
+                </font></td></tr>
+            </table>
+        > margin=0 shape=none]
+        Configured [label = <
+            <table CELLBORDER="0" CELLPADDING="5" style="rounded">
+                <tr><td><b>Configured</b></td></tr>
+                <hr/>
+                <tr><td align="left"><font point-size="10">
+$&gt;()<br ALIGN="LEFT"/>is_configured()<br ALIGN="LEFT"/>state()<br ALIGN="LEFT"/>
+                </font></td></tr>
+            </table>
+        > margin=0 shape=none]
+    }
+
+    Powered -> SlotEnabled [label=" slot_enabled "]
+    SlotEnabled -> AddressAssigned [label=" addressed "]
+    AddressAssigned -> DeviceDescribed [label=" device_described "]
+    DeviceDescribed -> Configured [label=" configured "]
+    Enumerating -> Failed [label=" fail " ltail="cluster_Enumerating"]
+}
+

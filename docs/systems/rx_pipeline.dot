@@ -1,0 +1,86 @@
+digraph RxPipeline {
+    compound=true
+    node [color="deepskyblue4" style="rounded, filled" fillcolor="azure"]
+    edge[color="red"]
+
+    Entry[width=0.2 shape="circle" style="filled" fillcolor="black" label=""]
+    Entry -> Idle
+
+    Idle [label = <
+        <table CELLBORDER="0" CELLPADDING="5" style="rounded">
+            <tr><td><b>Idle</b></td></tr>
+            <hr/>
+            <tr><td align="left"><font point-size="10">
+deliver(pkt: crate::net::RxDescriptor)<br ALIGN="LEFT"/>
+            </font></td></tr>
+        </table>
+    > margin=0 shape=none]
+    Classifying [label = <
+        <table CELLBORDER="0" CELLPADDING="5" style="rounded">
+            <tr><td><b>Classifying</b></td></tr>
+            <hr/>
+            <tr><td align="left"><font point-size="10">
+$&gt;()<br ALIGN="LEFT"/>
+            </font></td></tr>
+        </table>
+    > margin=0 shape=none]
+    Arp [label = <
+        <table CELLBORDER="0" CELLPADDING="5" style="rounded">
+            <tr><td><b>Arp</b></td></tr>
+            <hr/>
+            <tr><td align="left"><font point-size="10">
+$&gt;()<br ALIGN="LEFT"/>
+            </font></td></tr>
+        </table>
+    > margin=0 shape=none]
+    Ipv4 [label = <
+        <table CELLBORDER="0" CELLPADDING="5" style="rounded">
+            <tr><td><b>Ipv4</b></td></tr>
+            <hr/>
+            <tr><td align="left"><font point-size="10">
+$&gt;()<br ALIGN="LEFT"/>
+            </font></td></tr>
+        </table>
+    > margin=0 shape=none]
+    Icmp [label = <
+        <table CELLBORDER="0" CELLPADDING="5" style="rounded">
+            <tr><td><b>Icmp</b></td></tr>
+            <hr/>
+            <tr><td align="left"><font point-size="10">
+$&gt;()<br ALIGN="LEFT"/>
+            </font></td></tr>
+        </table>
+    > margin=0 shape=none]
+    Udp [label = <
+        <table CELLBORDER="0" CELLPADDING="5" style="rounded">
+            <tr><td><b>Udp</b></td></tr>
+            <hr/>
+            <tr><td align="left"><font point-size="10">
+$&gt;()<br ALIGN="LEFT"/>
+            </font></td></tr>
+        </table>
+    > margin=0 shape=none]
+    Tcp [label = <
+        <table CELLBORDER="0" CELLPADDING="5" style="rounded">
+            <tr><td><b>Tcp</b></td></tr>
+            <hr/>
+            <tr><td align="left"><font point-size="10">
+$&gt;()<br ALIGN="LEFT"/>
+            </font></td></tr>
+        </table>
+    > margin=0 shape=none]
+
+    Idle -> Classifying [label=" deliver "]
+    Classifying -> Arp [label=" $> "]
+    Classifying -> Ipv4 [label=" $> "]
+    Classifying -> Idle [label=" $> "]
+    Arp -> Idle [label=" $> "]
+    Ipv4 -> Icmp [label=" $> "]
+    Ipv4 -> Tcp [label=" $> "]
+    Ipv4 -> Udp [label=" $> "]
+    Ipv4 -> Idle [label=" $> "]
+    Icmp -> Idle [label=" $> "]
+    Udp -> Idle [label=" $> "]
+    Tcp -> Idle [label=" $> "]
+}
+

@@ -188,6 +188,8 @@ const DIAGRAMS: &[(&str, &str)] = &[
     ("block_request.frs", "block_request.svg"),
     ("mount.frs", "mount.svg"),
     ("open_file.frs", "open_file.svg"),
+    ("pipe.frs", "pipe.svg"),
+    ("io_scheduler.frs", "io_scheduler.svg"),
     ("arp_resolver.frs", "arp_resolver.svg"),
     ("rx_pipeline.frs", "rx_pipeline.svg"),
     ("udp_socket.frs", "udp_socket.svg"),
@@ -210,7 +212,9 @@ fn diagrams(mode: DiagramMode) -> Result<()> {
     if !is_framec_installed() {
         bail!("framec is not installed. Run `cargo xtask install-tools` first.");
     }
-    if !is_dot_installed() {
+    // `dot` is only needed to *render* SVGs (regen). The drift check compares the
+    // GraphViz-independent DOT, so it needs framec only — no graphviz on CI.
+    if matches!(mode, DiagramMode::Regen) && !is_dot_installed() {
         bail!(
             "GraphViz `dot` is not installed. Install via your package manager \
              (e.g. `brew install graphviz`, `apt install graphviz`)."
@@ -222,53 +226,72 @@ fn diagrams(mode: DiagramMode) -> Result<()> {
     for (frs, svg) in DIAGRAMS {
         let frs_path = frame_dir.join(frs);
         let svg_path = systems_dir.join(svg);
-        let generated = generate_svg(&frs_path)?;
+        let dot_path = svg_path.with_extension("dot");
+        // The DOT is the source of truth (deterministic from the .frs); it's what
+        // we gate on. The SVG is a render committed only for docs display.
+        let dot = generate_dot(&frs_path)?;
 
         match mode {
             DiagramMode::Regen => {
-                std::fs::write(&svg_path, &generated)
+                std::fs::write(&dot_path, &dot)
+                    .with_context(|| format!("failed to write {}", dot_path.display()))?;
+                let svg = render_svg(&dot)?;
+                std::fs::write(&svg_path, &svg)
                     .with_context(|| format!("failed to write {}", svg_path.display()))?;
-                println!("wrote {}", svg_path.display());
+                println!("wrote {} + {}", dot_path.display(), svg_path.display());
             }
             DiagramMode::Check => {
-                let committed = std::fs::read(&svg_path).ok();
-                let matches = committed.as_deref() == Some(generated.as_slice());
-                if !matches {
+                let committed = std::fs::read(&dot_path).ok();
+                if committed.as_deref() == Some(dot.as_slice()) {
+                    println!("ok: {}", dot_path.display());
+                } else {
                     drift_count += 1;
                     eprintln!(
-                        "drift: {} differs from generated output for {}",
-                        svg_path.display(),
+                        "drift: {} differs from `framec {} -l graphviz`",
+                        dot_path.display(),
                         frs_path.display()
                     );
-                } else {
-                    println!("ok: {}", svg_path.display());
                 }
             }
         }
     }
 
     if matches!(mode, DiagramMode::Check) && drift_count > 0 {
-        bail!("{drift_count} diagram(s) out of date. Run `cargo xtask regen-diagrams` and commit.");
+        bail!(
+            "{drift_count} diagram(s) out of date. Run `cargo xtask regen-diagrams` and commit \
+             (the .dot is gated; the .svg is a render)."
+        );
     }
 
     Ok(())
 }
 
-fn generate_svg(frs_path: &Path) -> Result<Vec<u8>> {
-    let dot_output = Command::new("framec")
+/// Generate the GraphViz **DOT** for an `.frs` (framec's `-l graphviz` output).
+/// This is the *gated* artifact: it's a pure function of the `.frs` (and a stable
+/// framec output — verified byte-identical across framec 4.2.1↔4.2.3), so it
+/// captures the FSM's structure without depending on the GraphViz version. (The
+/// drift check compares DOT, not the rendered SVG — see `diagrams`.)
+fn generate_dot(frs_path: &Path) -> Result<Vec<u8>> {
+    let out = Command::new("framec")
         .arg(frs_path)
         .arg("-l")
         .arg("graphviz")
         .output()
         .context("failed to invoke framec")?;
-    if !dot_output.status.success() {
+    if !out.status.success() {
         bail!(
             "framec failed for {}: {}",
             frs_path.display(),
-            String::from_utf8_lossy(&dot_output.stderr)
+            String::from_utf8_lossy(&out.stderr)
         );
     }
+    Ok(out.stdout)
+}
 
+/// Render DOT to SVG via `dot -Tsvg`. The SVG is a *documentation render* only
+/// (committed for GitHub display, NOT drift-gated): its bytes depend on the
+/// GraphViz version, so byte-comparing it would pin the repo to one GraphViz.
+fn render_svg(dot: &[u8]) -> Result<Vec<u8>> {
     let mut child = Command::new("dot")
         .args(["-Tsvg"])
         .stdin(std::process::Stdio::piped())
@@ -282,7 +305,7 @@ fn generate_svg(frs_path: &Path) -> Result<Vec<u8>> {
             .as_mut()
             .ok_or_else(|| anyhow!("failed to open dot stdin"))?;
         stdin
-            .write_all(&dot_output.stdout)
+            .write_all(dot)
             .context("failed to write to dot stdin")?;
     }
     let svg_output = child.wait_with_output().context("failed to wait for dot")?;

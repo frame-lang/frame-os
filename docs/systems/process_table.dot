@@ -1,0 +1,45 @@
+digraph ProcessTable {
+    compound=true
+    node [color="deepskyblue4" style="rounded, filled" fillcolor="azure"]
+    edge[color="red"]
+
+    Entry[width=0.2 shape="circle" style="filled" fillcolor="black" label=""]
+    Entry -> HasCapacity
+
+    subgraph cluster_Managing {
+        label = <
+            <table cellborder="0" border="0">
+                <tr><td>Managing</td></tr>
+                <hr/>
+                <tr><td align="left"><font point-size="10">
+block_pid(pid: u32)<br ALIGN="LEFT"/>unblock_pid(pid: u32)<br ALIGN="LEFT"/>exit_pid(pid: u32, code: i32)<br ALIGN="LEFT"/>kill_pid(pid: u32)<br ALIGN="LEFT"/>
+                </font></td></tr>
+            </table>
+        >
+        style = rounded
+        Managing [shape="point" width="0"]
+
+        HasCapacity [label = <
+            <table CELLBORDER="0" CELLPADDING="5" style="rounded">
+                <tr><td><b>HasCapacity</b></td></tr>
+                <hr/>
+                <tr><td align="left"><font point-size="10">
+spawn()<br ALIGN="LEFT"/>reap_pid(pid: u32)<br ALIGN="LEFT"/>
+                </font></td></tr>
+            </table>
+        > margin=0 shape=none]
+        Full [label = <
+            <table CELLBORDER="0" CELLPADDING="5" style="rounded">
+                <tr><td><b>Full</b></td></tr>
+                <hr/>
+                <tr><td align="left"><font point-size="10">
+spawn()<br ALIGN="LEFT"/>reap_pid(pid: u32)<br ALIGN="LEFT"/>is_full()<br ALIGN="LEFT"/>
+                </font></td></tr>
+            </table>
+        > margin=0 shape=none]
+    }
+
+    HasCapacity -> Full [label=" spawn "]
+    Full -> HasCapacity [label=" reap_pid "]
+}
+

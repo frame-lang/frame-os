@@ -1,0 +1,46 @@
+digraph SyscallDispatcher {
+    compound=true
+    node [color="deepskyblue4" style="rounded, filled" fillcolor="azure"]
+    edge[color="red"]
+
+    Entry[width=0.2 shape="circle" style="filled" fillcolor="black" label=""]
+    Entry -> Validating
+
+    subgraph cluster_Active {
+        label = <
+            <table cellborder="0" border="0">
+                <tr><td>Active</td></tr>
+                <hr/>
+                <tr><td align="left"><font point-size="10">
+reject(code: u64)<br ALIGN="LEFT"/>
+                </font></td></tr>
+            </table>
+        >
+        style = rounded
+        Active [shape="point" width="0"]
+
+        Validating [label = <
+            <table CELLBORDER="0" CELLPADDING="5" style="rounded">
+                <tr><td><b>Validating</b></td></tr>
+                <hr/>
+                <tr><td align="left"><font point-size="10">
+request(num: u64, a0: u64, a1: u64)<br ALIGN="LEFT"/>
+                </font></td></tr>
+            </table>
+        > margin=0 shape=none]
+        Executing [label = <
+            <table CELLBORDER="0" CELLPADDING="5" style="rounded">
+                <tr><td><b>Executing</b></td></tr>
+                <hr/>
+                <tr><td align="left"><font point-size="10">
+$&gt;()<br ALIGN="LEFT"/>
+                </font></td></tr>
+            </table>
+        > margin=0 shape=none]
+    }
+
+    Validating -> Executing [label=" request "]
+    Executing -> Validating [label=" $> "]
+    Active -> Validating [label=" reject " ltail="cluster_Active"]
+}
+

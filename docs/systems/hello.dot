@@ -1,0 +1,30 @@
+digraph Hello {
+    compound=true
+    node [color="deepskyblue4" style="rounded, filled" fillcolor="azure"]
+    edge[color="red"]
+
+    Entry[width=0.2 shape="circle" style="filled" fillcolor="black" label=""]
+    Entry -> Ready
+
+    Ready [label = <
+        <table CELLBORDER="0" CELLPADDING="5" style="rounded">
+            <tr><td><b>Ready</b></td></tr>
+            <hr/>
+            <tr><td align="left"><font point-size="10">
+greet()<br ALIGN="LEFT"/>
+            </font></td></tr>
+        </table>
+    > margin=0 shape=none]
+    Greeted [label = <
+        <table CELLBORDER="0" CELLPADDING="5" style="rounded">
+            <tr><td><b>Greeted</b></td></tr>
+            <hr/>
+            <tr><td align="left"><font point-size="10">
+greeted()<br ALIGN="LEFT"/>
+            </font></td></tr>
+        </table>
+    > margin=0 shape=none]
+
+    Ready -> Greeted [label=" greet "]
+}
+

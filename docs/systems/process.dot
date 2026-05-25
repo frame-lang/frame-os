@@ -1,0 +1,76 @@
+digraph Process {
+    compound=true
+    node [color="deepskyblue4" style="rounded, filled" fillcolor="azure"]
+    edge[color="red"]
+
+    Entry[width=0.2 shape="circle" style="filled" fillcolor="black" label=""]
+    Entry -> Created
+
+    subgraph cluster_Alive {
+        label = <
+            <table cellborder="0" border="0">
+                <tr><td>Alive</td></tr>
+                <hr/>
+                <tr><td align="left"><font point-size="10">
+kill()<br ALIGN="LEFT"/>
+                </font></td></tr>
+            </table>
+        >
+        style = rounded
+        Alive [shape="point" width="0"]
+
+        Created [label = <
+            <table CELLBORDER="0" CELLPADDING="5" style="rounded">
+                <tr><td><b>Created</b></td></tr>
+                <hr/>
+                <tr><td align="left"><font point-size="10">
+make_ready()<br ALIGN="LEFT"/>
+                </font></td></tr>
+            </table>
+        > margin=0 shape=none]
+        Ready [label = <
+            <table CELLBORDER="0" CELLPADDING="5" style="rounded">
+                <tr><td><b>Ready</b></td></tr>
+                <hr/>
+                <tr><td align="left"><font point-size="10">
+block()<br ALIGN="LEFT"/>exit(code: i32)<br ALIGN="LEFT"/>is_ready()<br ALIGN="LEFT"/>state_name()<br ALIGN="LEFT"/>
+                </font></td></tr>
+            </table>
+        > margin=0 shape=none]
+        Blocked [label = <
+            <table CELLBORDER="0" CELLPADDING="5" style="rounded">
+                <tr><td><b>Blocked</b></td></tr>
+                <hr/>
+                <tr><td align="left"><font point-size="10">
+unblock()<br ALIGN="LEFT"/>is_blocked()<br ALIGN="LEFT"/>state_name()<br ALIGN="LEFT"/>
+                </font></td></tr>
+            </table>
+        > margin=0 shape=none]
+    }
+    Zombie [label = <
+        <table CELLBORDER="0" CELLPADDING="5" style="rounded">
+            <tr><td><b>Zombie</b></td></tr>
+            <hr/>
+            <tr><td align="left"><font point-size="10">
+reap()<br ALIGN="LEFT"/>is_zombie()<br ALIGN="LEFT"/>state_name()<br ALIGN="LEFT"/>
+            </font></td></tr>
+        </table>
+    > margin=0 shape=none]
+    Reaped [label = <
+        <table CELLBORDER="0" CELLPADDING="5" style="rounded">
+            <tr><td><b>Reaped</b></td></tr>
+            <hr/>
+            <tr><td align="left"><font point-size="10">
+is_reaped()<br ALIGN="LEFT"/>state_name()<br ALIGN="LEFT"/>
+            </font></td></tr>
+        </table>
+    > margin=0 shape=none]
+
+    Created -> Ready [label=" make_ready "]
+    Ready -> Blocked [label=" block "]
+    Ready -> Zombie [label=" exit "]
+    Blocked -> Ready [label=" unblock "]
+    Alive -> Zombie [label=" kill " ltail="cluster_Alive"]
+    Zombie -> Reaped [label=" reap "]
+}
+

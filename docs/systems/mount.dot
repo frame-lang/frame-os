@@ -1,0 +1,52 @@
+digraph Mount {
+    compound=true
+    node [color="deepskyblue4" style="rounded, filled" fillcolor="azure"]
+    edge[color="red"]
+
+    Entry[width=0.2 shape="circle" style="filled" fillcolor="black" label=""]
+    Entry -> Unmounted
+
+    Unmounted [label = <
+        <table CELLBORDER="0" CELLPADDING="5" style="rounded">
+            <tr><td><b>Unmounted</b></td></tr>
+            <hr/>
+            <tr><td align="left"><font point-size="10">
+begin_mount()<br ALIGN="LEFT"/>
+            </font></td></tr>
+        </table>
+    > margin=0 shape=none]
+    Mounting [label = <
+        <table CELLBORDER="0" CELLPADDING="5" style="rounded">
+            <tr><td><b>Mounting</b></td></tr>
+            <hr/>
+            <tr><td align="left"><font point-size="10">
+mounted_ok()<br ALIGN="LEFT"/>mount_failed()<br ALIGN="LEFT"/>
+            </font></td></tr>
+        </table>
+    > margin=0 shape=none]
+    Mounted [label = <
+        <table CELLBORDER="0" CELLPADDING="5" style="rounded">
+            <tr><td><b>Mounted</b></td></tr>
+            <hr/>
+            <tr><td align="left"><font point-size="10">
+begin_unmount()<br ALIGN="LEFT"/>is_mounted()<br ALIGN="LEFT"/>
+            </font></td></tr>
+        </table>
+    > margin=0 shape=none]
+    Unmounting [label = <
+        <table CELLBORDER="0" CELLPADDING="5" style="rounded">
+            <tr><td><b>Unmounting</b></td></tr>
+            <hr/>
+            <tr><td align="left"><font point-size="10">
+unmounted()<br ALIGN="LEFT"/>
+            </font></td></tr>
+        </table>
+    > margin=0 shape=none]
+
+    Unmounted -> Mounting [label=" begin_mount "]
+    Mounting -> Mounted [label=" mounted_ok "]
+    Mounting -> Unmounted [label=" mount_failed "]
+    Mounted -> Unmounting [label=" begin_unmount "]
+    Unmounting -> Unmounted [label=" unmounted "]
+}
+

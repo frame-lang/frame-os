@@ -140,18 +140,15 @@ S5 + S6 end-to-end.
 
 ## Commit plan (once S5 is genuinely reliable)
 
-**DEFERRED — Frame diagrams + system docs for `pipe.frs` / `io_scheduler.frs`.**
-The two new systems are NOT yet registered in `DIAGRAMS` and have no committed
-`docs/systems/*.svg` / `*.md`, because the dev host/container has graphviz
-**14.1.5** while CI (Ubuntu apt) + the committed SVGs are graphviz **2.43.0** —
-regenerating locally churns all 28 existing SVGs with version-only coordinate
-diffs and would fail the CI `diagrams` gate. **Follow-up:** on a graphviz-2.43.0
-host, add the two entries to `DIAGRAMS`, `cargo xtask regen-diagrams`, write the
-two `docs/systems/*.md` (drafts were written this session and can be restored from
-git history if needed), and commit. (The `.frs` sources ARE committed; only the
-rendered diagrams + per-system docs are deferred.)
+**RESOLVED — diagrams + the gate that blocked them.** The graphviz-version
+blocker is fixed at the source: `check-diagrams` now gates the **DOT** (`framec -l
+graphviz`, version-independent), not the rendered SVG, so committing the new
+diagrams no longer requires CI's exact graphviz. Both systems are registered in
+`DIAGRAMS`, all systems have a committed `<name>.dot` (the gated artifact),
+`docs/systems/{pipe,io_scheduler}.{md,svg}` are written, and `check-diagrams`
+passes. (See `frame_assessment.md` 2026-05-25 tooling entry.)
 
-Otherwise likely one commit (the changes interleave across kernel/frame/user):
+Original commit-plan note (for history) — likely one commit (changes interleave):
 the disk used-ring fix + IoScheduler/Pipe FSMs + S6 pipes + per-process fd-table
 pipe support. The `docs/frame_assessment.md` entry for this
 episode is already written (2026-05-25). Do NOT commit until a clean console-test

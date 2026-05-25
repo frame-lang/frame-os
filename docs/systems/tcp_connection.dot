@@ -1,0 +1,141 @@
+digraph TcpConnection {
+    compound=true
+    node [color="deepskyblue4" style="rounded, filled" fillcolor="azure"]
+    edge[color="red"]
+
+    Entry[width=0.2 shape="circle" style="filled" fillcolor="black" label=""]
+    Entry -> Closed
+
+    Closed [label = <
+        <table CELLBORDER="0" CELLPADDING="5" style="rounded">
+            <tr><td><b>Closed</b></td></tr>
+            <hr/>
+            <tr><td align="left"><font point-size="10">
+open_passive()<br ALIGN="LEFT"/>open_active()<br ALIGN="LEFT"/>
+            </font></td></tr>
+        </table>
+    > margin=0 shape=none]
+    subgraph cluster_Open {
+        label = <
+            <table cellborder="0" border="0">
+                <tr><td>Open</td></tr>
+                <hr/>
+                <tr><td align="left"><font point-size="10">
+rst()<br ALIGN="LEFT"/>
+                </font></td></tr>
+            </table>
+        >
+        style = rounded
+        Open [shape="point" width="0"]
+
+        Listen [label = <
+            <table CELLBORDER="0" CELLPADDING="5" style="rounded">
+                <tr><td><b>Listen</b></td></tr>
+                <hr/>
+                <tr><td align="left"><font point-size="10">
+segment(seg: crate::tcp::TcpSegment)<br ALIGN="LEFT"/>state()<br ALIGN="LEFT"/>
+                </font></td></tr>
+            </table>
+        > margin=0 shape=none]
+        SynSent [label = <
+            <table CELLBORDER="0" CELLPADDING="5" style="rounded">
+                <tr><td><b>SynSent</b></td></tr>
+                <hr/>
+                <tr><td align="left"><font point-size="10">
+$&gt;()<br ALIGN="LEFT"/>&lt;$()<br ALIGN="LEFT"/>segment(seg: crate::tcp::TcpSegment)<br ALIGN="LEFT"/>timeout()<br ALIGN="LEFT"/>state()<br ALIGN="LEFT"/>
+                </font></td></tr>
+            </table>
+        > margin=0 shape=none]
+        SynReceived [label = <
+            <table CELLBORDER="0" CELLPADDING="5" style="rounded">
+                <tr><td><b>SynReceived</b></td></tr>
+                <hr/>
+                <tr><td align="left"><font point-size="10">
+$&gt;()<br ALIGN="LEFT"/>&lt;$()<br ALIGN="LEFT"/>segment(seg: crate::tcp::TcpSegment)<br ALIGN="LEFT"/>timeout()<br ALIGN="LEFT"/>state()<br ALIGN="LEFT"/>
+                </font></td></tr>
+            </table>
+        > margin=0 shape=none]
+        Established [label = <
+            <table CELLBORDER="0" CELLPADDING="5" style="rounded">
+                <tr><td><b>Established</b></td></tr>
+                <hr/>
+                <tr><td align="left"><font point-size="10">
+segment(seg: crate::tcp::TcpSegment)<br ALIGN="LEFT"/>close()<br ALIGN="LEFT"/>state()<br ALIGN="LEFT"/>
+                </font></td></tr>
+            </table>
+        > margin=0 shape=none]
+        FinWait1 [label = <
+            <table CELLBORDER="0" CELLPADDING="5" style="rounded">
+                <tr><td><b>FinWait1</b></td></tr>
+                <hr/>
+                <tr><td align="left"><font point-size="10">
+segment(seg: crate::tcp::TcpSegment)<br ALIGN="LEFT"/>state()<br ALIGN="LEFT"/>
+                </font></td></tr>
+            </table>
+        > margin=0 shape=none]
+        FinWait2 [label = <
+            <table CELLBORDER="0" CELLPADDING="5" style="rounded">
+                <tr><td><b>FinWait2</b></td></tr>
+                <hr/>
+                <tr><td align="left"><font point-size="10">
+segment(seg: crate::tcp::TcpSegment)<br ALIGN="LEFT"/>state()<br ALIGN="LEFT"/>
+                </font></td></tr>
+            </table>
+        > margin=0 shape=none]
+        Closing [label = <
+            <table CELLBORDER="0" CELLPADDING="5" style="rounded">
+                <tr><td><b>Closing</b></td></tr>
+                <hr/>
+                <tr><td align="left"><font point-size="10">
+segment(seg: crate::tcp::TcpSegment)<br ALIGN="LEFT"/>state()<br ALIGN="LEFT"/>
+                </font></td></tr>
+            </table>
+        > margin=0 shape=none]
+        TimeWait [label = <
+            <table CELLBORDER="0" CELLPADDING="5" style="rounded">
+                <tr><td><b>TimeWait</b></td></tr>
+                <hr/>
+                <tr><td align="left"><font point-size="10">
+$&gt;()<br ALIGN="LEFT"/>timeout()<br ALIGN="LEFT"/>state()<br ALIGN="LEFT"/>
+                </font></td></tr>
+            </table>
+        > margin=0 shape=none]
+        CloseWait [label = <
+            <table CELLBORDER="0" CELLPADDING="5" style="rounded">
+                <tr><td><b>CloseWait</b></td></tr>
+                <hr/>
+                <tr><td align="left"><font point-size="10">
+close()<br ALIGN="LEFT"/>state()<br ALIGN="LEFT"/>
+                </font></td></tr>
+            </table>
+        > margin=0 shape=none]
+        LastAck [label = <
+            <table CELLBORDER="0" CELLPADDING="5" style="rounded">
+                <tr><td><b>LastAck</b></td></tr>
+                <hr/>
+                <tr><td align="left"><font point-size="10">
+segment(seg: crate::tcp::TcpSegment)<br ALIGN="LEFT"/>state()<br ALIGN="LEFT"/>
+                </font></td></tr>
+            </table>
+        > margin=0 shape=none]
+    }
+
+    Closed -> Listen [label=" open_passive "]
+    Closed -> SynSent [label=" open_active "]
+    Listen -> SynReceived [label=" segment "]
+    SynSent -> Established [label=" segment "]
+    SynSent -> SynReceived [label=" segment "]
+    SynReceived -> Established [label=" segment "]
+    Established -> CloseWait [label=" segment "]
+    Established -> FinWait1 [label=" close "]
+    FinWait1 -> TimeWait [label=" segment "]
+    FinWait1 -> Closing [label=" segment "]
+    FinWait1 -> FinWait2 [label=" segment "]
+    FinWait2 -> TimeWait [label=" segment "]
+    Closing -> TimeWait [label=" segment "]
+    TimeWait -> Closed [label=" timeout "]
+    CloseWait -> LastAck [label=" close "]
+    LastAck -> Closed [label=" segment "]
+    Open -> Closed [label=" rst " ltail="cluster_Open"]
+}
+

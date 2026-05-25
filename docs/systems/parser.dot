@@ -1,0 +1,63 @@
+digraph Parser {
+    compound=true
+    node [color="deepskyblue4" style="rounded, filled" fillcolor="azure"]
+    edge[color="red"]
+
+    Entry[width=0.2 shape="circle" style="filled" fillcolor="black" label=""]
+    Entry -> ReadingWord
+
+    ReadingWord [label = <
+        <table CELLBORDER="0" CELLPADDING="5" style="rounded">
+            <tr><td><b>ReadingWord</b></td></tr>
+            <hr/>
+            <tr><td align="left"><font point-size="10">
+consume(c: char)<br ALIGN="LEFT"/>finalize()<br ALIGN="LEFT"/>
+            </font></td></tr>
+        </table>
+    > margin=0 shape=none]
+    InWord [label = <
+        <table CELLBORDER="0" CELLPADDING="5" style="rounded">
+            <tr><td><b>InWord</b></td></tr>
+            <hr/>
+            <tr><td align="left"><font point-size="10">
+consume(c: char)<br ALIGN="LEFT"/>finalize()<br ALIGN="LEFT"/>
+            </font></td></tr>
+        </table>
+    > margin=0 shape=none]
+    InQuotedString [label = <
+        <table CELLBORDER="0" CELLPADDING="5" style="rounded">
+            <tr><td><b>InQuotedString</b></td></tr>
+            <hr/>
+            <tr><td align="left"><font point-size="10">
+consume(c: char)<br ALIGN="LEFT"/>finalize()<br ALIGN="LEFT"/>
+            </font></td></tr>
+        </table>
+    > margin=0 shape=none]
+    Done [label = <
+        <table CELLBORDER="0" CELLPADDING="5" style="rounded">
+            <tr><td><b>Done</b></td></tr>
+            <hr/>
+            <tr><td align="left"><font point-size="10">
+is_complete()<br ALIGN="LEFT"/>
+            </font></td></tr>
+        </table>
+    > margin=0 shape=none]
+    Failed [label = <
+        <table CELLBORDER="0" CELLPADDING="5" style="rounded">
+            <tr><td><b>Failed</b></td></tr>
+            <hr/>
+            <tr><td align="left"><font point-size="10">
+is_complete()<br ALIGN="LEFT"/>
+            </font></td></tr>
+        </table>
+    > margin=0 shape=none]
+
+    ReadingWord -> InQuotedString [label=" consume "]
+    ReadingWord -> InWord [label=" consume "]
+    ReadingWord -> Done [label=" finalize "]
+    InWord -> ReadingWord [label=" consume "]
+    InWord -> Done [label=" finalize "]
+    InQuotedString -> ReadingWord [label=" consume "]
+    InQuotedString -> Failed [label=" finalize "]
+}
+

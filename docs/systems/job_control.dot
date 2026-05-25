@@ -1,0 +1,34 @@
+digraph JobControl {
+    compound=true
+    node [color="deepskyblue4" style="rounded, filled" fillcolor="azure"]
+    edge[color="red"]
+
+    Entry[width=0.2 shape="circle" style="filled" fillcolor="black" label=""]
+    Entry -> Idle
+
+    Idle [label = <
+        <table CELLBORDER="0" CELLPADDING="5" style="rounded">
+            <tr><td><b>Idle</b></td></tr>
+            <hr/>
+            <tr><td align="left"><font point-size="10">
+spawn_foreground(cmd: String, args: Vec&lt;String&gt;)<br ALIGN="LEFT"/>spawn_background(cmd: String, args: Vec&lt;String&gt;)<br ALIGN="LEFT"/>fg(id: u32)<br ALIGN="LEFT"/>bg(id: u32)<br ALIGN="LEFT"/>kill_job(id: u32)<br ALIGN="LEFT"/>wait_for(id: u32)<br ALIGN="LEFT"/>tick()<br ALIGN="LEFT"/>
+            </font></td></tr>
+        </table>
+    > margin=0 shape=none]
+    RunningForeground [label = <
+        <table CELLBORDER="0" CELLPADDING="5" style="rounded">
+            <tr><td><b>RunningForeground</b></td></tr>
+            <hr/>
+            <tr><td align="left"><font point-size="10">
+wait_foreground()<br ALIGN="LEFT"/>stop_foreground()<br ALIGN="LEFT"/>kill_job(id: u32)<br ALIGN="LEFT"/>tick()<br ALIGN="LEFT"/>wait_for(id: u32)<br ALIGN="LEFT"/>is_idle()<br ALIGN="LEFT"/>is_running_foreground()<br ALIGN="LEFT"/>
+            </font></td></tr>
+        </table>
+    > margin=0 shape=none]
+
+    Idle -> RunningForeground [label=" spawn_foreground "]
+    Idle -> RunningForeground [label=" fg "]
+    RunningForeground -> Idle [label=" wait_foreground "]
+    RunningForeground -> Idle [label=" stop_foreground "]
+    RunningForeground -> Idle [label=" kill_job "]
+}
+

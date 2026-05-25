@@ -1,0 +1,31 @@
+digraph Pipe {
+    compound=true
+    node [color="deepskyblue4" style="rounded, filled" fillcolor="azure"]
+    edge[color="red"]
+
+    Entry[width=0.2 shape="circle" style="filled" fillcolor="black" label=""]
+    Entry -> Writable
+
+    Writable [label = <
+        <table CELLBORDER="0" CELLPADDING="5" style="rounded">
+            <tr><td><b>Writable</b></td></tr>
+            <hr/>
+            <tr><td align="left"><font point-size="10">
+reader_opened()<br ALIGN="LEFT"/>writer_opened()<br ALIGN="LEFT"/>reader_closed()<br ALIGN="LEFT"/>writer_closed()<br ALIGN="LEFT"/>has_writers()<br ALIGN="LEFT"/>
+            </font></td></tr>
+        </table>
+    > margin=0 shape=none]
+    Drained [label = <
+        <table CELLBORDER="0" CELLPADDING="5" style="rounded">
+            <tr><td><b>Drained</b></td></tr>
+            <hr/>
+            <tr><td align="left"><font point-size="10">
+reader_opened()<br ALIGN="LEFT"/>reader_closed()<br ALIGN="LEFT"/>writer_opened()<br ALIGN="LEFT"/>
+            </font></td></tr>
+        </table>
+    > margin=0 shape=none]
+
+    Writable -> Drained [label=" writer_closed "]
+    Drained -> Writable [label=" writer_opened "]
+}
+

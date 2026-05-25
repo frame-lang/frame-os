@@ -1,0 +1,31 @@
+digraph UdpSocket {
+    compound=true
+    node [color="deepskyblue4" style="rounded, filled" fillcolor="azure"]
+    edge[color="red"]
+
+    Entry[width=0.2 shape="circle" style="filled" fillcolor="black" label=""]
+    Entry -> Unbound
+
+    Unbound [label = <
+        <table CELLBORDER="0" CELLPADDING="5" style="rounded">
+            <tr><td><b>Unbound</b></td></tr>
+            <hr/>
+            <tr><td align="left"><font point-size="10">
+bind(port: u16)<br ALIGN="LEFT"/>
+            </font></td></tr>
+        </table>
+    > margin=0 shape=none]
+    Bound [label = <
+        <table CELLBORDER="0" CELLPADDING="5" style="rounded">
+            <tr><td><b>Bound</b></td></tr>
+            <hr/>
+            <tr><td align="left"><font point-size="10">
+recv()<br ALIGN="LEFT"/>close()<br ALIGN="LEFT"/>is_bound()<br ALIGN="LEFT"/>
+            </font></td></tr>
+        </table>
+    > margin=0 shape=none]
+
+    Unbound -> Bound [label=" bind "]
+    Bound -> Unbound [label=" close "]
+}
+

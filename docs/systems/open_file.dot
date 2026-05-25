@@ -1,0 +1,50 @@
+digraph OpenFile {
+    compound=true
+    node [color="deepskyblue4" style="rounded, filled" fillcolor="azure"]
+    edge[color="red"]
+
+    Entry[width=0.2 shape="circle" style="filled" fillcolor="black" label=""]
+    Entry -> Open
+
+    Open [label = <
+        <table CELLBORDER="0" CELLPADDING="5" style="rounded">
+            <tr><td><b>Open</b></td></tr>
+            <hr/>
+            <tr><td align="left"><font point-size="10">
+open_read()<br ALIGN="LEFT"/>open_write()<br ALIGN="LEFT"/>close()<br ALIGN="LEFT"/>
+            </font></td></tr>
+        </table>
+    > margin=0 shape=none]
+    Reading [label = <
+        <table CELLBORDER="0" CELLPADDING="5" style="rounded">
+            <tr><td><b>Reading</b></td></tr>
+            <hr/>
+            <tr><td align="left"><font point-size="10">
+read()<br ALIGN="LEFT"/>close()<br ALIGN="LEFT"/>is_open()<br ALIGN="LEFT"/>is_reading()<br ALIGN="LEFT"/>
+            </font></td></tr>
+        </table>
+    > margin=0 shape=none]
+    Writing [label = <
+        <table CELLBORDER="0" CELLPADDING="5" style="rounded">
+            <tr><td><b>Writing</b></td></tr>
+            <hr/>
+            <tr><td align="left"><font point-size="10">
+write()<br ALIGN="LEFT"/>close()<br ALIGN="LEFT"/>is_open()<br ALIGN="LEFT"/>is_writing()<br ALIGN="LEFT"/>
+            </font></td></tr>
+        </table>
+    > margin=0 shape=none]
+    Closed [label = <
+        <table CELLBORDER="0" CELLPADDING="5" style="rounded">
+            <tr><td><b>Closed</b></td></tr>
+            <hr/>
+            <tr><td></td></tr>
+        </table>
+    > margin=0 shape=none]
+
+    Open -> Reading [label=" open_read "]
+    Open -> Writing [label=" open_write "]
+    Open -> Closed [label=" close "]
+    Reading -> Closed [label=" close "]
+    Writing -> Closed [label=" close "]
+}
+
