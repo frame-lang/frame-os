@@ -392,6 +392,12 @@ fn prepare_qemu_artifacts_features(workspace: &Path, interactive: bool) -> Resul
     let rm_elf = build_user_disk_elf(workspace, "rm")?;
     let touch_elf = build_user_disk_elf(workspace, "touch")?;
     let cp_elf = build_user_disk_elf(workspace, "cp")?;
+    // S4 text utilities.
+    let wc_elf = build_user_disk_elf(workspace, "wc")?;
+    let head_elf = build_user_disk_elf(workspace, "head")?;
+    let tail_elf = build_user_disk_elf(workspace, "tail")?;
+    let grep_elf = build_user_disk_elf(workspace, "grep")?;
+    let date_elf = build_user_disk_elf(workspace, "date")?;
     // B11-3e: the BuildDriver-FSM-driven build tool (compile→link→run via tcc).
     let build_elf = build_user_disk_elf(workspace, "buildc")?;
     // V1.0 capstone: the Hello Frame system (frame/hello.frs) transpiled to Rust
@@ -419,6 +425,11 @@ fn prepare_qemu_artifacts_features(workspace: &Path, interactive: bool) -> Resul
     files.push(("/bin/rm", &rm_elf));
     files.push(("/bin/touch", &touch_elf));
     files.push(("/bin/cp", &cp_elf));
+    files.push(("/bin/wc", &wc_elf));
+    files.push(("/bin/head", &head_elf));
+    files.push(("/bin/tail", &tail_elf));
+    files.push(("/bin/grep", &grep_elf));
+    files.push(("/bin/date", &date_elf));
     files.push(("/bin/chello", &chello_elf));
     files.push(("/bin/tcc", &tcc_elf));
     files.push(("/bin/buildc", &build_elf));
@@ -478,13 +489,12 @@ fn build_fs_image(total_blocks: u32, files: &[(&str, &[u8])]) -> Vec<u8> {
         set_used(&mut disk, b);
     }
 
-    // Directory registry, keyed by full slash-path ("" = root). Each entry is
-    // (path, inode, data block, running dirent offset). Root is inode 1.
+    // Directory registry, keyed by full slash-path ("" = root). Root is inode 1.
     // Arbitrary nesting is supported: a file at `/usr/include/stdio.h`
     // auto-creates `/usr` then `/usr/include` (the B11-3d tcc sysroot needs
     // multi-level dirs; the kernel's `namei` already walks any depth). Each dir
-    // gets one 512-byte data block (16 dirents) — ample for the staged tree;
-    // an overflow asserts rather than silently corrupting.
+    // grows across multiple 512-byte data blocks (16 dirents each) as entries
+    // are added, so a directory like /bin can exceed 16 files.
     let mut next_ino = fs::ROOT_INODE; // 1
     let mut next_data = layout.data_start;
     let alloc_dir = |next_ino: &mut u32, next_data: &mut u32, disk: &mut [u8]| -> (u32, u32) {
@@ -496,8 +506,12 @@ fn build_fs_image(total_blocks: u32, files: &[(&str, &[u8])]) -> Vec<u8> {
         (ino, dblk)
     };
     let (root_ino, root_data) = alloc_dir(&mut next_ino, &mut next_data, &mut disk);
-    // dirs: (full_path, ino, data_block, dirent_off)
-    let mut dirs: Vec<(String, u32, u32, usize)> = vec![(String::new(), root_ino, root_data, 0)];
+    // dirs: (full_path, ino, data_blocks, dirent_byte_len). A directory grows
+    // into more blocks as entries are added (DIRENT_SIZE 32 evenly divides
+    // BLOCK_SIZE 512 → 16/block), mirroring the kernel's multi-block fs::create —
+    // so /bin can hold more than 16 programs.
+    let mut dirs: Vec<(String, u32, Vec<u32>, usize)> =
+        vec![(String::new(), root_ino, vec![root_data], 0)];
 
     for (path, data) in files {
         let p = path.trim_start_matches('/');
@@ -518,15 +532,21 @@ fn build_fs_image(total_blocks: u32, files: &[(&str, &[u8])]) -> Vec<u8> {
                     Some(i) => i,
                     None => {
                         let (ino, dblk) = alloc_dir(&mut next_ino, &mut next_data, &mut disk);
-                        // Link the new subdir's dirent into its parent (`di`).
-                        let (pblk, poff) = (dirs[di].2, dirs[di].3);
-                        assert!(
-                            poff + fs::DIRENT_SIZE <= fs::BLOCK_SIZE,
-                            "mkfs: directory block overflow creating {acc}"
-                        );
-                        fs::write_dirent(&mut disk[blk(pblk)], poff, comp.as_bytes(), ino);
+                        // Link the new subdir's dirent into its parent (`di`),
+                        // growing the parent into a new block if the current one
+                        // is full.
+                        let off = dirs[di].3 % fs::BLOCK_SIZE;
+                        let bi = dirs[di].3 / fs::BLOCK_SIZE;
+                        if bi >= dirs[di].2.len() {
+                            let nb = next_data;
+                            next_data += 1;
+                            set_used(&mut disk, nb);
+                            dirs[di].2.push(nb);
+                        }
+                        let pblk = dirs[di].2[bi];
+                        fs::write_dirent(&mut disk[blk(pblk)], off, comp.as_bytes(), ino);
                         dirs[di].3 += fs::DIRENT_SIZE;
-                        dirs.push((acc.clone(), ino, dblk, 0));
+                        dirs.push((acc.clone(), ino, vec![dblk], 0));
                         dirs.len() - 1
                     }
                 };
@@ -594,23 +614,31 @@ fn build_fs_image(total_blocks: u32, files: &[(&str, &[u8])]) -> Vec<u8> {
         let (iblk, ioff) = layout.inode_loc(ino);
         node.write(&mut disk[blk(iblk)], ioff);
 
-        // Add the file's dirent to its parent directory.
-        let (pblk, poff) = (dirs[di].2, dirs[di].3);
-        assert!(
-            poff + fs::DIRENT_SIZE <= fs::BLOCK_SIZE,
-            "mkfs: directory block overflow adding {name}"
-        );
-        fs::write_dirent(&mut disk[blk(pblk)], poff, name.as_bytes(), ino);
+        // Add the file's dirent to its parent directory, growing into a new
+        // data block when the current one fills (multi-block dirs).
+        let off = dirs[di].3 % fs::BLOCK_SIZE;
+        let bi = dirs[di].3 / fs::BLOCK_SIZE;
+        if bi >= dirs[di].2.len() {
+            let nb = next_data;
+            next_data += 1;
+            set_used(&mut disk, nb);
+            dirs[di].2.push(nb);
+        }
+        let pblk = dirs[di].2[bi];
+        fs::write_dirent(&mut disk[blk(pblk)], off, name.as_bytes(), ino);
         dirs[di].3 += fs::DIRENT_SIZE;
     }
 
-    // Write every directory inode with its final size.
-    for (_, ino, dblk, off) in &dirs {
+    // Write every directory inode with its final size + all its data blocks
+    // (directories use direct blocks only — NDIRECT × 16 = 448 entries, ample).
+    for (_, ino, blocks, len) in &dirs {
         let mut d = fs::Inode::empty();
         d.kind = fs::T_DIR;
         d.nlink = 1;
-        d.direct[0] = *dblk;
-        d.size = *off as u32;
+        for (i, &b) in blocks.iter().take(fs::NDIRECT).enumerate() {
+            d.direct[i] = b;
+        }
+        d.size = *len as u32;
         let (iblk, ioff) = layout.inode_loc(*ino);
         d.write(&mut disk[blk(iblk)], ioff);
     }
@@ -1425,8 +1453,18 @@ fn run_console_test() -> Result<()> {
         wait_for_output(&buf, "a.txt", 20)?; // ls after `touch /a.txt`
         wait_for_output(&buf, "hi-there", 20)?; // echo
         wait_for_output(&buf, "hello from the disk", 20)?; // cat of the cp'd /readme
-                                                           // B9-2: argv reaches the program. Type a command WITH arguments; argtest
-                                                           // echoes argc + each argv string, so we can assert the args arrived.
+                                                           // S4 text utilities: wc counts /readme ("hello from the disk\n" = 1 line,
+                                                           // 4 words, 20 bytes), date prints the pinned RTC, and head/tail/grep/clear
+                                                           // run without error. (clear's ANSI escape is harmless in the capture.)
+        eprintln!("console-test: typing wc / head / tail / grep / date / clear");
+        stdin
+            .write_all(b"wc /readme\nhead /readme\ntail /readme\ngrep disk /readme\ndate\nclear\n")
+            .context("write textutils")?;
+        stdin.flush().ok();
+        wait_for_output(&buf, "1 4 20 /readme", 20)?; // wc
+        wait_for_output(&buf, "2026-05-24 12:", 20)?; // date (pinned RTC base)
+                                                      // B9-2: argv reaches the program. Type a command WITH arguments; argtest
+                                                      // echoes argc + each argv string, so we can assert the args arrived.
         eprintln!("console-test: typing `/bin/argtest alpha beta`");
         stdin
             .write_all(b"/bin/argtest alpha beta\n")
@@ -1573,8 +1611,11 @@ fn run_console_test() -> Result<()> {
 
     // Bounded wait for QEMU to exit (the shell's `exit` → halt → isa-debug-exit).
     // Polls `try_wait` so this NEVER hangs: on a drive failure or a timeout we
-    // kill QEMU rather than block forever.
-    let deadline = Instant::now() + Duration::from_secs(20);
+    // kill QEMU rather than block forever. Generous (60s) because the dev image
+    // runs on arm64 and emulates x86_64 via TCG — the final halt + OVMF/QEMU
+    // teardown is slow there, and a 20s budget spuriously failed an otherwise
+    // fully-passing run (every functional needle already matched).
+    let deadline = Instant::now() + Duration::from_secs(60);
     let mut status = None;
     loop {
         match child.try_wait() {

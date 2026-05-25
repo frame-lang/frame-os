@@ -77,6 +77,27 @@ path = "src/touch.rs"
 name = "cp"
 path = "src/cp.rs"
 
+# S4 text utilities.
+[[bin]]
+name = "wc"
+path = "src/wc.rs"
+
+[[bin]]
+name = "head"
+path = "src/head.rs"
+
+[[bin]]
+name = "tail"
+path = "src/tail.rs"
+
+[[bin]]
+name = "grep"
+path = "src/grep.rs"
+
+[[bin]]
+name = "date"
+path = "src/date.rs"
+
 # File write path (B9-3): creates /tmp.txt and exercises write, lseek, fstat,
 # dup, and read-back. Baked into the kernel; run by usermode::run.
 [[bin]]

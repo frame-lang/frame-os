@@ -8,8 +8,11 @@
 // Disk layout (512-byte blocks):
 //   block 0           superblock (magic + total block count)
 //   block 1           free-block bitmap (1 bit per block; 1 block ⇒ ≤4096 blocks)
-//   blocks 2..6       inode table (4 blocks × 8 inodes = 32 inodes)
-//   blocks 6..        data blocks
+//   blocks 2..2+N     inode table (INODE_BLOCKS=32 blocks × 4 inodes = 128 inodes)
+//   blocks 2+N..      data blocks
+//
+// (The inode table starts right after the bitmap, which grows with the disk, so
+// the exact start block is derived by `Layout::for_total`, not fixed at 2.)
 //
 // Inode 0 is reserved/unused; inode 1 is the root directory. A directory's
 // data blocks hold 32-byte dirents (name[28] + inode u32).
@@ -32,8 +35,8 @@ pub const PTRS_PER_BLOCK: usize = BLOCK_SIZE / 4;
 
 pub const INODE_SIZE: usize = 128;
 pub const INODES_PER_BLOCK: usize = BLOCK_SIZE / INODE_SIZE; // 4
-pub const INODE_BLOCKS: u32 = 16;
-pub const INODE_COUNT: u32 = INODE_BLOCKS * INODES_PER_BLOCK as u32; // 64
+pub const INODE_BLOCKS: u32 = 32;
+pub const INODE_COUNT: u32 = INODE_BLOCKS * INODES_PER_BLOCK as u32; // 128
 
 // Block map: 28 direct + single-indirect + double-indirect. Max file =
 // 28*512 + 128*512 + 128*128*512 ≈ 8.07 MiB. The inode is exactly 128 bytes:

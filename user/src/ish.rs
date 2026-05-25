@@ -163,8 +163,8 @@ fn run_line(line: &str) {
     match toks[0].as_str() {
         "exit" => exit(0),
         "help" => {
-            print(b"ish builtins: help, exit, cd [dir], pwd, cat <path>...\n");
-            print(b"anything else runs /bin/<cmd> <args...> from disk (e.g. ls, rm, cp)\n");
+            print(b"ish builtins: help, exit, cd [dir], pwd, clear, cat <path>...\n");
+            print(b"on disk in /bin: ls, echo, rm, cp, touch, wc, head, tail, grep, date, ...\n");
         }
         // cd must be a builtin: it changes *this shell's* cwd (per-process in the
         // kernel). No arg → go to root.
@@ -188,6 +188,8 @@ fn run_line(line: &str) {
                 write_char(b'\n');
             }
         }
+        // clear: ANSI clear-screen + cursor-home. A builtin (no point forking).
+        "clear" => print(b"\x1b[2J\x1b[H"),
         "cat" => {
             for path in &toks[1..] {
                 cat(path);
