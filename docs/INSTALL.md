@@ -66,9 +66,23 @@ Then:
 
 ```sh
 cargo build -p frame-os-kernel --target x86_64-unknown-none   # cross-build
-cargo xtask qemu                                              # boot interactively (Ctrl-A x to quit)
+cargo xtask qemu                                              # boot the DEMO kernel (runs B0–B7 self-tests, halts)
+cargo xtask qemu-interactive                                  # boot to the `frameos$` shell and type commands yourself
 cargo xtask qemu-test                                         # headless boot + the full smoke suite (CI)
 cargo xtask check-diagrams                                    # state-graph drift check (needs graphviz)
+```
+
+**Driving the OS by hand.** `cargo xtask qemu-interactive` drops you at the
+`frameos$` prompt (Ctrl-A x quits QEMU). Try:
+
+```
+/bin/hello                                    # a Rust ELF
+/bin/tcc -v                                   # the on-device C compiler
+tcc -B/usr/lib/tcc -static /hello.c -o /out.elf  &&  /out.elf   # compile + run C on-device
+buildc /hi.c                                  # compile→link→run via the BuildDriver FSM
+/bin/fhello                                   # the V1.0 capstone: one Frame system → Rust
+buildc /fhello.c                              # the same Frame system → C, built by the on-device tcc
+exit
 ```
 
 On first run, `xtask` fetches the pinned Limine bootloader binaries into
@@ -92,6 +106,16 @@ TAP=1 docker/run.sh "cargo xtask qemu-tap"   # inbound-L2 networking tests (need
 
 Source stays on the host (bind-mounted at `/work`); build artifacts live in a
 named volume, so the container's `target/` never clobbers a host-native one.
+
+To **drive the shell interactively** from macOS/Windows you need a TTY, so use
+the interactive container form (`docker/run.sh shell` is `-it`) and run the
+command inside:
+
+```sh
+docker/run.sh shell                  # interactive container
+# then, at the container prompt:
+cargo xtask qemu-interactive         # boots to the frameos$ prompt; type away
+```
 
 ## Platform support at a glance
 

@@ -43,8 +43,11 @@ cargo build --bin frame-os-shell
 # Run hosted-mode Frame OS
 cargo run --bin frame-os-shell
 
-# Run bare-metal Frame OS in QEMU (x86-64 UEFI)
+# Run bare-metal Frame OS in QEMU (x86-64 UEFI) — DEMO kernel: self-tests, then halts
 cargo xtask qemu
+
+# Boot to the `frameos$` shell and type commands yourself (/bin/tcc, buildc, /bin/fhello, …)
+cargo xtask qemu-interactive
 
 # Headless boot + the full smoke suite (what CI runs)
 cargo xtask qemu-test

@@ -58,8 +58,17 @@ enum SubCmd {
     RegenDiagrams,
 
     /// Boot the bare-metal kernel in QEMU x86_64 via Limine UEFI.
-    /// Serial is routed to stdio; Ctrl-A x quits QEMU.
+    /// Serial is routed to stdio; Ctrl-A x quits QEMU. This is the DEMO
+    /// kernel: it runs the B0–B7 self-test demos to the console, then halts.
+    /// For a typeable shell, use `qemu-interactive`.
     Qemu,
+
+    /// Boot the INTERACTIVE kernel in QEMU and drop you at the `frameos$`
+    /// prompt (serial ↔ your terminal, no scripted input). Type programs
+    /// yourself: `/bin/hello`, `/bin/tcc -v`, `buildc /hi.c`, `/bin/fhello`,
+    /// `buildc /fhello.c`, then `exit`. Ctrl-A x quits QEMU. Needs a TTY — on
+    /// macOS run it inside `docker/run.sh shell`.
+    QemuInteractive,
 
     /// Run the bare-metal kernel's QEMU smoke tests headlessly.
     /// Each test boots the kernel, captures serial output to file,
@@ -75,8 +84,8 @@ enum SubCmd {
 
     /// B8: boot the `interactive`-feature kernel and drive its serial console
     /// non-interactively — wait for the shell prompt, type `/bin/hello`, then
-    /// `exit`, and assert the program ran. (`cargo xtask qemu` with the
-    /// interactive kernel is the human-typeable version.)
+    /// `exit`, and assert the program ran. (`cargo xtask qemu-interactive` is
+    /// the human-typeable version of the same kernel.)
     ConsoleTest,
 }
 
@@ -88,6 +97,7 @@ fn main() -> Result<()> {
         SubCmd::CheckDiagrams => diagrams(DiagramMode::Check),
         SubCmd::RegenDiagrams => diagrams(DiagramMode::Regen),
         SubCmd::Qemu => run_qemu(),
+        SubCmd::QemuInteractive => run_qemu_interactive(),
         SubCmd::QemuTest => run_qemu_test(),
         SubCmd::QemuTap => run_qemu_tap(),
         SubCmd::ConsoleTest => run_console_test(),
@@ -1244,11 +1254,40 @@ fn qemu_base_command(
     cmd
 }
 
+/// `cargo xtask qemu` — boot the demo kernel (runs the self-test demos, halts).
 fn run_qemu() -> Result<()> {
-    let workspace = workspace_root()?;
-    let artifacts = prepare_qemu_artifacts(&workspace)?;
+    run_qemu_inner(false)
+}
 
-    eprintln!("booting kernel in QEMU (Ctrl-C or Ctrl-A x to quit)...");
+/// `cargo xtask qemu-interactive` — boot the interactive kernel and hand the
+/// serial console to the user's terminal, so they get the `frameos$` prompt and
+/// can type programs themselves (the human-typeable counterpart to
+/// `console-test`, which drives the same kernel scripted).
+fn run_qemu_interactive() -> Result<()> {
+    run_qemu_inner(true)
+}
+
+/// Shared QEMU launch with serial on stdio. `interactive` selects the
+/// `interactive`-feature kernel (boots straight to the ring-3 shell) vs. the
+/// default demo kernel (runs the B0–B7 self-tests then halts).
+fn run_qemu_inner(interactive: bool) -> Result<()> {
+    let workspace = workspace_root()?;
+    let artifacts = prepare_qemu_artifacts_features(&workspace, interactive)?;
+
+    if interactive {
+        eprintln!("booting INTERACTIVE Frame OS in QEMU. At the `frameos$ ` prompt, try:");
+        eprintln!("  /bin/hello            # a Rust ELF");
+        eprintln!("  /bin/tcc -v           # the on-device C compiler");
+        eprintln!("  buildc /hi.c          # compile+link+run C via the BuildDriver FSM");
+        eprintln!("  /bin/fhello           # the capstone: a Frame system -> Rust");
+        eprintln!(
+            "  buildc /fhello.c      # the capstone: the same Frame system -> C, built by tcc"
+        );
+        eprintln!("  exit                  # leave (or Ctrl-A x to quit QEMU)");
+    } else {
+        eprintln!("booting kernel in QEMU (Ctrl-C or Ctrl-A x to quit)...");
+    }
+
     let ovmf_vars = fresh_ovmf_vars(&artifacts, "run")?;
     let blk_disk = fresh_blk_disk(&artifacts, "run")?;
     let mut cmd = qemu_base_command(
