@@ -66,8 +66,8 @@ fn exit(code: u64) -> ! {
 fn fork() -> u64 {
     unsafe { syscall3(2, 0, 0, 0) }
 }
-fn wait() -> u64 {
-    unsafe { syscall3(4, 0, 0, 0) }
+fn waitpid(pid: u64) -> u64 {
+    unsafe { syscall3(4, pid, 0, 0) }
 }
 fn open(path: &[u8]) -> u64 {
     unsafe { syscall3(5, path.as_ptr() as u64, path.len() as u64, 0) }
@@ -166,7 +166,8 @@ fn run_external(toks: &[String], redir_in: &Option<String>, redir_out: &Option<(
     let cmd = toks[0].as_str();
     let (argv, argc) = build_argv(toks);
 
-    if fork() == 0 {
+    let child = fork();
+    if child == 0 {
         // Child. Apply input redirection (`< file`) onto fd 0.
         if let Some(path) = redir_in {
             let fd = open(path.as_bytes());
@@ -198,8 +199,12 @@ fn run_external(toks: &[String], redir_in: &Option<String>, redir_out: &Option<(
         write_char(b'\n');
         exit(127);
     } else {
-        // Parent (the shell): reap the child, then loop back to the prompt.
-        wait();
+        // Parent (the shell): wait for *this* child specifically, then loop back
+        // to the prompt. Waiting on the exact pid (not `wait`-any) is what keeps
+        // the shell from racing ahead of the command it just launched — a bare
+        // `wait` could reap an unrelated older child and return while this one is
+        // still running, so a following builtin (e.g. `cat`) would see stale state.
+        waitpid(child);
     }
 }
 
@@ -216,7 +221,8 @@ fn run_pipeline(left: &[String], right: &[String]) {
         return;
     };
     // Writer: stdout → pipe write end.
-    if fork() == 0 {
+    let wpid = fork();
+    if wpid == 0 {
         dup2(wfd, 1);
         close(rfd);
         close(wfd);
@@ -227,7 +233,8 @@ fn run_pipeline(left: &[String], right: &[String]) {
         exit(127);
     }
     // Reader: stdin → pipe read end.
-    if fork() == 0 {
+    let rpid = fork();
+    if rpid == 0 {
         dup2(rfd, 0);
         close(rfd);
         close(wfd);
@@ -238,11 +245,12 @@ fn run_pipeline(left: &[String], right: &[String]) {
         exit(127);
     }
     // Parent: drop both ends so the reader gets EOF when the writer exits, then
-    // reap both children.
+    // wait for *both* children specifically (not `wait`-any) so the shell only
+    // returns to the prompt once the whole pipeline has finished.
     close(rfd);
     close(wfd);
-    wait();
-    wait();
+    waitpid(wpid);
+    waitpid(rpid);
 }
 
 /// Split tokens into (command words, input redirect, output redirect). The
@@ -315,7 +323,7 @@ fn run_line(line: &str) {
         "exit" => exit(0),
         "help" => {
             print(b"ish builtins: help, exit, cd [dir], pwd, clear, cat <path>...\n");
-            print(b"on disk in /bin: ls, echo, rm, cp, touch, wc, head, tail, grep, date, mkdir, rmdir, mv, ...\n");
+            print(b"on disk in /bin: ls, echo, rm, cp, touch, wc, head, tail, grep, date, mkdir, rmdir, mv, ps, ...\n");
             print(b"redirection (external cmds): cmd > file, cmd >> file, cmd < file\n");
             print(b"pipes: cmd1 | cmd2 (connect cmd1's stdout to cmd2's stdin)\n");
         }

@@ -112,6 +112,11 @@ path = "src/rmdir.rs"
 name = "mv"
 path = "src/mv.rs"
 
+# S9 process listing.
+[[bin]]
+name = "ps"
+path = "src/ps.rs"
+
 # File write path (B9-3): creates /tmp.txt and exercises write, lseek, fstat,
 # dup, and read-back. Baked into the kernel; run by usermode::run.
 [[bin]]

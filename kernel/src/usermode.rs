@@ -94,6 +94,9 @@ static mut PENDING_EXIT: i64 = -1;
 // child's syscalls would be dropped). The handler sets this flag; the actual
 // block + reap happens in `syscall_dispatch` after the dispatch completes.
 static mut PENDING_WAIT: bool = false;
+// The pid `wait` should wait for: a *specific* child (so the shell can't race
+// ahead of it), or 0 = "any child" (POSIX `wait`). Set alongside PENDING_WAIT.
+static mut PENDING_WAIT_PID: u32 = 0;
 
 // `read_line` (B8) likewise BLOCKS until the user types a newline — which must
 // not happen inside the dispatcher handler. The handler records the user buffer
@@ -341,10 +344,11 @@ extern "C" fn syscall_dispatch(frame: *mut TrapFrame) {
     // block must not happen inside the handler. do_wait_loop blocks until a
     // child exits, reaps it, and returns the status into the caller's frame.
     if unsafe { (&raw const PENDING_WAIT).read() } {
-        unsafe {
+        let target = unsafe {
             (&raw mut PENDING_WAIT).write(false);
-        }
-        f.rax = do_wait_loop();
+            (&raw const PENDING_WAIT_PID).read()
+        };
+        f.rax = do_wait_loop(target);
     }
 
     // Honor a pending read_line AFTER the dispatcher settles (B8): block until a
@@ -393,11 +397,12 @@ fn proc_table() -> &'static mut ProcessTable {
 /// 0=write_char 1=exit 2=fork 3=exec(prog_id) 4=wait 5=open 6=read 7=close
 /// 8=exec(path) 9=read_line 10=brk 11=exec_argv 12=write 13=lseek 14=fstat
 /// 15=stat 16=dup 17=unlink 18=time 19=chdir 20=getcwd 21=readdir 22=dup2
-/// 23=pipe 24=mkdir 25=rmdir 26=rename. (B4 Step 4 added the file-I/O +
+/// 23=pipe 24=mkdir 25=rmdir 26=rename 27=ps. (B4 Step 4 added the file-I/O +
 /// exec-from-disk syscalls; 17–21 are B11-3 follow-ups; 22 is the S5 redirection
-/// primitive; 23 is the S6 pipe; 24/25 are the S7 directory ops; 26 is S8 mv.)
+/// primitive; 23 is the S6 pipe; 24/25 are the S7 directory ops; 26 is S8 mv;
+/// 27 is the S9 process-table snapshot.)
 pub fn is_known_syscall(num: u64) -> bool {
-    num <= 26
+    num <= 27
 }
 
 /// Block until the console has a complete line, copy it into the user buffer
@@ -597,10 +602,14 @@ pub fn perform_syscall(num: u64, a0: u64, _a1: u64) -> u64 {
             0
         }
         4 => {
-            // Record the wait; syscall_dispatch runs the (blocking) reap loop
-            // after the dispatcher returns to $Validating.
+            // wait(target_pid=a0): block until child `a0` exits (0 = any child).
+            // Recorded here; syscall_dispatch runs the (blocking) reap loop after
+            // the dispatcher returns to $Validating. Waiting for a *specific* pid
+            // is what lets the shell serialize — `wait`-any would let it reap an
+            // older child and race ahead of the one it just forked.
             unsafe {
                 (&raw mut PENDING_WAIT).write(true);
+                (&raw mut PENDING_WAIT_PID).write(a0 as u32);
             }
             0
         }
@@ -705,6 +714,7 @@ pub fn perform_syscall(num: u64, a0: u64, _a1: u64) -> u64 {
         24 => sys_mkdir(a0, _a1),
         25 => sys_rmdir(a0, _a1),
         26 => sys_rename(a0, _a1),
+        27 => sys_ps(a0, _a1),
         _ => u64::MAX, // unreachable: validated by is_known_syscall
     }
 }
@@ -858,6 +868,28 @@ fn sys_rmdir(a0: u64, a1: u64) -> u64 {
 }
 
 #[inline(never)]
+fn sys_ps(a0: u64, a1: u64) -> u64 {
+    // ps(buf_ptr=a0, buf_len=a1) → bytes written: a snapshot of the live process
+    // table as packed 12-byte records [pid: u32 LE, ppid: u32 LE, state: u32 LE],
+    // one per process (state 1=Runnable/R, 2=Blocked/S, 3=Dead/Z). u64::MAX if the
+    // buffer is too small. The user buffer is mapped in the current address space.
+    let mut recs = [(0u32, 0u32, 0u8); 8]; // MAX_THREADS
+    let n = sched::live_procs(&mut recs);
+    let need = n * 12;
+    if (a1 as usize) < need {
+        return u64::MAX;
+    }
+    let buf = unsafe { core::slice::from_raw_parts_mut(a0 as *mut u8, need) };
+    for (i, &(pid, ppid, st)) in recs[..n].iter().enumerate() {
+        let o = i * 12;
+        buf[o..o + 4].copy_from_slice(&pid.to_le_bytes());
+        buf[o + 4..o + 8].copy_from_slice(&ppid.to_le_bytes());
+        buf[o + 8..o + 12].copy_from_slice(&(st as u32).to_le_bytes());
+    }
+    need as u64
+}
+
+#[inline(never)]
 fn sys_rename(a0: u64, a1: u64) -> u64 {
     // rename(src_ptr=a0, src_len=a1, dst_ptr=rdx, dst_len=r10) → 0, or u64::MAX.
     // Both paths resolve against cwd (S8). Two paths ⇒ 4 args.
@@ -879,32 +911,67 @@ fn sys_rename(a0: u64, a1: u64) -> u64 {
 /// `wait`: block until a child exits, reap it (collect status, free its
 /// `Process` slot + address space), and return its exit code. Returns
 /// `u64::MAX` (ECHILD) if the caller has no children. The blocking is the one
-/// place a syscall suspends: `sched::block_current` yields to the scheduler and
-/// returns once a child's exit (SIGCHLD) wakes us. Called from `syscall_dispatch`
-/// (not the handler) so the shared dispatcher stays available to the child.
-fn do_wait_loop() -> u64 {
+/// place a syscall suspends: `sched::block_current_until` yields to the scheduler
+/// and returns once a child's exit (SIGCHLD) wakes us. Called from
+/// `syscall_dispatch` (not the handler) so the shared dispatcher stays available
+/// to the child.
+/// Reap one dead child (`child_pid`, `child_pml4`): collect its exit status, free
+/// its `Process` slot + address space, and log it. Shared by the wait paths.
+fn reap_child(me: u32, child_pid: u32, child_pml4: u64) -> i32 {
+    let status = proc_table().reap_pid(child_pid); // $Zombie → $Reaped, slot freed
+    unsafe { paging::free_address_space(child_pml4) }; // teardown
+    serial::write_str("[wait] pid ");
+    serial::write_u32_decimal(me);
+    serial::write_str(" reaped child pid ");
+    serial::write_u32_decimal(child_pid);
+    serial::write_str(" (exit ");
+    write_exit_code(status);
+    serial::write_str("); table count ");
+    serial::write_u32_decimal(proc_table().count());
+    serial::writeln("");
+    status
+}
+
+/// `wait(target)`: block until child `target` exits and reap it, returning its
+/// exit code. `target == 0` is POSIX `wait` (reap *any* one child). For a
+/// specific `target` we drain *every* currently-dead child (so unrelated
+/// zombies can't pile up) and return once the target itself is reaped — which is
+/// what lets the shell serialize: it blocks here until the exact child it forked
+/// is done, so it can never run the next command ahead of it. `u64::MAX`
+/// (ECHILD) if the target (or, for 0, any child) doesn't exist.
+fn do_wait_loop(target: u32) -> u64 {
     let me = sched::current_pid();
-    loop {
-        if let Some((child_pid, child_pml4)) = sched::reap_dead_child(me) {
-            let status = proc_table().reap_pid(child_pid); // $Zombie → $Reaped, slot freed
-            unsafe { paging::free_address_space(child_pml4) }; // teardown
-            serial::write_str("[wait] pid ");
-            serial::write_u32_decimal(me);
-            serial::write_str(" reaped child pid ");
-            serial::write_u32_decimal(child_pid);
-            serial::write_str(" (exit ");
-            write_exit_code(status);
-            serial::write_str("); table count ");
-            serial::write_u32_decimal(proc_table().count());
-            serial::writeln("");
-            return status as u64;
+    // Block until a matching child is reapable (exited) or there is no such child.
+    // `block_current_until` makes the check-and-block atomic (interrupts off), so a
+    // child that exits between "is it dead?" and "go to sleep" can't be missed —
+    // the lost-wakeup bug that plain `block_current` has, which intermittently hung
+    // the shell in `waitpid` once it always blocked for a *specific* child.
+    let exists = |t: u32| {
+        if t == 0 {
+            sched::has_children(me)
+        } else {
+            sched::has_child(me, t)
         }
-        if !sched::has_children(me) {
-            return u64::MAX; // ECHILD
+    };
+    sched::block_current_until(|| sched::child_reapable(me, target) || !exists(target));
+    // A matching child is now dead (or vanished). Reap the dead children; for a
+    // specific target, drain the others too so unrelated zombies can't pile up.
+    let result = if target == 0 {
+        match sched::reap_dead_child(me) {
+            Some((child_pid, child_pml4)) => reap_child(me, child_pid, child_pml4) as u64,
+            None => u64::MAX, // ECHILD
         }
-        // A living child exists but none have exited yet — block until one does.
-        sched::block_current();
-    }
+    } else {
+        let mut target_status: Option<i32> = None;
+        while let Some((child_pid, child_pml4)) = sched::reap_dead_child(me) {
+            let status = reap_child(me, child_pid, child_pml4);
+            if child_pid == target {
+                target_status = Some(status);
+            }
+        }
+        target_status.map_or(u64::MAX, |s| s as u64)
+    };
+    result
 }
 
 /// Map an `exec` program id to its baked ELF. (No filesystem yet — programs are

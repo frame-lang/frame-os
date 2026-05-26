@@ -457,27 +457,11 @@ pub unsafe fn spawn_user_from_frame(
     with_sched(|s| s.task_ready());
 }
 
-/// Block the current process (B3 Step 5d `wait`): mark it `Blocked` and yield
-/// to the scheduler, returning only once another context wakes it (`wake`) and
-/// it is rescheduled. A Blocked task is skipped by the round-robin but stays
-/// "alive" in the Frame Scheduler's count (no `task_unready`), so the boot
-/// context won't declare `$Idle` while a parent waits. Restores IF=0 on return
-/// (the caller is a syscall handler that must stay non-preemptible).
-pub fn block_current() {
-    unsafe {
-        let cur = (&raw const CURRENT).read();
-        interrupts::without_interrupts(|| {
-            (*tcbs().add(cur)).state = RunState::Blocked;
-        });
-        // Yield: enable interrupts so the timer reschedules us away. We resume
-        // here (post-hlt) only once `wake` has set us Runnable again.
-        while (*tcbs().add(cur)).state == RunState::Blocked {
-            interrupts::wait_for_interrupt_enabled();
-        }
-        // Back to non-preemptible for the rest of the syscall.
-        interrupts::disable();
-    }
-}
+// (Removed `block_current`: a check-then-block with a gap between the caller's
+// readiness test and marking the task Blocked, so a wake landing in that gap was
+// lost. `wait` was its last user and intermittently hung the shell because of it;
+// it now uses `block_current_until`, which folds the check and the block into one
+// interrupts-off step. Use `block_current_until` for all blocking.)
 
 /// Block the current process until `ready()` returns true, yielding the CPU
 /// between checks. Unlike `block_current`, the decision to keep waiting is made
@@ -559,6 +543,41 @@ fn slot_of_pid(pid: u32) -> Option<usize> {
     }
 }
 
+/// Snapshot the live process table (S9 `ps`): fill `out` with a
+/// `(pid, parent_pid, state_code)` tuple for each non-free slot that owns a
+/// real process (`pid != 0` — skips the boot/idle context in slot 0), and
+/// return the count written (capped at `out.len()`). State codes:
+/// `1`=Runnable, `2`=Blocked, `3`=Dead/zombie. Taken with interrupts off so the
+/// snapshot is consistent against a concurrent fork/exit. Pure read — no
+/// lifecycle, so it's native (not a Frame system).
+pub fn live_procs(out: &mut [(u32, u32, u8)]) -> usize {
+    unsafe {
+        interrupts::without_interrupts(|| {
+            let t = tcbs();
+            let n = (&raw const N).read();
+            let mut k = 0usize;
+            for i in 0..n {
+                if k >= out.len() {
+                    break;
+                }
+                let tcb = &*t.add(i);
+                if tcb.pid == 0 || tcb.state == RunState::Free {
+                    continue;
+                }
+                let code = match tcb.state {
+                    RunState::Runnable => 1u8,
+                    RunState::Blocked => 2,
+                    RunState::Dead => 3,
+                    RunState::Free => continue,
+                };
+                out[k] = (tcb.pid, tcb.parent_pid, code);
+                k += 1;
+            }
+            k
+        })
+    }
+}
+
 /// Reap one *dead* (exited) child of `parent_pid`: free its scheduler slot and
 /// return its pid + PML4 so the caller can tear down the address space + the
 /// `Process`. Returns `None` if the parent has no exited-unreaped child.
@@ -589,6 +608,44 @@ pub fn has_children(parent_pid: u32) -> bool {
         let n = (&raw const N).read();
         for i in 1..n {
             if (*t.add(i)).parent_pid == parent_pid && (*t.add(i)).state != RunState::Free {
+                return true;
+            }
+        }
+        false
+    }
+}
+
+/// Whether `parent_pid` still has a specific child `child_pid` tracked (alive,
+/// blocked, or exited-unreaped). False ⇒ `waitpid(child_pid)` returns ECHILD
+/// (the child was already reaped, or never belonged to this parent).
+pub fn has_child(parent_pid: u32, child_pid: u32) -> bool {
+    unsafe {
+        let t = tcbs();
+        let n = (&raw const N).read();
+        for i in 1..n {
+            let tcb = &*t.add(i);
+            if tcb.parent_pid == parent_pid && tcb.pid == child_pid && tcb.state != RunState::Free {
+                return true;
+            }
+        }
+        false
+    }
+}
+
+/// Whether `parent_pid` has a *reapable* (exited, `Dead`) child matching
+/// `target` (`0` = any child). This is the predicate `wait` blocks on via
+/// `block_current_until`, so the check-and-block is atomic against a child
+/// exiting (which sets it `Dead` and wakes us) — no lost wakeup.
+pub fn child_reapable(parent_pid: u32, target: u32) -> bool {
+    unsafe {
+        let t = tcbs();
+        let n = (&raw const N).read();
+        for i in 1..n {
+            let tcb = &*t.add(i);
+            if tcb.parent_pid == parent_pid
+                && tcb.state == RunState::Dead
+                && (target == 0 || tcb.pid == target)
+            {
                 return true;
             }
         }
