@@ -878,6 +878,26 @@ pub fn child_reapable(parent_pid: u32, target: u32) -> bool {
     }
 }
 
+/// Whether `parent_pid` has a *stopped* (job-control suspended) child matching
+/// `target` (`0` = any). The wait path blocks on this too (POSIX WUNTRACED), so
+/// the foreground shell wakes when the job it's waiting on is Ctrl-Z'd.
+pub fn child_stopped(parent_pid: u32, target: u32) -> bool {
+    unsafe {
+        let t = tcbs();
+        let n = (&raw const N).read();
+        for i in 1..n {
+            let tcb = &*t.add(i);
+            if tcb.parent_pid == parent_pid
+                && tcb.state == RunState::Stopped
+                && (target == 0 || tcb.pid == target)
+            {
+                return true;
+            }
+        }
+        false
+    }
+}
+
 /// Point the *current* process at a new address space (B3 Step 5c `exec`): the
 /// process keeps its pid + kernel stack, but its user space is replaced. Updates
 /// the TCB's PML4 and switches CR3 now (so the syscall return `iretq`s into the

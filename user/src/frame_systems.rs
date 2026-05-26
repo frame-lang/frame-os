@@ -33,6 +33,9 @@ pub struct JobEntry {
     pub cmd: String,
     /// Set once the child has been reaped via the non-blocking sweep.
     pub done: bool,
+    /// Set while the job is job-control stopped (SIGTSTP/SIGSTOP); cleared on
+    /// resume (bg/fg). Mutually exclusive with `done` in practice.
+    pub stopped: bool,
     /// The child's exit code, valid once `done` is true.
     pub code: i32,
 }

@@ -48,10 +48,30 @@ fn write(fd: u64, buf: &[u8]) {
 fn time() -> u64 {
     unsafe { syscall3(18, 0, 0, 0) }
 }
+fn cstr_len(p: *const u8) -> usize {
+    let mut n = 0;
+    unsafe {
+        while *p.add(n) != 0 {
+            n += 1;
+        }
+    }
+    n
+}
 
 #[no_mangle]
-extern "C" fn spin_main(_sp: *const u64) -> ! {
-    write(1, b"spin: alive\n");
+extern "C" fn spin_main(sp: *const u64) -> ! {
+    // "spin: alive [tag]" — an optional argv[1] tag makes a given instance's
+    // banner unique (the signal tests launch several spins; a tag lets a test
+    // wait for *its* instance rather than matching an earlier one's line).
+    write(1, b"spin: alive");
+    let argc = unsafe { *sp };
+    if argc >= 2 {
+        let p = unsafe { *sp.add(2) } as *const u8; // argv[1]
+        let tag = unsafe { core::slice::from_raw_parts(p, cstr_len(p)) };
+        write(1, b" ");
+        write(1, tag);
+    }
+    write(1, b"\n");
     loop {
         // A cheap syscall gives any pending signal a delivery boundary; the
         // busy spin keeps us off a tight syscall storm without ever blocking.

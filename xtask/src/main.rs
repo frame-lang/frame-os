@@ -1671,6 +1671,28 @@ fn run_console_test() -> Result<()> {
         wait_for_output(&buf, "continued", 90)?; // SIGCONT resumed it from Stopped
         stdin.write_all(b"kill %4\n").context("write kill (cleanup)")?;
         stdin.flush().ok();
+        // S10 2c-ii: terminal job control. `spin fg2c` runs in the FOREGROUND
+        // (no `&`); the shell registers it via set_foreground and blocks in
+        // waitpid. Sending Ctrl-Z (0x1A) makes the console deliver SIGTSTP to it
+        // → it stops (sig 20) and the shell's WUNTRACED wait returns, so the
+        // shell reports `[5]+ Stopped` and reprompts (rather than hanging). `bg
+        // %5` resumes it (SIGCONT) in the background; `jobs` then shows it
+        // Running. The `fg2c` tag makes spin's banner unique to this instance.
+        eprintln!("console-test: typing `spin fg2c` (fg) + Ctrl-Z + `bg %5` + `jobs` (terminal job control)");
+        stdin.write_all(b"spin fg2c\n").context("write spin fg")?;
+        stdin.flush().ok();
+        wait_for_output(&buf, "spin: alive fg2c", 90)?; // the foreground instance is up
+        stdin.write_all(&[0x1A]).context("write Ctrl-Z")?; // SIGTSTP to the foreground job
+        stdin.flush().ok();
+        wait_for_output(&buf, "stopped (sig 20", 90)?; // SIGTSTP (20) delivered → suspended
+        wait_for_output(&buf, "Stopped   spin fg2c", 90)?; // WUNTRACED wait returned → shell reported + reprompted
+        stdin.write_all(b"bg %5\n").context("write bg %5")?;
+        stdin.flush().ok();
+        stdin.write_all(b"jobs\n").context("write jobs")?;
+        stdin.flush().ok();
+        wait_for_output(&buf, "] Running", 90)?; // bg resumed it (SIGCONT) → jobs shows it Running
+        stdin.write_all(b"kill %5\n").context("write kill %5 (cleanup)")?;
+        stdin.flush().ok();
                                                                 // B9-2: argv reaches the program. Type a command WITH arguments; argtest
                                                                 // echoes argc + each argv string, so we can assert the args arrived.
         eprintln!("console-test: typing `/bin/argtest alpha beta`");

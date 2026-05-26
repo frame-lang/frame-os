@@ -114,6 +114,17 @@ fn reap_nohang() -> u64 {
 fn kill(pid: u64, sig: u64) -> u64 {
     unsafe { syscall3(29, pid, sig, 0) }
 }
+/// set_foreground (#33): tell the kernel which pid is the foreground job, so the
+/// console's Ctrl-C/Ctrl-Z routes the terminal signal to it. 0 = none (the shell
+/// is back at its prompt).
+fn set_foreground(pid: u64) {
+    unsafe { syscall3(33, pid, 0, 0) };
+}
+/// waitpid returns this (bit 63) when the target stopped (job-control suspend,
+/// POSIX WIFSTOPPED) instead of exiting. Must match usermode::WSTOPPED_FLAG.
+const WSTOPPED: u64 = 1 << 63;
+/// SIGCONT, sent to resume a stopped job (bg/fg).
+const SIGCONT: u64 = 18;
 fn open(path: &[u8]) -> u64 {
     unsafe { syscall3(5, path.as_ptr() as u64, path.len() as u64, 0) }
 }
@@ -262,17 +273,28 @@ fn run_external(
         print_u64(child);
         write_char(b'\n');
     } else {
-        // Foreground: drive the FSM into $Foreground for the duration, wait for
-        // *this* child specifically, then back to $Idle. Waiting on the exact pid
-        // (not `wait`-any) is what keeps the shell from racing ahead of the
-        // command it just launched — a bare `wait` could reap an unrelated older
-        // child and return while this one is still running, so a following builtin
-        // (e.g. `cat`) would see stale state. The FSM's $Foreground state encodes
-        // exactly this window: the shell is blocked here and won't touch the job
-        // table until fg_done().
+        // Foreground: drive the FSM into $Foreground for the duration, register
+        // the child as the foreground job (so Ctrl-C/Ctrl-Z reach it), and wait
+        // for *this* child specifically. Waiting on the exact pid (not `wait`-any)
+        // keeps the shell from racing ahead of the command it just launched. The
+        // FSM's $Foreground state encodes this window: the shell is blocked here
+        // and won't touch the job table until fg_done().
         jobs.launch_fg();
-        waitpid(child);
+        set_foreground(child);
+        let st = waitpid(child);
+        set_foreground(0);
         jobs.fg_done();
+        if st & WSTOPPED != 0 {
+            // Ctrl-Z (or SIGSTOP) suspended the job rather than ending it. It
+            // becomes a tracked stopped background job, bash-style, so `jobs` /
+            // `bg` / `fg` can manage it.
+            jobs.launch_stopped(child, String::from(cmd_str));
+            write_char(b'[');
+            print_u64(jobs.last_id() as u64);
+            print(b"]+ Stopped   ");
+            print(cmd_str.as_bytes());
+            write_char(b'\n');
+        }
     }
 }
 
@@ -389,37 +411,37 @@ fn harvest(jobs: &mut IshJobs) {
     }
 }
 
-/// `fg <id>`: bring a tracked background job to the foreground — block until it
-/// finishes, then drop it from the table. The pid is looked up in the FSM's
-/// snapshot; the FSM tracks the $Idle→$Foreground→$Idle window around the wait.
-fn fg_job(arg: Option<&str>, jobs: &mut IshJobs) {
-    let snap = jobs.snapshot();
-    // Default to the most-recently-launched still-running job (highest id),
-    // matching bash's `fg` with no argument.
-    let id = match arg {
-        Some(s) => match parse_u32(s) {
-            Some(n) => n,
-            None => {
-                print(b"fg: not a job id: ");
-                print(s.as_bytes());
-                write_char(b'\n');
-                return;
-            }
-        },
-        None => {
-            let mut best = 0u32;
-            for e in &snap {
-                if !e.done && e.id > best {
-                    best = e.id;
-                }
-            }
-            best
+/// Resolve a job-spec argument (`%N`, bare `N`, or None=most-recent) to a job id.
+/// `stopped_only` picks the highest *stopped* job when no argument is given
+/// (bash's `bg`); otherwise the highest non-done job (bash's `fg`). 0 = none.
+fn resolve_job_id(arg: Option<&str>, jobs: &mut IshJobs, stopped_only: bool) -> u32 {
+    if let Some(s) = arg {
+        let spec = s.strip_prefix('%').unwrap_or(s);
+        return parse_u32(spec).unwrap_or(0);
+    }
+    let mut best = 0u32;
+    for e in &jobs.snapshot() {
+        if !e.done && (!stopped_only || e.stopped) && e.id > best {
+            best = e.id;
         }
-    };
+    }
+    best
+}
+
+/// `fg [id]`: bring a tracked job to the foreground — resume it if stopped
+/// (SIGCONT), then block until it finishes or stops again. On exit it's dropped;
+/// on another Ctrl-Z it stays a stopped job. The FSM tracks the
+/// $Idle→$Foreground→$Idle window around the wait.
+fn fg_job(arg: Option<&str>, jobs: &mut IshJobs) {
+    let id = resolve_job_id(arg, jobs, false);
     let mut pid = 0u64;
-    for e in &snap {
+    let mut was_stopped = false;
+    let mut cmd = String::new();
+    for e in &jobs.snapshot() {
         if e.id == id && !e.done {
             pid = e.pid;
+            was_stopped = e.stopped;
+            cmd = e.cmd.clone();
             break;
         }
     }
@@ -427,10 +449,55 @@ fn fg_job(arg: Option<&str>, jobs: &mut IshJobs) {
         print(b"fg: no such job\n");
         return;
     }
+    // bash echoes the command being foregrounded.
+    print(cmd.as_bytes());
+    write_char(b'\n');
+    if was_stopped {
+        kill(pid, SIGCONT); // resume the stopped job before waiting on it
+        jobs.mark_running(id);
+    }
     jobs.launch_fg();
-    waitpid(pid);
+    set_foreground(pid);
+    let st = waitpid(pid);
+    set_foreground(0);
     jobs.fg_done();
-    jobs.remove(id);
+    if st & WSTOPPED != 0 {
+        // Stopped again (Ctrl-Z during the foreground run): keep it as a job.
+        jobs.mark_stopped(id);
+        write_char(b'[');
+        print_u64(id as u64);
+        print(b"]+ Stopped   ");
+        print(cmd.as_bytes());
+        write_char(b'\n');
+    } else {
+        jobs.remove(id);
+    }
+}
+
+/// `bg [id]`: resume a stopped job in the background (SIGCONT) and leave it
+/// running there. It's harvested at a later prompt when it exits.
+fn bg_job(arg: Option<&str>, jobs: &mut IshJobs) {
+    let id = resolve_job_id(arg, jobs, true);
+    let mut pid = 0u64;
+    let mut cmd = String::new();
+    for e in &jobs.snapshot() {
+        if e.id == id && !e.done {
+            pid = e.pid;
+            cmd = e.cmd.clone();
+            break;
+        }
+    }
+    if pid == 0 {
+        print(b"bg: no such job\n");
+        return;
+    }
+    kill(pid, SIGCONT);
+    jobs.mark_running(id);
+    write_char(b'[');
+    print_u64(id as u64);
+    print(b"] ");
+    print(cmd.as_bytes());
+    print(b" &\n");
 }
 
 /// Map a signal spec (name without the `-`, or a number) to its number.
@@ -518,6 +585,8 @@ fn list_jobs(jobs: &mut IshJobs) {
         print(b"] ");
         if e.done {
             print(b"Done    ");
+        } else if e.stopped {
+            print(b"Stopped ");
         } else {
             print(b"Running ");
         }
@@ -573,16 +642,17 @@ fn run_line(line: &str, jobs: &mut IshJobs) {
     match toks[0].as_str() {
         "exit" => exit(0),
         "help" => {
-            print(b"ish builtins: help, exit, cd [dir], pwd, clear, cat <path>..., jobs, fg [id], kill %<job>|<pid>\n");
+            print(b"ish builtins: help, exit, cd [dir], pwd, clear, cat <path>..., jobs, fg [id], bg [id], kill %<job>|<pid>\n");
             print(b"on disk in /bin: ls, echo, rm, cp, touch, wc, head, tail, grep, date, mkdir, rmdir, mv, ps, ...\n");
             print(b"redirection (external cmds): cmd > file, cmd >> file, cmd < file\n");
             print(b"pipes: cmd1 | cmd2 (connect cmd1's stdout to cmd2's stdin)\n");
-            print(b"background: cmd &   (then `jobs` to list, `fg [id]` to foreground)\n");
+            print(b"background: cmd &   (jobs/fg/bg manage; Ctrl-Z stops the foreground job, Ctrl-C interrupts)\n");
         }
         // jobs / fg are builtins: they read+drive *this shell's* IshJobs FSM,
         // which lives in the shell process (forking would lose it).
         "jobs" => list_jobs(jobs),
         "fg" => fg_job(toks.get(1).map(|s| s.as_str()), jobs),
+        "bg" => bg_job(toks.get(1).map(|s| s.as_str()), jobs),
         "kill" => kill_cmd(&toks, jobs),
         // cd must be a builtin: it changes *this shell's* cwd (per-process in the
         // kernel). No arg → go to root.

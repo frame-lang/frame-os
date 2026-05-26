@@ -79,6 +79,24 @@ pub fn feed(b: u8) {
             c.ring_push(b'\n');
             c.cur_len = 0;
         }
+        // Ctrl-C (0x03) / Ctrl-Z (0x1A): terminal job-control signals (S10 2c).
+        // Send SIGINT / SIGTSTP to the current foreground process (the job the
+        // shell is waiting on). No foreground (fg == 0, i.e. the shell is idle at
+        // its prompt) ⇒ ignore. Echo the conventional ^C/^Z. The edit line is
+        // dropped (matches a terminal interrupting the current input).
+        0x03 | 0x1A => {
+            let fg = crate::usermode::foreground_pid();
+            let (sig, label): (u32, &str) = if b == 0x03 {
+                (crate::usermode::SIGINT, "^C\r\n")
+            } else {
+                (crate::usermode::SIGTSTP, "^Z\r\n")
+            };
+            serial::write_str(label);
+            c.cur_len = 0;
+            if fg != 0 {
+                crate::sched::send_signal(fg, sig);
+            }
+        }
         // Backspace / DEL: rub out the last char on screen and in the edit buffer.
         0x08 | 0x7F if c.cur_len > 0 => {
             c.cur_len -= 1;

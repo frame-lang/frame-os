@@ -39,6 +39,9 @@
         // ish forked a `cmd &` child; record it as a background job. Assigns
         // the next job id (readable afterwards via last_id()). Stays in $Idle.
         launch_bg(pid: u64, cmd: String)
+        // A foreground job that was just Ctrl-Z'd (or otherwise stopped) becomes
+        // a tracked, stopped background job. Like launch_bg but flagged stopped.
+        launch_stopped(pid: u64, cmd: String)
         // A foreground job is starting (plain external command, a pipeline, or
         // `fg <id>` resuming a background job). ish then forks + blocks in
         // waitpid; this just records the mode.
@@ -48,6 +51,10 @@
         // A reaped child (from the non-blocking reap-any sweep at the prompt):
         // flag the matching table entry $Done with its exit code.
         mark_done(pid: u64, code: i32)
+        // Clear an entry's stopped flag (it was resumed via bg/fg → running).
+        mark_running(id: u32)
+        // Set an entry's stopped flag (it was Ctrl-Z'd again while in foreground).
+        mark_stopped(id: u32)
         // Drop a table entry by job id (after its "Done" line is reported, or
         // after `fg <id>` finishes waiting on it).
         remove(id: u32)
@@ -66,6 +73,20 @@
                     pid: pid,
                     cmd: cmd,
                     done: false,
+                    stopped: false,
+                    code: 0,
+                });
+                self.last_id = self.next_id;
+                self.next_id += 1;
+            }
+
+            launch_stopped(pid: u64, cmd: String) {
+                self.entries.push(JobEntry {
+                    id: self.next_id,
+                    pid: pid,
+                    cmd: cmd,
+                    done: false,
+                    stopped: true,
                     code: 0,
                 });
                 self.last_id = self.next_id;
@@ -81,6 +102,24 @@
                     if e.pid == pid {
                         e.done = true;
                         e.code = code;
+                        break;
+                    }
+                }
+            }
+
+            mark_running(id: u32) {
+                for e in self.entries.iter_mut() {
+                    if e.id == id {
+                        e.stopped = false;
+                        break;
+                    }
+                }
+            }
+
+            mark_stopped(id: u32) {
+                for e in self.entries.iter_mut() {
+                    if e.id == id {
+                        e.stopped = true;
                         break;
                     }
                 }

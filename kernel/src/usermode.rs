@@ -98,6 +98,23 @@ static mut PENDING_WAIT: bool = false;
 // ahead of it), or 0 = "any child" (POSIX `wait`). Set alongside PENDING_WAIT.
 static mut PENDING_WAIT_PID: u32 = 0;
 
+// The current foreground process pid (S10 2c), set by the shell via the
+// set_foreground syscall (#33) around a foreground wait. The console's terminal
+// signal handler (Ctrl-C/Ctrl-Z) sends SIGINT/SIGTSTP here; 0 = no foreground
+// job (the shell is idle at its prompt), so those keystrokes are ignored.
+static mut FOREGROUND_PID: u32 = 0;
+
+/// The current foreground process pid (0 = none). Read by the console's
+/// Ctrl-C/Ctrl-Z handler to target the terminal signal.
+pub fn foreground_pid() -> u32 {
+    unsafe { (&raw const FOREGROUND_PID).read() }
+}
+
+/// Wait-status sentinel (S10 2c): the target child stopped (job-control suspend)
+/// rather than exited — POSIX WIFSTOPPED. The shell distinguishes this from a
+/// normal exit code (small non-negative) and from ECHILD (u64::MAX).
+pub const WSTOPPED_FLAG: u64 = 1 << 63;
+
 // `read_line` (B8) likewise BLOCKS until the user types a newline — which must
 // not happen inside the dispatcher handler. The handler records the user buffer
 // pointer (0 = none) + length; the blocking line read happens in
@@ -417,7 +434,7 @@ fn proc_table() -> &'static mut ProcessTable {
 /// primitive; 23 is the S6 pipe; 24/25 are the S7 directory ops; 26 is S8 mv;
 /// 27 is the S9 process-table snapshot.)
 pub fn is_known_syscall(num: u64) -> bool {
-    num <= 32
+    num <= 33
 }
 
 // POSIX signal numbers (Linux x86-64 ABI subset, S10). Only the ones Frame OS
@@ -865,6 +882,13 @@ pub fn perform_syscall(num: u64, a0: u64, _a1: u64) -> u64 {
             // SIGKILL/SIGSTOP can't be blocked (enforced in set_signal_mask).
             sched::set_signal_mask(a0 as u32, _a1 as u32) as u64
         }
+        33 => {
+            // set_foreground(pid=a0): record the shell's current foreground job
+            // (S10 2c). The console's Ctrl-C/Ctrl-Z handler signals this pid.
+            // 0 clears it (the shell is back at its prompt). Always succeeds.
+            unsafe { (&raw mut FOREGROUND_PID).write(a0 as u32) };
+            0
+        }
         _ => u64::MAX, // unreachable: validated by is_known_syscall
     }
 }
@@ -1103,7 +1127,19 @@ fn do_wait_loop(target: u32) -> u64 {
             sched::has_child(me, t)
         }
     };
-    sched::block_current_until(|| sched::child_reapable(me, target) || !exists(target));
+    // Block until a matching child is reapable (exited), stopped (job-control
+    // suspend — POSIX WUNTRACED), or gone. Waking on *stopped* is what lets the
+    // foreground shell regain its prompt when Ctrl-Z suspends the job it's
+    // waiting on, instead of hanging until the job exits.
+    sched::block_current_until(|| {
+        sched::child_reapable(me, target) || sched::child_stopped(me, target) || !exists(target)
+    });
+    // A stopped (not exited) matching child with nothing reapable ⇒ report
+    // WSTOPPED without reaping it (a stopped process is still alive). The shell
+    // records it as a stopped job; a later SIGCONT (bg/fg) resumes it.
+    if !sched::child_reapable(me, target) && sched::child_stopped(me, target) {
+        return WSTOPPED_FLAG;
+    }
     // A matching child is now dead (or vanished). Reap the dead children; for a
     // specific target, drain the others too so unrelated zombies can't pile up.
     let result = if target == 0 {
