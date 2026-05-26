@@ -678,9 +678,7 @@ pub fn send_signal(pid: u32, sig: u32) -> bool {
                     // Wake a blocked target so it returns from its syscall and
                     // takes delivery at the boundary.
                     (*t.add(i)).state = RunState::Runnable;
-                } else if st == RunState::Stopped
-                    && (sig == SIGCONT_NUM || sig == SIGKILL_NUM)
-                {
+                } else if st == RunState::Stopped && (sig == SIGCONT_NUM || sig == SIGKILL_NUM) {
                     // SIGCONT resumes a stopped process; SIGKILL also un-stops it
                     // so it runs far enough to take the (unblockable) kill at its
                     // next boundary. The resume is the *sender's* action — the
@@ -963,13 +961,14 @@ pub fn child_stopped(parent_pid: u32, target: u32) -> bool {
 pub unsafe fn exec_into(new_pml4: u64) {
     let cur = (&raw const CURRENT).read();
     (*tcbs().add(cur)).pml4 = new_pml4;
-    (*tcbs().add(cur)).heap_brk = USER_HEAP_BASE; // new image ⇒ fresh, empty brk heap
+    // New image ⇒ fresh, empty brk heap.
+    (*tcbs().add(cur)).heap_brk = USER_HEAP_BASE;
     // New image ⇒ signal handlers reset to default (the old image's handler VAs
     // are meaningless in the new one). Pending + blocked sets persist (POSIX).
     (*tcbs().add(cur)).sig_handlers = [0; NSIG];
-                                                  // New image ⇒ fresh FPU: reset both the live registers and the saved area to
-                                                  // the clean template, so the old image's x87/SSE state (esp. MXCSR) can't
-                                                  // leak into the new program before its first context switch (B11-3a).
+    // New image ⇒ fresh FPU: reset both the live registers and the saved area to
+    // the clean template, so the old image's x87/SSE state (esp. MXCSR) can't
+    // leak into the new program before its first context switch (B11-3a).
     let c = fpu::clean();
     fpu_area(cur).write(c);
     fpu::restore(fpu_area(cur));

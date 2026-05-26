@@ -429,6 +429,7 @@ fn prepare_qemu_artifacts_features(workspace: &Path, interactive: bool) -> Resul
     let spin_elf = build_user_disk_elf(workspace, "spin")?; // S10 signal target
     let sigtest_elf = build_user_disk_elf(workspace, "sigtest")?; // S10 2b handler test
     let busyloop_elf = build_user_disk_elf(workspace, "busyloop")?; // S10 2d timer-delivery test
+
     // B11-3e: the BuildDriver-FSM-driven build tool (compile→link→run via tcc).
     let build_elf = build_user_disk_elf(workspace, "buildc")?;
     // V1.0 capstone: the Hello Frame system (frame/hello.frs) transpiled to Rust
@@ -1497,9 +1498,10 @@ fn run_console_test() -> Result<()> {
         wait_for_output(&buf, "readme", 90)?; // ls at root lists /readme
         wait_for_output(&buf, "/usr", 90)?; // pwd after `cd /usr`
         wait_for_output(&buf, "include", 90)?; // ls /usr lists `include`
-                                               // S3 coreutils on the Frame OS filesystem: touch creates a file (ls
-                                               // sees it), echo prints args, cp copies /readme → /b.txt (cat proves
-                                               // the bytes), rm deletes. (cwd is / after the nav block's `cd /`.)
+
+        // S3 coreutils on the Frame OS filesystem: touch creates a file (ls
+        // sees it), echo prints args, cp copies /readme → /b.txt (cat proves
+        // the bytes), rm deletes. (cwd is / after the nav block's `cd /`.)
         eprintln!("console-test: typing touch / echo / cp / cat / rm");
         stdin
             .write_all(
@@ -1510,9 +1512,10 @@ fn run_console_test() -> Result<()> {
         wait_for_output(&buf, "a.txt", 90)?; // ls after `touch /a.txt`
         wait_for_output(&buf, "hi-there", 90)?; // echo
         wait_for_output(&buf, "hello from the disk", 90)?; // cat of the cp'd /readme
-                                                           // S4 text utilities: wc counts /readme ("hello from the disk\n" = 1 line,
-                                                           // 4 words, 20 bytes), date prints the pinned RTC, and head/tail/grep/clear
-                                                           // run without error. (clear's ANSI escape is harmless in the capture.)
+
+        // S4 text utilities: wc counts /readme ("hello from the disk\n" = 1 line,
+        // 4 words, 20 bytes), date prints the pinned RTC, and head/tail/grep/clear
+        // run without error. (clear's ANSI escape is harmless in the capture.)
         eprintln!("console-test: typing wc / head / tail / grep / date / clear");
         stdin
             .write_all(b"wc /readme\nhead /readme\ntail /readme\ngrep disk /readme\ndate\nclear\n")
@@ -1520,13 +1523,14 @@ fn run_console_test() -> Result<()> {
         stdin.flush().ok();
         wait_for_output(&buf, "1 4 20 /readme", 90)?; // wc
         wait_for_output(&buf, "2026-05-24 12:", 90)?; // date (pinned RTC base)
-                                                      // S5 I/O redirection: `>` creates /r.txt with echo's stdout, `>>` appends
-                                                      // (must NOT truncate), and `wc < /r.txt` reads it back via stdin. The only
-                                                      // assertion is `wc`'s "2 2 20": that exact count appears only if `>` made the
-                                                      // file ("redir-out\n", 10B), `>>` appended ("redir-app\n", 10B → 2 lines, 2
-                                                      // words, 20 bytes total, proving it didn't truncate), and `<` fed it to wc.
-                                                      // (We can't assert on "redir-out"/"redir-app" themselves — the kernel echoes
-                                                      // the typed command line, so those strings are in the stream regardless.)
+
+        // S5 I/O redirection: `>` creates /r.txt with echo's stdout, `>>` appends
+        // (must NOT truncate), and `wc < /r.txt` reads it back via stdin. The only
+        // assertion is `wc`'s "2 2 20": that exact count appears only if `>` made the
+        // file ("redir-out\n", 10B), `>>` appended ("redir-app\n", 10B → 2 lines, 2
+        // words, 20 bytes total, proving it didn't truncate), and `<` fed it to wc.
+        // (We can't assert on "redir-out"/"redir-app" themselves — the kernel echoes
+        // the typed command line, so those strings are in the stream regardless.)
         eprintln!("console-test: typing echo > / >> / wc < (redirection)");
         stdin
             .write_all(
@@ -1535,21 +1539,23 @@ fn run_console_test() -> Result<()> {
             .context("write redirection")?;
         stdin.flush().ok();
         wait_for_output(&buf, "2 2 20", 90)?; // wc < /r.txt after > then >>
-                                              // S6 pipe: connect echo's stdout to wc's stdin. `echo pipe one two` writes
-                                              // "pipe one two\n" (13 bytes, 3 words, 1 line) into the pipe; wc reads it
-                                              // from stdin and prints "1 3 13" — which is not in the typed command, so it
-                                              // only appears if the pipe actually carried the bytes between the two procs.
+
+        // S6 pipe: connect echo's stdout to wc's stdin. `echo pipe one two` writes
+        // "pipe one two\n" (13 bytes, 3 words, 1 line) into the pipe; wc reads it
+        // from stdin and prints "1 3 13" — which is not in the typed command, so it
+        // only appears if the pipe actually carried the bytes between the two procs.
         eprintln!("console-test: typing `echo pipe one two | wc` (pipe)");
         stdin
             .write_all(b"echo pipe one two | wc\n")
             .context("write pipe")?;
         stdin.flush().ok();
         wait_for_output(&buf, "1 3 13", 90)?; // wc counting echo's piped stdout
-                                              // S7 directories: mkdir /zsub creates it; the *second* mkdir fails
-                                              // ("cannot create directory") which proves the first one created it;
-                                              // rmdir removes it, after which `cd /zsub` fails ("no such directory")
-                                              // proving it's gone. Both asserted strings are program/shell output, not
-                                              // in the typed commands, so they can't be satisfied by the input echo.
+
+        // S7 directories: mkdir /zsub creates it; the *second* mkdir fails
+        // ("cannot create directory") which proves the first one created it;
+        // rmdir removes it, after which `cd /zsub` fails ("no such directory")
+        // proving it's gone. Both asserted strings are program/shell output, not
+        // in the typed commands, so they can't be satisfied by the input echo.
         eprintln!("console-test: typing mkdir / rmdir (directories)");
         stdin
             .write_all(b"mkdir /zsub\nmkdir /zsub\nrmdir /zsub\ncd /zsub\n")
@@ -1557,10 +1563,11 @@ fn run_console_test() -> Result<()> {
         stdin.flush().ok();
         wait_for_output(&buf, "cannot create directory", 90)?; // 2nd mkdir → dir exists ⇒ 1st made it
         wait_for_output(&buf, "no such directory: /zsub", 90)?; // cd after rmdir ⇒ rmdir removed it
-                                              // S8 rename: `echo movesrc > /msrc` makes an 8-byte file; `mv /msrc /mdst`
-                                              // re-points it; `wc /mdst` → "1 1 8 /mdst" proves the content is now at the
-                                              // destination, and `cat /msrc` → "cannot open /msrc" proves the source name
-                                              // is gone. The counts + the error are program output, not typed input.
+
+        // S8 rename: `echo movesrc > /msrc` makes an 8-byte file; `mv /msrc /mdst`
+        // re-points it; `wc /mdst` → "1 1 8 /mdst" proves the content is now at the
+        // destination, and `cat /msrc` → "cannot open /msrc" proves the source name
+        // is gone. The counts + the error are program output, not typed input.
         eprintln!("console-test: typing echo > / mv / wc / cat (rename)");
         stdin
             .write_all(b"echo movesrc > /msrc\nmv /msrc /mdst\nwc /mdst\ncat /msrc\n")
@@ -1568,18 +1575,20 @@ fn run_console_test() -> Result<()> {
         stdin.flush().ok();
         wait_for_output(&buf, "1 1 8 /mdst", 90)?; // moved content lands at the destination
         wait_for_output(&buf, "cannot open /msrc", 90)?; // source name is gone after the move
-                                              // S9 process listing: `ps` snapshots the live process table. The header is
-                                              // deterministic program output; the `    1     0 ` row is the shell itself
-                                              // (pid 1, ppid 0) — proving ps reports real per-process identity, not just a
-                                              // header. (The shell's STAT char is left unasserted: it's R or S depending on
-                                              // whether it's mid-reap or blocked in wait() the instant ps snapshots; the
-                                              // column itself is exercised — sibling rows show R for ps + Z for a zombie.)
-                                              // Both asserted strings are program output, not typed input.
+
+        // S9 process listing: `ps` snapshots the live process table. The header is
+        // deterministic program output; the `    1     0 ` row is the shell itself
+        // (pid 1, ppid 0) — proving ps reports real per-process identity, not just a
+        // header. (The shell's STAT char is left unasserted: it's R or S depending on
+        // whether it's mid-reap or blocked in wait() the instant ps snapshots; the
+        // column itself is exercised — sibling rows show R for ps + Z for a zombie.)
+        // Both asserted strings are program output, not typed input.
         eprintln!("console-test: typing `ps` (process list)");
         stdin.write_all(b"ps\n").context("write ps")?;
         stdin.flush().ok();
         wait_for_output(&buf, "PID  PPID STAT", 90)?; // ps header ⇒ the snapshot syscall ran
         wait_for_output(&buf, "    1     0 ", 90)?; // the shell row: pid 1, ppid 0 (STAT varies)
+
         // S10 job control: `echo bgjob &` forks the echo child and returns to the
         // prompt *without* waiting — ish records it in the IshJobs FSM (job id 1)
         // and echoes `[1] <pid>` bash-style. The child runs + exits while the shell
@@ -1594,6 +1603,7 @@ fn run_console_test() -> Result<()> {
             .context("write background job")?;
         stdin.flush().ok();
         wait_for_output(&buf, "[1] ", 90)?; // `[1] <pid>` ⇒ job launched in background, not waited on
+
         // Trigger the harvest with a FOREGROUND EXTERNAL command (`echo` is
         // /bin/echo — it forks + the shell waitpid's it), NOT a builtin. This
         // also guards the S10 bug-1 fix: a foreground waitpid must reap only its
@@ -1609,6 +1619,7 @@ fn run_console_test() -> Result<()> {
         stdin.write_all(b"fg 99\n").context("write fg 99")?;
         stdin.flush().ok();
         wait_for_output(&buf, "fg: no such job", 90)?; // fg on an unknown id ⇒ clean error
+
         // S10 signals: `spin &` backgrounds a long-lived process (job id 2 — job 1
         // was the harvested echo above; next_id is monotonic). `kill %2` resolves
         // the job spec to spin's pid through the IshJobs FSM snapshot and sends
@@ -1633,6 +1644,7 @@ fn run_console_test() -> Result<()> {
             .context("write pwd (trigger harvest after kill)")?;
         stdin.flush().ok();
         wait_for_output(&buf, "Done   spin", 90)?; // killed job reaped + reported by the IshJobs FSM
+
         // S10 2b signal handlers: sigtest installs a SIGTERM handler (sigaction
         // #30). `kill %3` (job 3 — echo/spin were 1/2 and are gone) sends SIGTERM;
         // the kernel enters the handler instead of terminating, pushing a signal
@@ -1643,7 +1655,9 @@ fn run_console_test() -> Result<()> {
         // strings are sigtest's own output: the handler line proves the trampoline
         // fired, the resume line proves sigreturn round-tripped.
         eprintln!("console-test: typing `sigtest &` then `kill %3` (signal handler + sigreturn)");
-        stdin.write_all(b"sigtest &\n").context("write sigtest bg")?;
+        stdin
+            .write_all(b"sigtest &\n")
+            .context("write sigtest bg")?;
         stdin.flush().ok();
         wait_for_output(&buf, "sigtest: ready", 90)?; // handler installed, looping
         stdin.write_all(b"kill %3\n").context("write kill %3")?;
@@ -1655,6 +1669,7 @@ fn run_console_test() -> Result<()> {
             .context("write pwd (trigger harvest after sigtest)")?;
         stdin.flush().ok();
         wait_for_output(&buf, "Done   sigtest", 90)?; // exited 0 on its own → harvested + reported
+
         // S10 2c-i: job-control stop/continue. `spin &` (job 4) backgrounds a
         // long-lived process; `kill -STOP %4` sends SIGSTOP — its default action
         // suspends spin (RunState::Stopped, skipped by the round-robin); `kill
@@ -1663,7 +1678,9 @@ fn run_console_test() -> Result<()> {
         // final `kill %4` terminates the resumed job (cleanup, not asserted — its
         // exit log isn't distinguishable from the 2a spin's).
         eprintln!("console-test: typing `spin sigb &` + `kill -STOP/-CONT %4` (job-control suspend/resume)");
-        stdin.write_all(b"spin sigb &\n").context("write spin bg (2c)")?;
+        stdin
+            .write_all(b"spin sigb &\n")
+            .context("write spin bg (2c)")?;
         stdin.flush().ok();
         wait_for_output(&buf, "spin: alive sigb", 90)?; // the long-lived job is running (unique tag)
         stdin
@@ -1676,6 +1693,7 @@ fn run_console_test() -> Result<()> {
             .context("write kill -CONT")?;
         stdin.flush().ok();
         wait_for_output(&buf, "continued", 90)?; // SIGCONT resumed it from Stopped
+
         // Terminate + fully reap the job before moving on, so its async exit log
         // can't interleave into a later test's output (a `pwd` triggers the
         // harvest; wait for the unique Done line to confirm it's gone).
@@ -1693,6 +1711,7 @@ fn run_console_test() -> Result<()> {
         stdin.write_all(b"pwd\n").context("write pwd (reap 2c-i)")?;
         stdin.flush().ok();
         wait_for_output(&buf, "Done   spin sigb", 90)?; // reaped + reported before continuing
+
         // S10 2c-ii: terminal job control. `spin fg2c` runs in the FOREGROUND
         // (no `&`); the shell registers it via set_foreground and blocks in
         // waitpid. Sending Ctrl-Z (0x1A) makes the console deliver SIGTSTP to it
@@ -1713,6 +1732,7 @@ fn run_console_test() -> Result<()> {
         stdin.write_all(b"jobs\n").context("write jobs")?;
         stdin.flush().ok();
         wait_for_output(&buf, "] Running", 90)?; // bg resumed it (SIGCONT) → jobs shows it Running
+
         // Terminate + fully reap before later sections (else its async exit log
         // interleaves into e.g. cmain's output and splits a needle).
         // Terminate with SIGKILL (exit 128+9 = 137, unique to this step) and wait
@@ -1723,9 +1743,12 @@ fn run_console_test() -> Result<()> {
             .context("write kill -KILL (cleanup)")?;
         stdin.flush().ok();
         wait_for_output(&buf, "exited with code 137", 90)?; // SIGKILL default terminate (unique code)
-        stdin.write_all(b"pwd\n").context("write pwd (reap 2c-ii)")?;
+        stdin
+            .write_all(b"pwd\n")
+            .context("write pwd (reap 2c-ii)")?;
         stdin.flush().ok();
         wait_for_output(&buf, "Done   spin fg2c", 90)?; // reaped + reported before continuing
+
         // S10 2d: signal a CPU-bound process via the timer-path delivery (the
         // vDSO exit trampoline). `busyloop` makes NO syscalls after its banner, so
         // syscall-boundary delivery can never reach it — the only way to kill it
@@ -1733,11 +1756,17 @@ fn run_console_test() -> Result<()> {
         // `kill -6 %6` (SIGABRT → exit 128+6 = 134, an exit code unique to this
         // step) proves it: if busyloop reaches exit 134, the timer-path terminate
         // worked. Then reap it (harvest) before the later sections.
-        eprintln!("console-test: typing `busyloop &` then `kill -6 %6` (timer-path signal delivery)");
-        stdin.write_all(b"busyloop &\n").context("write busyloop bg")?;
+        eprintln!(
+            "console-test: typing `busyloop &` then `kill -6 %6` (timer-path signal delivery)"
+        );
+        stdin
+            .write_all(b"busyloop &\n")
+            .context("write busyloop bg")?;
         stdin.flush().ok();
         wait_for_output(&buf, "busyloop: running", 90)?; // the CPU-bound (syscall-free) job is up
-        stdin.write_all(b"kill -6 %6\n").context("write kill -6 %6")?;
+        stdin
+            .write_all(b"kill -6 %6\n")
+            .context("write kill -6 %6")?;
         stdin.flush().ok();
         wait_for_output(&buf, "exited with code 134", 90)?; // SIGABRT delivered via the timer trampoline → terminated
         stdin
@@ -1745,8 +1774,9 @@ fn run_console_test() -> Result<()> {
             .context("write fg cmd (reap busyloop)")?;
         stdin.flush().ok();
         wait_for_output(&buf, "Done   busyloop", 90)?; // reaped + reported before continuing
-                                                                // B9-2: argv reaches the program. Type a command WITH arguments; argtest
-                                                                // echoes argc + each argv string, so we can assert the args arrived.
+
+        // B9-2: argv reaches the program. Type a command WITH arguments; argtest
+        // echoes argc + each argv string, so we can assert the args arrived.
         eprintln!("console-test: typing `/bin/argtest alpha beta`");
         stdin
             .write_all(b"/bin/argtest alpha beta\n")
