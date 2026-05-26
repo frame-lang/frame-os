@@ -70,8 +70,8 @@
             launch_bg(pid: u64, cmd: String) {
                 self.entries.push(JobEntry {
                     id: self.next_id,
-                    pid: pid,
-                    cmd: cmd,
+                    pid,
+                    cmd,
                     done: false,
                     stopped: false,
                     code: 0,
@@ -83,8 +83,8 @@
             launch_stopped(pid: u64, cmd: String) {
                 self.entries.push(JobEntry {
                     id: self.next_id,
-                    pid: pid,
-                    cmd: cmd,
+                    pid,
+                    cmd,
                     done: false,
                     stopped: true,
                     code: 0,

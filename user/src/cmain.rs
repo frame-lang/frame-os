@@ -9,6 +9,11 @@
 
 #![no_std]
 #![no_main]
+// This program deliberately hand-builds NUL-terminated `b"...\0"` byte strings:
+// it's the C-runtime linkage test, exercising the exact `*const u8` C-string
+// hand-off a tcc-compiled program takes. `c"..."` literals would defeat the
+// point (and pull in `CStr`), so silence the clippy suggestion module-wide.
+#![allow(clippy::manual_c_str_literals)]
 
 use frame_os_libc::{
     fclose, feof, fgets, fopen, fprintf_args, fputs, fread, free, malloc, print_fmt, realloc,

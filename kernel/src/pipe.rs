@@ -133,7 +133,9 @@ pub fn dec_writer(id: usize) {
 
 fn free_if_idle(id: usize) {
     let p = &mut pool()[id];
-    let free = p.fsm.as_mut().is_none_or(|f| f.is_free());
+    // `map_or(true, …)` rather than `is_none_or` (stable only since 1.82) to
+    // honor the crate's declared MSRV (1.75).
+    let free = p.fsm.as_mut().map_or(true, |f| f.is_free());
     if free {
         p.fsm = None;
         p.len = 0;

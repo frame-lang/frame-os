@@ -604,6 +604,7 @@ pub fn deliver_on_preempt(frame: *mut TrapFrame) -> bool {
 ///   - save the full interrupted TrapFrame (so sigreturn can restore it);
 ///   - push `restorer` as the handler's return address — when the handler
 ///     `ret`s it lands in the restorer stub, which invokes sigreturn (#31).
+///
 /// On entry the handler sees rdi = signal number (SysV arg0) and rsp 16-byte
 /// aligned per the ABI (rsp ≡ 8 mod 16 at the call boundary).
 unsafe fn setup_signal_frame(f: &mut TrapFrame, sig: u32, handler: u64, restorer: u64) {
@@ -726,6 +727,7 @@ fn resolve_user_path(ptr: u64, len: usize, out: &mut [u8]) -> Option<usize> {
 ///   - `new_end > break` → grow: map fresh, zeroed USER|WRITABLE pages over the
 ///     gap `[break, new_end)` into the process's address space.
 ///   - `new_end < break` → shrink: unmap + free the pages over `[new_end, break)`.
+///
 /// Returns the new break, or the *unchanged* break on out-of-memory (so the
 /// caller's allocator sees the request was refused). `new_end` is rounded up to
 /// a page boundary; the heap lives in its own VA region (`sched::USER_HEAP_BASE`)
@@ -944,16 +946,7 @@ pub fn perform_syscall(num: u64, a0: u64, _a1: u64) -> u64 {
         26 => sys_rename(a0, _a1),
         27 => sys_ps(a0, _a1),
         28 => sys_reap_nohang(a0), // non-blocking reap-any for job control (S10)
-        29 => {
-            // kill(pid=a0, sig=a1): send signal a1 to process a0 (S10). a1 == 0
-            // is the POSIX existence check (no signal delivered). Returns 0 on
-            // success, u64::MAX (ESRCH) if no such live process.
-            if sched::send_signal(a0 as u32, _a1 as u32) {
-                0
-            } else {
-                u64::MAX
-            }
-        }
+        29 => sys_kill(a0, _a1),
         30 => {
             // sigaction(sig=a0, handler=a1, restorer=rdx): set the current
             // process's handler for `sig` (0 = SIG_DFL, 1 = SIG_IGN, else a
@@ -1042,24 +1035,38 @@ fn sys_unlink(a0: u64, a1: u64) -> u64 {
     }
 }
 
+/// kill(pid=a0, sig=a1): send signal a1 to process a0 (S10). a1 == 0 is the
+/// POSIX existence check (no signal delivered). 0 on success, u64::MAX (ESRCH)
+/// if no such live process.
+fn sys_kill(a0: u64, a1: u64) -> u64 {
+    if sched::send_signal(a0 as u32, a1 as u32) {
+        0
+    } else {
+        u64::MAX
+    }
+}
+
 #[inline(never)]
 fn sys_chdir(a0: u64, a1: u64) -> u64 {
     // chdir(path_ptr=a0, path_len=a1) → 0 on success, u64::MAX if the path
     // doesn't resolve to a directory (or doesn't fit). Resolves relative to the
-    // caller's cwd, then stores the canonical absolute result.
+    // caller's cwd, then stores the canonical absolute result. Flattened with
+    // early returns (vs a match arm + nested if) to keep the side-effecting
+    // set_cwd_current out of a match guard.
     let mut canon = [0u8; 512];
     let Some(n) = resolve_user_path(a0, a1 as usize, &mut canon) else {
         return u64::MAX;
     };
-    match crate::fs::namei(&canon[..n]) {
-        Some(ino) if crate::fs::is_dir(ino) => {
-            if sched::set_cwd_current(&canon[..n]) {
-                0
-            } else {
-                u64::MAX
-            }
-        }
-        _ => u64::MAX,
+    let Some(ino) = crate::fs::namei(&canon[..n]) else {
+        return u64::MAX;
+    };
+    if !crate::fs::is_dir(ino) {
+        return u64::MAX;
+    }
+    if sched::set_cwd_current(&canon[..n]) {
+        0
+    } else {
+        u64::MAX
     }
 }
 
@@ -1239,7 +1246,7 @@ fn do_wait_loop(target: u32) -> u64 {
     // IshJobs FSM. Zombies can't pile up unboundedly: the shell harvests every
     // bg child before each prompt, and any parent that forks children waits on
     // each one it spawns.
-    let result = if target == 0 {
+    if target == 0 {
         match sched::reap_dead_child(me) {
             Some((child_pid, child_pml4)) => reap_child(me, child_pid, child_pml4) as u64,
             None => u64::MAX, // ECHILD
@@ -1249,8 +1256,7 @@ fn do_wait_loop(target: u32) -> u64 {
             Some((child_pid, child_pml4)) => reap_child(me, child_pid, child_pml4) as u64,
             None => u64::MAX, // target vanished
         }
-    };
-    result
+    }
 }
 
 /// `reap_nohang(target)`: non-blocking reap (POSIX `waitpid(.., WNOHANG)`-style)

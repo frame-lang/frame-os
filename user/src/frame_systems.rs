@@ -10,6 +10,14 @@
 //
 // This is the crux of B4 Step 4b: the *same* `frame/parser.frs` the hosted
 // shell compiles also compiles here for `x86_64-unknown-none`, unchanged.
+//
+// This module is shared FSM glue: `mod frame_systems` is included by BOTH `ish`
+// (uses Parser + IshJobs + JobEntry) and `frameshell` (uses Parser only). Each
+// binary therefore drags in the other's subset, so per-bin some items are
+// legitimately unused (e.g. JobEntry::cmd and the generated `_ishjobs_framec`
+// glob in the frameshell build). Allow dead_code / unused_imports module-wide
+// rather than chase per-bin false positives.
+#![allow(dead_code, unused_imports)]
 
 pub use alloc::boxed::Box;
 pub use alloc::string::{String, ToString};
