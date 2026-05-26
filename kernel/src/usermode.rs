@@ -311,6 +311,15 @@ extern "C" fn syscall_dispatch(frame: *mut TrapFrame) {
     }
     let f = unsafe { &mut *frame };
     let (num, a0, a1) = (f.rax, f.rdi, f.rsi);
+    // sigreturn (#31) is handled out-of-band (S10): it restores the full
+    // interrupted frame from the user stack and resumes — it must NOT run the
+    // dispatcher FSM (it's not a normal request/result syscall) or overwrite rax
+    // with a result, and there's no signal re-delivery on this return (we're
+    // resuming the pre-signal context). Return straight to the iretq path.
+    if num == 31 {
+        sys_sigreturn(f);
+        return;
+    }
     let d = unsafe {
         let p = &raw mut DISPATCHER;
         (*p).as_mut().expect("dispatcher initialized")
@@ -408,7 +417,7 @@ fn proc_table() -> &'static mut ProcessTable {
 /// primitive; 23 is the S6 pipe; 24/25 are the S7 directory ops; 26 is S8 mv;
 /// 27 is the S9 process-table snapshot.)
 pub fn is_known_syscall(num: u64) -> bool {
-    num <= 29
+    num <= 32
 }
 
 // POSIX signal numbers (Linux x86-64 ABI subset, S10). Only the ones Frame OS
@@ -423,26 +432,76 @@ pub const SIGSTOP: u32 = 19; // unconditional stop (2c)
 pub const SIGTSTP: u32 = 20; // Ctrl-Z stop (2c)
 
 /// Deliver at most one pending signal to the *current* process at the
-/// syscall-return boundary (S10). This is the single delivery site for now: a
-/// process gets its pending signals when it next returns from a syscall (a
-/// blocked target is flipped Runnable by `send_signal` so it returns and lands
-/// here). For SIG_DFL the default action runs; a terminate diverges through
-/// `do_exit` (so it never returns to the killed program). SIGCHLD/SIGCONT
-/// default to ignore. (User handler trampolines and the stop/continue actions
-/// land in the next sub-steps; today no handler can be registered and SIGTSTP
-/// isn't generated yet, so the terminate + ignore paths are all that fire.)
+/// syscall-return boundary (S10). A process gets its pending signals when it
+/// next returns from a syscall (a blocked target is flipped Runnable by
+/// `send_signal` so it returns and lands here).
+///
+/// For a signal with a registered handler (and a restorer trampoline), this
+/// rewrites `frame` to enter the handler on return — pushing the interrupted
+/// state on the user stack so a later sigreturn restores it — and stops (one
+/// handler per return; the rest stay pending). For SIG_DFL the default action
+/// runs: terminate (diverges through `do_exit`, never returns to the killed
+/// program) for most, ignore for SIGCHLD/SIGCONT. SIG_IGN drops the signal.
 fn maybe_deliver_signal(frame: *mut TrapFrame) {
-    let _ = frame; // used once handler trampolines land (sigaction sub-step)
     loop {
         let sig = sched::take_deliverable_signal();
         if sig == 0 {
             return;
+        }
+        let handler = sched::signal_handler(sig);
+        if handler == sched::SIG_IGN {
+            continue; // explicitly ignored — drop it, look for the next
+        }
+        if handler != 0 {
+            let restorer = sched::signal_restorer();
+            if restorer != 0 {
+                // Run the user handler on return; sigreturn (#31) resumes here.
+                unsafe { setup_signal_frame(&mut *frame, sig, handler, restorer) };
+                return;
+            }
+            // Handler set but no restorer registered ⇒ we can't safely return
+            // from it. Fall through to the default action rather than crash.
         }
         match sig {
             SIGCHLD | SIGCONT => { /* default action: ignore */ }
             _ => do_exit(128 + sig as i32), // default action: terminate — never returns
         }
     }
+}
+
+/// Rewrite the user `frame` to enter signal handler `handler` for `sig` on
+/// return (S10). Builds a signal frame on the user stack:
+///   - skip the 128-byte red zone the interrupted code may rely on;
+///   - save the full interrupted TrapFrame (so sigreturn can restore it);
+///   - push `restorer` as the handler's return address — when the handler
+///     `ret`s it lands in the restorer stub, which invokes sigreturn (#31).
+/// On entry the handler sees rdi = signal number (SysV arg0) and rsp 16-byte
+/// aligned per the ABI (rsp ≡ 8 mod 16 at the call boundary).
+unsafe fn setup_signal_frame(f: &mut TrapFrame, sig: u32, handler: u64, restorer: u64) {
+    let saved = *f;
+    // Below the red zone, reserve a 16-aligned slot for the saved frame.
+    let frame_slot = ((f.rsp - 128) - core::mem::size_of::<TrapFrame>() as u64) & !0xF;
+    (frame_slot as *mut TrapFrame).write(saved);
+    // The fake return address sits just below the saved frame; entering the
+    // handler with rsp here makes rsp ≡ 8 (mod 16) at its first instruction.
+    let new_rsp = frame_slot - 8;
+    (new_rsp as *mut u64).write(restorer);
+    f.rsp = new_rsp;
+    f.rip = handler;
+    f.rdi = sig as u64; // arg0 = signal number
+}
+
+/// `sigreturn` (#31): restore the interrupted frame saved by `setup_signal_frame`
+/// and resume the pre-signal context. The restorer stub invokes this with the
+/// user rsp pointing exactly at the saved TrapFrame (the handler `ret` popped the
+/// restorer address, leaving rsp at the frame slot). We overwrite the live kernel
+/// frame with it, so `syscall_dispatch` iretq's straight back to where the signal
+/// interrupted — including the original rax (sigreturn must not clobber it). This
+/// is handled out-of-band in syscall_dispatch (it does not run the dispatcher FSM
+/// or the normal rax-result path).
+fn sys_sigreturn(f: &mut TrapFrame) {
+    let saved = unsafe { (f.rsp as *const TrapFrame).read() };
+    *f = saved;
 }
 
 /// Block until the console has a complete line, copy it into the user buffer
@@ -765,6 +824,22 @@ pub fn perform_syscall(num: u64, a0: u64, _a1: u64) -> u64 {
             } else {
                 u64::MAX
             }
+        }
+        30 => {
+            // sigaction(sig=a0, handler=a1, restorer=rdx): set the current
+            // process's handler for `sig` (0 = SIG_DFL, 1 = SIG_IGN, else a
+            // handler VA) and register the restorer trampoline (shared by all
+            // signals; ignored if 0). Returns the previous handler (S10).
+            let restorer = arg2();
+            sched::set_signal_restorer(restorer);
+            sched::set_signal_handler(a0 as u32, _a1)
+        }
+        // 31 (sigreturn) is intercepted in syscall_dispatch before the dispatcher.
+        32 => {
+            // sigprocmask(how=a0, mask=a1): adjust the blocked-signal set.
+            // how: 0 = SETMASK, 1 = BLOCK, 2 = UNBLOCK. Returns the old mask.
+            // SIGKILL/SIGSTOP can't be blocked (enforced in set_signal_mask).
+            sched::set_signal_mask(a0 as u32, _a1 as u32) as u64
         }
         _ => u64::MAX, // unreachable: validated by is_known_syscall
     }

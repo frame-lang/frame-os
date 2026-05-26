@@ -70,6 +70,14 @@ struct Tcb {
     sig_pending: u32,
     sig_blocked: u32,
     sig_handlers: [u64; NSIG],
+    // The user-space "restorer" trampoline VA: a tiny stub (`mov rax, sigreturn;
+    // syscall`) the runtime registers via sigaction. The delivery path pushes it
+    // as the return address under a handler call, so when the handler returns it
+    // `ret`s into the restorer, which invokes sigreturn to restore the
+    // interrupted frame. One per process (every signal shares it). 0 ⇒ no
+    // restorer registered, so handlers can't be safely invoked (delivery falls
+    // back to the default action).
+    sig_restorer: u64,
 }
 
 const TCB_INIT: Tcb = Tcb {
@@ -85,6 +93,7 @@ const TCB_INIT: Tcb = Tcb {
     sig_pending: 0,
     sig_blocked: 0,
     sig_handlers: [0; NSIG],
+    sig_restorer: 0,
 };
 
 /// Number of signals tracked (0 unused; 1..=31 valid), sized for a u32 mask.
@@ -701,6 +710,58 @@ pub fn reset_signal_handlers() {
         (*tcbs().add(cur)).sig_handlers = [0; NSIG];
     }
 }
+
+/// The current process's registered restorer trampoline VA (0 = none).
+pub fn signal_restorer() -> u64 {
+    unsafe {
+        let cur = (&raw const CURRENT).read();
+        (*tcbs().add(cur)).sig_restorer
+    }
+}
+
+/// Register the current process's restorer trampoline VA (sigaction supplies it
+/// once; all signals share it). A no-op if `restorer` is 0.
+pub fn set_signal_restorer(restorer: u64) {
+    if restorer == 0 {
+        return;
+    }
+    unsafe {
+        let cur = (&raw const CURRENT).read();
+        (*tcbs().add(cur)).sig_restorer = restorer;
+    }
+}
+
+/// The current process's blocked-signal mask.
+pub fn signal_mask() -> u32 {
+    unsafe {
+        let cur = (&raw const CURRENT).read();
+        (*tcbs().add(cur)).sig_blocked
+    }
+}
+
+/// Apply a sigprocmask operation to the current process. `how`: 0 = SETMASK
+/// (replace), 1 = BLOCK (OR in), 2 = UNBLOCK (clear). SIGKILL/SIGSTOP can't be
+/// blocked (POSIX) — those bits are always cleared. Returns the previous mask.
+pub fn set_signal_mask(how: u32, mask: u32) -> u32 {
+    unsafe {
+        let cur = (&raw const CURRENT).read();
+        let prev = (*tcbs().add(cur)).sig_blocked;
+        let mut next = match how {
+            1 => prev | mask,  // BLOCK
+            2 => prev & !mask, // UNBLOCK
+            _ => mask,         // SETMASK (0)
+        };
+        next &= !((1 << SIGKILL_NUM) | (1 << SIGSTOP_NUM)); // can't block these
+        (*tcbs().add(cur)).sig_blocked = next;
+        prev
+    }
+}
+
+/// SIGKILL / SIGSTOP signal numbers — unmaskable per POSIX (mirrors the values
+/// named in usermode; kept here so set_signal_mask can enforce the rule without
+/// a cross-module dependency).
+const SIGKILL_NUM: u32 = 9;
+const SIGSTOP_NUM: u32 = 19;
 
 /// Reap one *dead* (exited) child of `parent_pid`: free its scheduler slot and
 /// return its pid + PML4 so the caller can tear down the address space + the

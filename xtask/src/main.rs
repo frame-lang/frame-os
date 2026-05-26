@@ -427,6 +427,7 @@ fn prepare_qemu_artifacts_features(workspace: &Path, interactive: bool) -> Resul
     let mv_elf = build_user_disk_elf(workspace, "mv")?; // S8 rename
     let ps_elf = build_user_disk_elf(workspace, "ps")?; // S9 process list
     let spin_elf = build_user_disk_elf(workspace, "spin")?; // S10 signal target
+    let sigtest_elf = build_user_disk_elf(workspace, "sigtest")?; // S10 2b handler test
     // B11-3e: the BuildDriver-FSM-driven build tool (compile→link→run via tcc).
     let build_elf = build_user_disk_elf(workspace, "buildc")?;
     // V1.0 capstone: the Hello Frame system (frame/hello.frs) transpiled to Rust
@@ -464,6 +465,7 @@ fn prepare_qemu_artifacts_features(workspace: &Path, interactive: bool) -> Resul
     files.push(("/bin/mv", &mv_elf));
     files.push(("/bin/ps", &ps_elf));
     files.push(("/bin/spin", &spin_elf));
+    files.push(("/bin/sigtest", &sigtest_elf));
     files.push(("/bin/chello", &chello_elf));
     files.push(("/bin/tcc", &tcc_elf));
     files.push(("/bin/buildc", &build_elf));
@@ -1624,6 +1626,28 @@ fn run_console_test() -> Result<()> {
             .context("write pwd (trigger harvest after kill)")?;
         stdin.flush().ok();
         wait_for_output(&buf, "Done   spin", 90)?; // killed job reaped + reported by the IshJobs FSM
+        // S10 2b signal handlers: sigtest installs a SIGTERM handler (sigaction
+        // #30). `kill %3` (job 3 — echo/spin were 1/2 and are gone) sends SIGTERM;
+        // the kernel enters the handler instead of terminating, pushing a signal
+        // frame + the restorer return address on the user stack. The handler
+        // prints and returns into the restorer stub → sigreturn (#31) → the kernel
+        // restores the interrupted context and the loop resumes, sees the flag,
+        // and exits 0 *on its own* (a handled SIGTERM does NOT kill it). All three
+        // strings are sigtest's own output: the handler line proves the trampoline
+        // fired, the resume line proves sigreturn round-tripped.
+        eprintln!("console-test: typing `sigtest &` then `kill %3` (signal handler + sigreturn)");
+        stdin.write_all(b"sigtest &\n").context("write sigtest bg")?;
+        stdin.flush().ok();
+        wait_for_output(&buf, "sigtest: ready", 90)?; // handler installed, looping
+        stdin.write_all(b"kill %3\n").context("write kill %3")?;
+        stdin.flush().ok();
+        wait_for_output(&buf, "handler: caught SIGTERM", 90)?; // handler trampoline entered
+        wait_for_output(&buf, "sigtest: resumed after handler", 90)?; // sigreturn restored + resumed
+        stdin
+            .write_all(b"pwd\n")
+            .context("write pwd (trigger harvest after sigtest)")?;
+        stdin.flush().ok();
+        wait_for_output(&buf, "Done   sigtest", 90)?; // exited 0 on its own → harvested + reported
                                                                 // B9-2: argv reaches the program. Type a command WITH arguments; argtest
                                                                 // echoes argc + each argv string, so we can assert the args arrived.
         eprintln!("console-test: typing `/bin/argtest alpha beta`");

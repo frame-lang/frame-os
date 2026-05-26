@@ -123,6 +123,13 @@ path = "src/ps.rs"
 name = "spin"
 path = "src/spin.rs"
 
+# S10 2b signal-handler test: installs a SIGTERM handler via sigaction, gets
+# signaled, the handler runs + sigreturn resumes it (so it is NOT killed).
+# Staged at /bin/sigtest.
+[[bin]]
+name = "sigtest"
+path = "src/sigtest.rs"
+
 # File write path (B9-3): creates /tmp.txt and exercises write, lseek, fstat,
 # dup, and read-back. Baked into the kernel; run by usermode::run.
 [[bin]]
