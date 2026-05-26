@@ -402,7 +402,7 @@ fn proc_table() -> &'static mut ProcessTable {
 /// primitive; 23 is the S6 pipe; 24/25 are the S7 directory ops; 26 is S8 mv;
 /// 27 is the S9 process-table snapshot.)
 pub fn is_known_syscall(num: u64) -> bool {
-    num <= 27
+    num <= 28
 }
 
 /// Block until the console has a complete line, copy it into the user buffer
@@ -715,6 +715,7 @@ pub fn perform_syscall(num: u64, a0: u64, _a1: u64) -> u64 {
         25 => sys_rmdir(a0, _a1),
         26 => sys_rename(a0, _a1),
         27 => sys_ps(a0, _a1),
+        28 => sys_reap_nohang(a0), // non-blocking reap-any for job control (S10)
         _ => u64::MAX, // unreachable: validated by is_known_syscall
     }
 }
@@ -972,6 +973,43 @@ fn do_wait_loop(target: u32) -> u64 {
         target_status.map_or(u64::MAX, |s| s as u64)
     };
     result
+}
+
+/// `reap_nohang(target)`: non-blocking reap (POSIX `waitpid(.., WNOHANG)`-style)
+/// for job control (S10). `target == 0` means any child. If a *matching* child
+/// has already exited (is `Dead`), reap exactly one and return its identity +
+/// status packed as `(pid << 32) | (status as u32)`; otherwise return `0`
+/// immediately (pid 0 is never a valid child, so it's an unambiguous "nothing
+/// reapable right now"). Unlike `wait` (#4) this never blocks, so it runs inline
+/// in `perform_syscall` — `reap_child` only frees frames + the table slot, no
+/// disk I/O. The interactive shell loops on this at the prompt to harvest
+/// finished `&` background jobs without stalling, then marks them done in its
+/// IshJobs FSM.
+fn sys_reap_nohang(target: u64) -> u64 {
+    let me = sched::current_pid();
+    let t = target as u32;
+    if !sched::child_reapable(me, t) {
+        return 0;
+    }
+    // A matching dead child exists; reap exactly one. reap_dead_child returns
+    // whichever dead child it finds first; when target != 0 we already know the
+    // only reapable one(s) match, but a different dead child could be picked, so
+    // loop until we get the target (draining the rest, like do_wait_loop does).
+    loop {
+        match sched::reap_dead_child(me) {
+            Some((child_pid, child_pml4)) => {
+                let status = reap_child(me, child_pid, child_pml4);
+                if t == 0 || child_pid == t {
+                    return ((child_pid as u64) << 32) | (status as u32 as u64);
+                }
+                // Reaped an unrelated dead child; keep going for the target.
+                if !sched::child_reapable(me, t) {
+                    return 0;
+                }
+            }
+            None => return 0,
+        }
+    }
 }
 
 /// Map an `exec` program id to its baked ELF. (No filesystem yet — programs are

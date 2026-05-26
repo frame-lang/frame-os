@@ -1574,6 +1574,30 @@ fn run_console_test() -> Result<()> {
         stdin.flush().ok();
         wait_for_output(&buf, "PID  PPID STAT", 90)?; // ps header ⇒ the snapshot syscall ran
         wait_for_output(&buf, "    1     0 ", 90)?; // the shell row: pid 1, ppid 0 (STAT varies)
+        // S10 job control: `echo bgjob &` forks the echo child and returns to the
+        // prompt *without* waiting — ish records it in the IshJobs FSM (job id 1)
+        // and echoes `[1] <pid>` bash-style. The child runs + exits while the shell
+        // is idle; the next command's pre-prompt harvest sweep (non-blocking
+        // reap-any via syscall #28 → IshJobs.mark_done) reaps it and prints the
+        // async `[1]+ Done   echo bgjob` report. `fg 99` exercises the no-such-job
+        // error path. All asserted strings are shell output, not typed input
+        // (the typed command carries the trailing `&`; the Done line drops it).
+        eprintln!("console-test: typing `echo bgjob &` (background job) + harvest + fg");
+        stdin
+            .write_all(b"echo bgjob &\n")
+            .context("write background job")?;
+        stdin.flush().ok();
+        wait_for_output(&buf, "[1] ", 90)?; // `[1] <pid>` ⇒ job launched in background, not waited on
+        // Next command: its pre-prompt harvest reaps the finished bg child and
+        // prints the async Done report. `pwd` is innocuous; we assert the report.
+        stdin
+            .write_all(b"pwd\n")
+            .context("write pwd (trigger harvest)")?;
+        stdin.flush().ok();
+        wait_for_output(&buf, "[1]+ Done   echo bgjob", 90)?; // bg job harvested + reported at the prompt
+        stdin.write_all(b"fg 99\n").context("write fg 99")?;
+        stdin.flush().ok();
+        wait_for_output(&buf, "fg: no such job", 90)?; // fg on an unknown id ⇒ clean error
                                                                 // B9-2: argv reaches the program. Type a command WITH arguments; argtest
                                                                 // echoes argc + each argv string, so we can assert the args arrived.
         eprintln!("console-test: typing `/bin/argtest alpha beta`");

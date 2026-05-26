@@ -31,7 +31,7 @@ use core::panic::PanicInfo;
 mod frame_systems;
 mod mem;
 
-use frame_systems::Parser;
+use frame_systems::{IshJobs, Parser};
 
 #[inline(always)]
 unsafe fn syscall3(num: u64, a0: u64, a1: u64, a2: u64) -> u64 {
@@ -57,6 +57,37 @@ fn print(s: &[u8]) {
         write_char(b);
     }
 }
+/// Print an unsigned integer in decimal (no allocation). Used for job-control
+/// echoes like `[1] 7` and the `jobs` listing.
+fn print_u64(mut n: u64) {
+    if n == 0 {
+        write_char(b'0');
+        return;
+    }
+    let mut buf = [0u8; 20];
+    let mut i = buf.len();
+    while n > 0 {
+        i -= 1;
+        buf[i] = b'0' + (n % 10) as u8;
+        n /= 10;
+    }
+    print(&buf[i..]);
+}
+/// Parse a base-10 `u32` (job id). None on empty or any non-digit.
+fn parse_u32(s: &str) -> Option<u32> {
+    let bytes = s.as_bytes();
+    if bytes.is_empty() {
+        return None;
+    }
+    let mut v: u32 = 0;
+    for &b in bytes {
+        if !b.is_ascii_digit() {
+            return None;
+        }
+        v = v.checked_mul(10)?.checked_add((b - b'0') as u32)?;
+    }
+    Some(v)
+}
 fn exit(code: u64) -> ! {
     unsafe { syscall3(1, code, 0, 0) };
     loop {
@@ -68,6 +99,15 @@ fn fork() -> u64 {
 }
 fn waitpid(pid: u64) -> u64 {
     unsafe { syscall3(4, pid, 0, 0) }
+}
+/// reap_nohang (#28): non-blocking reap of *any* exited child (POSIX
+/// `waitpid(-1, WNOHANG)`). Returns `(pid << 32) | (status as u32)`, or 0 if no
+/// child has exited yet (pid 0 is never a real child, so 0 is an unambiguous
+/// "nothing to harvest"). The shell loops on this at the prompt to collect
+/// finished `&` background jobs without blocking. Unlike `waitpid`, this never
+/// stalls the prompt waiting on a still-running job.
+fn reap_nohang() -> u64 {
+    unsafe { syscall3(28, 0, 0, 0) }
 }
 fn open(path: &[u8]) -> u64 {
     unsafe { syscall3(5, path.as_ptr() as u64, path.len() as u64, 0) }
@@ -162,7 +202,14 @@ fn build_argv(toks: &[String]) -> (Vec<u8>, u64) {
     (argv, toks.len() as u64)
 }
 
-fn run_external(toks: &[String], redir_in: &Option<String>, redir_out: &Option<(String, bool)>) {
+fn run_external(
+    toks: &[String],
+    redir_in: &Option<String>,
+    redir_out: &Option<(String, bool)>,
+    background: bool,
+    cmd_str: &str,
+    jobs: &mut IshJobs,
+) {
     let cmd = toks[0].as_str();
     let (argv, argc) = build_argv(toks);
 
@@ -198,13 +245,29 @@ fn run_external(toks: &[String], redir_in: &Option<String>, redir_out: &Option<(
         print(cmd.as_bytes());
         write_char(b'\n');
         exit(127);
+    } else if background {
+        // Backgrounded (`cmd &`): record the child in the IshJobs FSM and return
+        // to the prompt *without* waiting. The FSM assigns a job id; echo the
+        // `[id] pid` line bash-style. The child is harvested later by the
+        // non-blocking reap sweep that runs before each prompt (see harvest()).
+        jobs.launch_bg(child, String::from(cmd_str));
+        write_char(b'[');
+        print_u64(jobs.last_id() as u64);
+        print(b"] ");
+        print_u64(child);
+        write_char(b'\n');
     } else {
-        // Parent (the shell): wait for *this* child specifically, then loop back
-        // to the prompt. Waiting on the exact pid (not `wait`-any) is what keeps
-        // the shell from racing ahead of the command it just launched — a bare
-        // `wait` could reap an unrelated older child and return while this one is
-        // still running, so a following builtin (e.g. `cat`) would see stale state.
+        // Foreground: drive the FSM into $Foreground for the duration, wait for
+        // *this* child specifically, then back to $Idle. Waiting on the exact pid
+        // (not `wait`-any) is what keeps the shell from racing ahead of the
+        // command it just launched — a bare `wait` could reap an unrelated older
+        // child and return while this one is still running, so a following builtin
+        // (e.g. `cat`) would see stale state. The FSM's $Foreground state encodes
+        // exactly this window: the shell is blocked here and won't touch the job
+        // table until fg_done().
+        jobs.launch_fg();
         waitpid(child);
+        jobs.fg_done();
     }
 }
 
@@ -290,19 +353,123 @@ fn parse_redirs(toks: &[String]) -> (Vec<String>, Option<String>, Option<(String
     (words, redir_in, redir_out)
 }
 
+/// Harvest finished background (`&`) jobs without blocking. Called once before
+/// every prompt: loop the non-blocking reap syscall to collect every child that
+/// has exited since the last prompt, tell the IshJobs FSM (mark_done), then print
+/// a bash-style `[id]+ Done   cmd` line for each and drop the entry. Reaping at
+/// the prompt — and only at the prompt — is exactly what the FSM's $Idle state
+/// represents; while a foreground job runs we're parked in waitpid ($Foreground)
+/// and never get here.
+fn harvest(jobs: &mut IshJobs) {
+    loop {
+        let v = reap_nohang();
+        if v == 0 {
+            break;
+        }
+        let pid = v >> 32;
+        let code = (v & 0xffff_ffff) as u32 as i32;
+        jobs.mark_done(pid, code);
+    }
+    // Report + remove every entry now flagged done. snapshot() is a clone, so
+    // calling jobs.remove() inside the loop doesn't disturb the iteration.
+    for e in jobs.snapshot() {
+        if e.done {
+            write_char(b'[');
+            print_u64(e.id as u64);
+            print(b"]+ Done   ");
+            print(e.cmd.as_bytes());
+            write_char(b'\n');
+            jobs.remove(e.id);
+        }
+    }
+}
+
+/// `fg <id>`: bring a tracked background job to the foreground — block until it
+/// finishes, then drop it from the table. The pid is looked up in the FSM's
+/// snapshot; the FSM tracks the $Idle→$Foreground→$Idle window around the wait.
+fn fg_job(arg: Option<&str>, jobs: &mut IshJobs) {
+    let snap = jobs.snapshot();
+    // Default to the most-recently-launched still-running job (highest id),
+    // matching bash's `fg` with no argument.
+    let id = match arg {
+        Some(s) => match parse_u32(s) {
+            Some(n) => n,
+            None => {
+                print(b"fg: not a job id: ");
+                print(s.as_bytes());
+                write_char(b'\n');
+                return;
+            }
+        },
+        None => {
+            let mut best = 0u32;
+            for e in &snap {
+                if !e.done && e.id > best {
+                    best = e.id;
+                }
+            }
+            best
+        }
+    };
+    let mut pid = 0u64;
+    for e in &snap {
+        if e.id == id && !e.done {
+            pid = e.pid;
+            break;
+        }
+    }
+    if pid == 0 {
+        print(b"fg: no such job\n");
+        return;
+    }
+    jobs.launch_fg();
+    waitpid(pid);
+    jobs.fg_done();
+    jobs.remove(id);
+}
+
+/// `jobs`: list tracked background jobs (id, state, pid, command).
+fn list_jobs(jobs: &mut IshJobs) {
+    for e in jobs.snapshot() {
+        write_char(b'[');
+        print_u64(e.id as u64);
+        print(b"] ");
+        if e.done {
+            print(b"Done    ");
+        } else {
+            print(b"Running ");
+        }
+        print_u64(e.pid);
+        write_char(b' ');
+        print(e.cmd.as_bytes());
+        write_char(b'\n');
+    }
+}
+
 /// Tokenize one line with the Frame `Parser` FSM and dispatch the first token.
-fn run_line(line: &str) {
+fn run_line(line: &str, jobs: &mut IshJobs) {
     let mut p = Parser::__create();
     for c in line.chars() {
         p.consume(c);
     }
     p.finalize();
-    let raw: Vec<String> = p.tokens();
+    let mut raw: Vec<String> = p.tokens();
     if raw.is_empty() {
         return;
     }
+    // Trailing `&` → run the command in the background (S10). Strip it here; the
+    // remaining tokens are the command. `&` on its own line is a no-op.
+    let background = raw.last().map(|t| t == "&").unwrap_or(false);
+    if background {
+        raw.pop();
+        if raw.is_empty() {
+            return;
+        }
+    }
     // Pipeline: a single `|` connects two external commands (S6). Handled before
     // redirection/builtins — `left | right` runs both with a pipe between them.
+    // (Pipelines always run in the foreground at S10; a trailing `&` on a
+    // pipeline is currently ignored.)
     if let Some(pos) = raw.iter().position(|t| t == "|") {
         let left = &raw[..pos];
         let right = &raw[pos + 1..];
@@ -319,14 +486,21 @@ fn run_line(line: &str) {
     if toks.is_empty() {
         return;
     }
+    // The command line as typed (sans `&`/redirs), for job-control reporting.
+    let cmd_str = toks.join(" ");
     match toks[0].as_str() {
         "exit" => exit(0),
         "help" => {
-            print(b"ish builtins: help, exit, cd [dir], pwd, clear, cat <path>...\n");
+            print(b"ish builtins: help, exit, cd [dir], pwd, clear, cat <path>..., jobs, fg [id]\n");
             print(b"on disk in /bin: ls, echo, rm, cp, touch, wc, head, tail, grep, date, mkdir, rmdir, mv, ps, ...\n");
             print(b"redirection (external cmds): cmd > file, cmd >> file, cmd < file\n");
             print(b"pipes: cmd1 | cmd2 (connect cmd1's stdout to cmd2's stdin)\n");
+            print(b"background: cmd &   (then `jobs` to list, `fg [id]` to foreground)\n");
         }
+        // jobs / fg are builtins: they read+drive *this shell's* IshJobs FSM,
+        // which lives in the shell process (forking would lose it).
+        "jobs" => list_jobs(jobs),
+        "fg" => fg_job(toks.get(1).map(|s| s.as_str()), jobs),
         // cd must be a builtin: it changes *this shell's* cwd (per-process in the
         // kernel). No arg → go to root.
         "cd" => {
@@ -356,7 +530,7 @@ fn run_line(line: &str) {
                 cat(path);
             }
         }
-        _ => run_external(&toks, &redir_in, &redir_out),
+        _ => run_external(&toks, &redir_in, &redir_out, background, &cmd_str, jobs),
     }
 }
 
@@ -364,12 +538,20 @@ fn run_line(line: &str) {
 pub extern "C" fn _start() -> ! {
     mem::init();
     print(b"\nFrame OS interactive shell (ish). Type 'help'.\n");
+    // The job-control FSM lives for the whole shell session, in the shell
+    // process. It's the ish-resident JobControl (S10): $Idle at the prompt,
+    // $Foreground while waiting on a job, with the background-job table in its
+    // domain. fork() would lose it, so `jobs`/`fg`/`&` are all builtins.
+    let mut jobs = IshJobs::__create();
     let mut buf = [0u8; 256];
     loop {
+        // Harvest any background jobs that finished since the last prompt and
+        // report them, before drawing the prompt (bash-style).
+        harvest(&mut jobs);
         print(b"frameos$ ");
         let n = read_line(&mut buf);
         if let Ok(line) = core::str::from_utf8(&buf[..n]) {
-            run_line(line);
+            run_line(line, &mut jobs);
         }
     }
 }

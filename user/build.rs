@@ -17,6 +17,11 @@ use std::process::Command;
 // generated .rs stem in OUT_DIR; it must match the input stem.
 const FRAME_SYSTEMS: &[(&str, &str)] = &[
     ("parser", "parser.frs"),
+    // IshJobs (S10): the interactive shell's job-control FSM ($Idle/$Foreground
+    // + background-job table), the ish-resident adaptation of the hosted-shell
+    // job_control.frs. Built for x86_64-unknown-none; src/frame_systems.rs
+    // include!s it. Tracks pids ish forks rather than spawning them itself.
+    ("ish_jobs", "ish_jobs.frs"),
     // BuildDriver (B11-3e): the on-device toolchain pipeline FSM, driven by the
     // `build` bin. Generated to OUT_DIR; `src/build_frame.rs` include!s it.
     ("builddriver", "builddriver.frs"),
