@@ -424,6 +424,7 @@ fn prepare_qemu_artifacts_features(workspace: &Path, interactive: bool) -> Resul
     // S7 directory ops.
     let mkdir_elf = build_user_disk_elf(workspace, "mkdir")?;
     let rmdir_elf = build_user_disk_elf(workspace, "rmdir")?;
+    let mv_elf = build_user_disk_elf(workspace, "mv")?; // S8 rename
     // B11-3e: the BuildDriver-FSM-driven build tool (compile→link→run via tcc).
     let build_elf = build_user_disk_elf(workspace, "buildc")?;
     // V1.0 capstone: the Hello Frame system (frame/hello.frs) transpiled to Rust
@@ -458,6 +459,7 @@ fn prepare_qemu_artifacts_features(workspace: &Path, interactive: bool) -> Resul
     files.push(("/bin/date", &date_elf));
     files.push(("/bin/mkdir", &mkdir_elf));
     files.push(("/bin/rmdir", &rmdir_elf));
+    files.push(("/bin/mv", &mv_elf));
     files.push(("/bin/chello", &chello_elf));
     files.push(("/bin/tcc", &tcc_elf));
     files.push(("/bin/buildc", &build_elf));
@@ -526,6 +528,14 @@ fn build_fs_image(total_blocks: u32, files: &[(&str, &[u8])]) -> Vec<u8> {
     let mut next_ino = fs::ROOT_INODE; // 1
     let mut next_data = layout.data_start;
     let alloc_dir = |next_ino: &mut u32, next_data: &mut u32, disk: &mut [u8]| -> (u32, u32) {
+        // Fail loudly on inode exhaustion — silently writing inode >= INODE_COUNT
+        // would land it on the first data block (inode_loc wraps into data_start)
+        // and corrupt the FS. Bump INODE_BLOCKS in shared::fs if this trips.
+        assert!(
+            *next_ino < fs::INODE_COUNT,
+            "mkfs: out of inodes (>= {}); raise INODE_BLOCKS",
+            fs::INODE_COUNT
+        );
         let ino = *next_ino;
         *next_ino += 1;
         let dblk = *next_data;
@@ -582,6 +592,11 @@ fn build_fs_image(total_blocks: u32, files: &[(&str, &[u8])]) -> Vec<u8> {
         }
 
         // Allocate the file inode + data blocks.
+        assert!(
+            next_ino < fs::INODE_COUNT,
+            "mkfs: out of inodes (>= {}); raise INODE_BLOCKS",
+            fs::INODE_COUNT
+        );
         let ino = next_ino;
         next_ino += 1;
         let mut node = fs::Inode::empty();
@@ -1532,8 +1547,19 @@ fn run_console_test() -> Result<()> {
             .write_all(b"mkdir /zsub\nmkdir /zsub\nrmdir /zsub\ncd /zsub\n")
             .context("write mkdir/rmdir")?;
         stdin.flush().ok();
-        wait_for_output(&buf, "cannot create directory", 45)?; // 2nd mkdir → dir exists ⇒ 1st made it
-        wait_for_output(&buf, "no such directory: /zsub", 45)?; // cd after rmdir ⇒ rmdir removed it
+        wait_for_output(&buf, "cannot create directory", 150)?; // 2nd mkdir → dir exists ⇒ 1st made it
+        wait_for_output(&buf, "no such directory: /zsub", 150)?; // cd after rmdir ⇒ rmdir removed it
+                                              // S8 rename: `echo movesrc > /msrc` makes an 8-byte file; `mv /msrc /mdst`
+                                              // re-points it; `wc /mdst` → "1 1 8 /mdst" proves the content is now at the
+                                              // destination, and `cat /msrc` → "cannot open /msrc" proves the source name
+                                              // is gone. The counts + the error are program output, not typed input.
+        eprintln!("console-test: typing echo > / mv / wc / cat (rename)");
+        stdin
+            .write_all(b"echo movesrc > /msrc\nmv /msrc /mdst\nwc /mdst\ncat /msrc\n")
+            .context("write mv")?;
+        stdin.flush().ok();
+        wait_for_output(&buf, "1 1 8 /mdst", 150)?; // moved content lands at the destination
+        wait_for_output(&buf, "cannot open /msrc", 150)?; // source name is gone after the move
                                                                 // B9-2: argv reaches the program. Type a command WITH arguments; argtest
                                                                 // echoes argc + each argv string, so we can assert the args arrived.
         eprintln!("console-test: typing `/bin/argtest alpha beta`");

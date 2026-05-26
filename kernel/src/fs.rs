@@ -530,6 +530,47 @@ pub fn rmdir(path: &[u8]) -> bool {
     clear_dirent(pino, ino, name)
 }
 
+/// Rename `src` to `dst` (S8) — re-points the inode under a new name without
+/// copying it. `src` must exist; both parents must be directories. If `dst`
+/// already exists it must be a regular *file*, which is overwritten (freed); an
+/// existing directory at `dst` fails. Works for files and directories (there's
+/// no `.`/`..` to fix up). Returns false on any of those conditions.
+pub fn rename(src: &[u8], dst: &[u8]) -> bool {
+    let Some((sp_ino, sname)) = split_parent(src) else {
+        return false;
+    };
+    if sname.is_empty() {
+        return false;
+    }
+    let Some(ino) = dir_lookup(sp_ino, sname) else {
+        return false; // source must exist
+    };
+    let Some((dp_ino, dname)) = split_parent(dst) else {
+        return false;
+    };
+    if dname.is_empty() {
+        return false;
+    }
+    if let Some(dino) = dir_lookup(dp_ino, dname) {
+        if dino == ino {
+            return true; // src and dst name the same entry — nothing to do
+        }
+        let dnode = read_inode(dino);
+        if dnode.kind != fs::T_FILE {
+            return false; // refuse to clobber a directory
+        }
+        free_all_blocks(&dnode); // overwrite: drop the old destination file
+        write_inode(dino, &fs::Inode::empty());
+        clear_dirent(dp_ino, dino, dname);
+    }
+    // Link the inode under the new name, then unlink the old name. (Same inode —
+    // a move, not a copy; its blocks/contents are untouched.)
+    if !dir_link(dp_ino, dname, ino) {
+        return false;
+    }
+    clear_dirent(sp_ino, ino, sname)
+}
+
 /// Overwrite file `ino` with `data` (allocating blocks as needed).
 pub fn write_file(ino: u32, data: &[u8]) -> bool {
     truncate(ino); // reset size; write_at reuses any blocks already linked

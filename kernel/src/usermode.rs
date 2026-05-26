@@ -393,11 +393,11 @@ fn proc_table() -> &'static mut ProcessTable {
 /// 0=write_char 1=exit 2=fork 3=exec(prog_id) 4=wait 5=open 6=read 7=close
 /// 8=exec(path) 9=read_line 10=brk 11=exec_argv 12=write 13=lseek 14=fstat
 /// 15=stat 16=dup 17=unlink 18=time 19=chdir 20=getcwd 21=readdir 22=dup2
-/// 23=pipe 24=mkdir 25=rmdir. (B4 Step 4 added the file-I/O + exec-from-disk
-/// syscalls; 17–21 are B11-3 follow-ups; 22 is the S5 redirection primitive; 23
-/// is the S6 pipe; 24/25 are the S7 directory ops.)
+/// 23=pipe 24=mkdir 25=rmdir 26=rename. (B4 Step 4 added the file-I/O +
+/// exec-from-disk syscalls; 17–21 are B11-3 follow-ups; 22 is the S5 redirection
+/// primitive; 23 is the S6 pipe; 24/25 are the S7 directory ops; 26 is S8 mv.)
 pub fn is_known_syscall(num: u64) -> bool {
-    num <= 25
+    num <= 26
 }
 
 /// Block until the console has a complete line, copy it into the user buffer
@@ -604,25 +604,7 @@ pub fn perform_syscall(num: u64, a0: u64, _a1: u64) -> u64 {
             }
             0
         }
-        5 => {
-            // open(path_ptr=a0, path_len=a1, flags=rdx) → fd, or u64::MAX on
-            // failure. flags bit0: 0 = read (default; back-compat), 1 = write
-            // (create/truncate). bit1: append — open for writing without
-            // truncating, offset at end-of-file (`>>` redirection, S5).
-            let mut canon = [0u8; 512];
-            let Some(n) = resolve_user_path(a0, _a1 as usize, &mut canon) else {
-                return u64::MAX;
-            };
-            let flags = arg2();
-            let append = flags & 2 != 0;
-            let write = flags & 1 != 0 || append;
-            let r = if write {
-                crate::vfs::open_write(&canon[..n], append)
-            } else {
-                crate::vfs::open_read(&canon[..n])
-            };
-            r.map_or(u64::MAX, |fd| fd as u64)
-        }
+        5 => sys_open(a0, _a1),
         6 => {
             // read(fd=a0, buf_ptr=a1, len=rdx) → bytes read. The buffer is a
             // user VA, mapped in the current address space (CR3 unchanged
@@ -692,85 +674,13 @@ pub fn perform_syscall(num: u64, a0: u64, _a1: u64) -> u64 {
             crate::vfs::seek(a0 as usize, off, whence).map_or(u64::MAX, |p| p as u64)
         }
         14 => crate::vfs::fstat_size(a0 as usize).map_or(u64::MAX, |s| s as u64), // fstat(fd) → size
-        15 => {
-            // stat(path_ptr=a0, path_len=a1) → file size, or u64::MAX (B9-3).
-            let mut canon = [0u8; 512];
-            let Some(n) = resolve_user_path(a0, _a1 as usize, &mut canon) else {
-                return u64::MAX;
-            };
-            match crate::fs::namei(&canon[..n]) {
-                Some(ino) if crate::fs::is_file(ino) => crate::fs::size_of(ino) as u64,
-                _ => u64::MAX,
-            }
-        }
+        15 => sys_stat(a0, _a1),
         16 => crate::vfs::dup(a0 as usize).map_or(u64::MAX, |fd| fd as u64), // dup(fd) → newfd
-        17 => {
-            // unlink(path_ptr=a0, path_len=a1) → 0 on success, u64::MAX if the
-            // path doesn't resolve to a regular file. Lets a program delete a
-            // file (tcc temp/output overwrite, `rm`).
-            let mut canon = [0u8; 512];
-            let Some(n) = resolve_user_path(a0, _a1 as usize, &mut canon) else {
-                return u64::MAX;
-            };
-            if crate::fs::unlink(&canon[..n]) {
-                0
-            } else {
-                u64::MAX
-            }
-        }
+        17 => sys_unlink(a0, _a1),
         18 => crate::rtc::epoch_secs(), // time() → CMOS RTC wall-clock epoch seconds
-        19 => {
-            // chdir(path_ptr=a0, path_len=a1) → 0 on success, u64::MAX if the path
-            // doesn't resolve to a directory (or doesn't fit). Resolves relative
-            // to the caller's cwd, then stores the canonical absolute result.
-            let mut canon = [0u8; 512];
-            let Some(n) = resolve_user_path(a0, _a1 as usize, &mut canon) else {
-                return u64::MAX;
-            };
-            match crate::fs::namei(&canon[..n]) {
-                Some(ino) if crate::fs::is_dir(ino) => {
-                    if sched::set_cwd_current(&canon[..n]) {
-                        0
-                    } else {
-                        u64::MAX
-                    }
-                }
-                _ => u64::MAX,
-            }
-        }
-        20 => {
-            // getcwd(buf_ptr=a0, buf_len=a1) → bytes written (the path, no NUL —
-            // libc appends it), or u64::MAX if the buffer is too small. The user
-            // buffer is mapped in the current address space (CR3 unchanged).
-            let mut cwd = [0u8; 256];
-            let cl = sched::cwd_current(&mut cwd);
-            let src: &[u8] = if cl > 0 { &cwd[..cl] } else { b"/" };
-            let buflen = _a1 as usize;
-            if buflen < src.len() {
-                u64::MAX
-            } else {
-                unsafe {
-                    let dst = core::slice::from_raw_parts_mut(a0 as *mut u8, src.len());
-                    dst.copy_from_slice(src);
-                }
-                src.len() as u64
-            }
-        }
-        21 => {
-            // readdir(path_ptr=a0, path_len=a1, buf_ptr=rdx, buf_len=r10) → bytes
-            // of NUL-separated entry names written to buf, or u64::MAX if the path
-            // isn't a directory. Path resolves relative to the caller's cwd.
-            let mut canon = [0u8; 512];
-            let Some(n) = resolve_user_path(a0, _a1 as usize, &mut canon) else {
-                return u64::MAX;
-            };
-            let buf_len = arg3() as usize;
-            if buf_len == 0 {
-                return u64::MAX;
-            }
-            let buf = unsafe { core::slice::from_raw_parts_mut(arg2() as *mut u8, buf_len) };
-            crate::fs::list_dir(&canon[..n], buf).map_or(u64::MAX, |w| w as u64)
-        }
+        19 => sys_chdir(a0, _a1),
+        20 => sys_getcwd(a0, _a1),
+        21 => sys_readdir(a0, _a1),
         22 => {
             // dup2(oldfd=a0, newfd=a1) → newfd, or u64::MAX. Repoints newfd at
             // oldfd (closing newfd first). The shell uses this to wire
@@ -792,32 +702,177 @@ pub fn perform_syscall(num: u64, a0: u64, _a1: u64) -> u64 {
                 None => u64::MAX,
             }
         }
-        24 => {
-            // mkdir(path_ptr=a0, path_len=a1) → 0, or u64::MAX (parent missing /
-            // not a dir, name exists, or no space). Path resolves against cwd (S7).
-            let mut canon = [0u8; 512];
-            let Some(n) = resolve_user_path(a0, _a1 as usize, &mut canon) else {
-                return u64::MAX;
-            };
-            if crate::fs::mkdir(&canon[..n]) {
-                0
-            } else {
-                u64::MAX
-            }
-        }
-        25 => {
-            // rmdir(path_ptr=a0, path_len=a1) → 0, or u64::MAX (not an empty dir).
-            let mut canon = [0u8; 512];
-            let Some(n) = resolve_user_path(a0, _a1 as usize, &mut canon) else {
-                return u64::MAX;
-            };
-            if crate::fs::rmdir(&canon[..n]) {
-                0
-            } else {
-                u64::MAX
-            }
-        }
+        24 => sys_mkdir(a0, _a1),
+        25 => sys_rmdir(a0, _a1),
+        26 => sys_rename(a0, _a1),
         _ => u64::MAX, // unreachable: validated by is_known_syscall
+    }
+}
+
+// --- path-resolving syscall handlers ---------------------------------------
+//
+// Each of these owns a 512-byte canonical-path buffer (some two). They are
+// `#[inline(never)]` *on purpose*: the kernel runs on a single 16 KiB stack
+// (gdt::KERNEL_STACK), and in a debug build (opt-level 0) LLVM does no
+// stack-slot coloring — every `let buf = [0u8; 512]` across the `perform_syscall`
+// match arms would otherwise get its *own* slot in one giant frame, coexisting
+// whether or not that arm runs. Pulling each into its own function means a
+// buffer only occupies the stack while that one syscall is actually executing.
+// (Folding them back inline overflowed the stack and faulted RIP into NX BSS.)
+
+#[inline(never)]
+fn sys_open(a0: u64, a1: u64) -> u64 {
+    // open(path_ptr=a0, path_len=a1, flags=rdx) → fd, or u64::MAX on failure.
+    // flags bit0: 0 = read (default; back-compat), 1 = write (create/truncate).
+    // bit1: append — open for writing without truncating, offset at end-of-file
+    // (`>>` redirection, S5).
+    let mut canon = [0u8; 512];
+    let Some(n) = resolve_user_path(a0, a1 as usize, &mut canon) else {
+        return u64::MAX;
+    };
+    let flags = arg2();
+    let append = flags & 2 != 0;
+    let write = flags & 1 != 0 || append;
+    let r = if write {
+        crate::vfs::open_write(&canon[..n], append)
+    } else {
+        crate::vfs::open_read(&canon[..n])
+    };
+    r.map_or(u64::MAX, |fd| fd as u64)
+}
+
+#[inline(never)]
+fn sys_stat(a0: u64, a1: u64) -> u64 {
+    // stat(path_ptr=a0, path_len=a1) → file size, or u64::MAX (B9-3).
+    let mut canon = [0u8; 512];
+    let Some(n) = resolve_user_path(a0, a1 as usize, &mut canon) else {
+        return u64::MAX;
+    };
+    match crate::fs::namei(&canon[..n]) {
+        Some(ino) if crate::fs::is_file(ino) => crate::fs::size_of(ino) as u64,
+        _ => u64::MAX,
+    }
+}
+
+#[inline(never)]
+fn sys_unlink(a0: u64, a1: u64) -> u64 {
+    // unlink(path_ptr=a0, path_len=a1) → 0 on success, u64::MAX if the path
+    // doesn't resolve to a regular file. Lets a program delete a file (tcc
+    // temp/output overwrite, `rm`).
+    let mut canon = [0u8; 512];
+    let Some(n) = resolve_user_path(a0, a1 as usize, &mut canon) else {
+        return u64::MAX;
+    };
+    if crate::fs::unlink(&canon[..n]) {
+        0
+    } else {
+        u64::MAX
+    }
+}
+
+#[inline(never)]
+fn sys_chdir(a0: u64, a1: u64) -> u64 {
+    // chdir(path_ptr=a0, path_len=a1) → 0 on success, u64::MAX if the path
+    // doesn't resolve to a directory (or doesn't fit). Resolves relative to the
+    // caller's cwd, then stores the canonical absolute result.
+    let mut canon = [0u8; 512];
+    let Some(n) = resolve_user_path(a0, a1 as usize, &mut canon) else {
+        return u64::MAX;
+    };
+    match crate::fs::namei(&canon[..n]) {
+        Some(ino) if crate::fs::is_dir(ino) => {
+            if sched::set_cwd_current(&canon[..n]) {
+                0
+            } else {
+                u64::MAX
+            }
+        }
+        _ => u64::MAX,
+    }
+}
+
+#[inline(never)]
+fn sys_getcwd(a0: u64, a1: u64) -> u64 {
+    // getcwd(buf_ptr=a0, buf_len=a1) → bytes written (the path, no NUL — libc
+    // appends it), or u64::MAX if the buffer is too small. The user buffer is
+    // mapped in the current address space (CR3 unchanged).
+    let mut cwd = [0u8; 256];
+    let cl = sched::cwd_current(&mut cwd);
+    let src: &[u8] = if cl > 0 { &cwd[..cl] } else { b"/" };
+    let buflen = a1 as usize;
+    if buflen < src.len() {
+        u64::MAX
+    } else {
+        unsafe {
+            let dst = core::slice::from_raw_parts_mut(a0 as *mut u8, src.len());
+            dst.copy_from_slice(src);
+        }
+        src.len() as u64
+    }
+}
+
+#[inline(never)]
+fn sys_readdir(a0: u64, a1: u64) -> u64 {
+    // readdir(path_ptr=a0, path_len=a1, buf_ptr=rdx, buf_len=r10) → bytes of
+    // NUL-separated entry names written to buf, or u64::MAX if the path isn't a
+    // directory. Path resolves relative to the caller's cwd.
+    let mut canon = [0u8; 512];
+    let Some(n) = resolve_user_path(a0, a1 as usize, &mut canon) else {
+        return u64::MAX;
+    };
+    let buf_len = arg3() as usize;
+    if buf_len == 0 {
+        return u64::MAX;
+    }
+    let buf = unsafe { core::slice::from_raw_parts_mut(arg2() as *mut u8, buf_len) };
+    crate::fs::list_dir(&canon[..n], buf).map_or(u64::MAX, |w| w as u64)
+}
+
+#[inline(never)]
+fn sys_mkdir(a0: u64, a1: u64) -> u64 {
+    // mkdir(path_ptr=a0, path_len=a1) → 0, or u64::MAX (parent missing / not a
+    // dir, name exists, or no space). Path resolves against cwd (S7).
+    let mut canon = [0u8; 512];
+    let Some(n) = resolve_user_path(a0, a1 as usize, &mut canon) else {
+        return u64::MAX;
+    };
+    if crate::fs::mkdir(&canon[..n]) {
+        0
+    } else {
+        u64::MAX
+    }
+}
+
+#[inline(never)]
+fn sys_rmdir(a0: u64, a1: u64) -> u64 {
+    // rmdir(path_ptr=a0, path_len=a1) → 0, or u64::MAX (not an empty dir).
+    let mut canon = [0u8; 512];
+    let Some(n) = resolve_user_path(a0, a1 as usize, &mut canon) else {
+        return u64::MAX;
+    };
+    if crate::fs::rmdir(&canon[..n]) {
+        0
+    } else {
+        u64::MAX
+    }
+}
+
+#[inline(never)]
+fn sys_rename(a0: u64, a1: u64) -> u64 {
+    // rename(src_ptr=a0, src_len=a1, dst_ptr=rdx, dst_len=r10) → 0, or u64::MAX.
+    // Both paths resolve against cwd (S8). Two paths ⇒ 4 args.
+    let mut csrc = [0u8; 512];
+    let mut cdst = [0u8; 512];
+    let Some(sn) = resolve_user_path(a0, a1 as usize, &mut csrc) else {
+        return u64::MAX;
+    };
+    let Some(dn) = resolve_user_path(arg2(), arg3() as usize, &mut cdst) else {
+        return u64::MAX;
+    };
+    if crate::fs::rename(&csrc[..sn], &cdst[..dn]) {
+        0
+    } else {
+        u64::MAX
     }
 }
 
