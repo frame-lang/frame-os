@@ -17,6 +17,14 @@ use crate::{serial, virtio_blk};
 type Block = [u8; fs::BLOCK_SIZE];
 
 // --- buffer cache (write-through, direct-mapped) ---------------------------
+//
+// SAFETY / concurrency: this cache (and all of fs) is accessed ONLY from the BSP,
+// because ring-3 processes — the only fs callers — are scheduled solely by the
+// BSP's PIT-driven `sched::schedule` (the APs run kernel threads via
+// `pcsched`/`lapic_schedule`, which never touch the fs). So the unlocked
+// `static mut CACHE` is single-writer in practice. If user scheduling ever goes
+// multi-core, this needs a lock (the cache check + fill straddle the IoScheduler
+// disk-engine serialization, so it is NOT covered by acquire/release_disk).
 
 const CACHE_SLOTS: usize = 16;
 
