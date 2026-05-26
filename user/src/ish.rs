@@ -433,15 +433,42 @@ fn fg_job(arg: Option<&str>, jobs: &mut IshJobs) {
     jobs.remove(id);
 }
 
-/// `kill %<job>` | `kill <pid>`: send SIGTERM. A `%N` argument is a job spec
-/// resolved to a pid through the IshJobs FSM snapshot; otherwise the argument is
-/// a raw pid. The killed background job is harvested at the next prompt (its
-/// `[id]+ Done` line), same as a job that exits on its own.
-fn kill_cmd(arg: Option<&str>, jobs: &mut IshJobs) {
-    let arg = match arg {
-        Some(a) => a,
+/// Map a signal spec (name without the `-`, or a number) to its number.
+/// Supports the job-control + terminate set the shell uses.
+fn parse_signal(s: &str) -> Option<u64> {
+    match s {
+        "INT" | "2" => Some(2),
+        "KILL" | "9" => Some(9),
+        "TERM" | "15" => Some(15),
+        "CONT" | "18" => Some(18),
+        "STOP" | "19" => Some(19),
+        "TSTP" | "20" => Some(20),
+        _ => parse_u32(s).map(|n| n as u64),
+    }
+}
+
+/// `kill [-SIG] %<job>|<pid>`: send a signal (default SIGTERM). `-SIG` is a name
+/// (`-STOP`, `-CONT`, `-KILL`, ...) or number (`-9`). A `%N` target is a job spec
+/// resolved to a pid through the IshJobs FSM snapshot; otherwise it's a raw pid.
+fn kill_cmd(toks: &[String], jobs: &mut IshJobs) {
+    let mut idx = 1;
+    let mut sig = 15u64; // SIGTERM default
+    if idx < toks.len() && toks[idx].starts_with('-') {
+        match parse_signal(&toks[idx][1..]) {
+            Some(s) => sig = s,
+            None => {
+                print(b"kill: bad signal: ");
+                print(toks[idx].as_bytes());
+                write_char(b'\n');
+                return;
+            }
+        }
+        idx += 1;
+    }
+    let arg = match toks.get(idx) {
+        Some(a) => a.as_str(),
         None => {
-            print(b"kill: usage: kill %<job> | <pid>\n");
+            print(b"kill: usage: kill [-SIG] %<job> | <pid>\n");
             return;
         }
     };
@@ -478,7 +505,7 @@ fn kill_cmd(arg: Option<&str>, jobs: &mut IshJobs) {
             }
         }
     };
-    if kill(pid, 15) == u64::MAX {
+    if kill(pid, sig) == u64::MAX {
         print(b"kill: no such process\n");
     }
 }
@@ -556,7 +583,7 @@ fn run_line(line: &str, jobs: &mut IshJobs) {
         // which lives in the shell process (forking would lose it).
         "jobs" => list_jobs(jobs),
         "fg" => fg_job(toks.get(1).map(|s| s.as_str()), jobs),
-        "kill" => kill_cmd(toks.get(1).map(|s| s.as_str()), jobs),
+        "kill" => kill_cmd(&toks, jobs),
         // cd must be a builtin: it changes *this shell's* cwd (per-process in the
         // kernel). No arg → go to root.
         "cd" => {

@@ -463,10 +463,34 @@ fn maybe_deliver_signal(frame: *mut TrapFrame) {
             // from it. Fall through to the default action rather than crash.
         }
         match sig {
-            SIGCHLD | SIGCONT => { /* default action: ignore */ }
-            _ => do_exit(128 + sig as i32), // default action: terminate — never returns
+            SIGCHLD | SIGCONT => { /* default action: ignore (CONT resume happens at send) */ }
+            SIGSTOP | SIGTSTP => do_stop_current(sig), // default action: job-control stop
+            _ => do_exit(128 + sig as i32),            // default action: terminate — never returns
         }
     }
+}
+
+/// Default action for SIGSTOP/SIGTSTP (S10 2c): suspend the current process.
+/// Notify the parent (SIGCHLD, so a shell waiting with job control can react),
+/// log the stop, then park in the scheduler until a SIGCONT/SIGKILL resumes us
+/// (`stop_current_and_wait`). On resume this returns and the interrupted syscall
+/// completes its return — the stopped/resumed program never sees a gap.
+fn do_stop_current(sig: u32) {
+    let me = sched::current_pid();
+    if let Some(parent) = sched::parent_of(me) {
+        if parent != 0 {
+            sched::send_signal(parent, SIGCHLD);
+        }
+    }
+    serial::write_str("[signal] pid ");
+    serial::write_u32_decimal(me);
+    serial::write_str(" stopped (sig ");
+    serial::write_u32_decimal(sig);
+    serial::writeln(")");
+    sched::stop_current_and_wait();
+    serial::write_str("[signal] pid ");
+    serial::write_u32_decimal(me);
+    serial::writeln(" continued");
 }
 
 /// Rewrite the user `frame` to enter signal handler `handler` for `sig` on

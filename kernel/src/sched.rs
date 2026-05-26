@@ -39,6 +39,7 @@ enum RunState {
     Free,
     Runnable,
     Blocked, // alive but not runnable (e.g. a parent in wait()) — skipped by the round-robin, still counted "alive"
+    Stopped, // job-control suspend (SIGTSTP/SIGSTOP) — skipped by the round-robin until SIGCONT, like Blocked but reported 'T'
     Dead,
 }
 
@@ -565,6 +566,12 @@ pub fn current_slot() -> usize {
     unsafe { (&raw const CURRENT).read() }
 }
 
+/// The parent pid of process `pid` (0 if none / not found). Used by the signal
+/// path to notify a parent (SIGCHLD) when a child stops.
+pub fn parent_of(pid: u32) -> Option<u32> {
+    slot_of_pid(pid).map(|i| unsafe { (*tcbs().add(i)).parent_pid })
+}
+
 /// The scheduler slot owning process `pid` (skipping freed slots), or None.
 fn slot_of_pid(pid: u32) -> Option<usize> {
     unsafe {
@@ -604,6 +611,7 @@ pub fn live_procs(out: &mut [(u32, u32, u8)]) -> usize {
                     RunState::Runnable => 1u8,
                     RunState::Blocked => 2,
                     RunState::Dead => 3,
+                    RunState::Stopped => 4, // ps reports 'T'
                     RunState::Free => continue,
                 };
                 out[k] = (tcb.pid, tcb.parent_pid, code);
@@ -646,13 +654,44 @@ pub fn send_signal(pid: u32, sig: u32) -> bool {
             Some(i) => {
                 let t = tcbs();
                 (*t.add(i)).sig_pending |= 1 << sig;
-                if (*t.add(i)).state == RunState::Blocked {
+                let st = (*t.add(i)).state;
+                if st == RunState::Blocked {
+                    // Wake a blocked target so it returns from its syscall and
+                    // takes delivery at the boundary.
+                    (*t.add(i)).state = RunState::Runnable;
+                } else if st == RunState::Stopped
+                    && (sig == SIGCONT_NUM || sig == SIGKILL_NUM)
+                {
+                    // SIGCONT resumes a stopped process; SIGKILL also un-stops it
+                    // so it runs far enough to take the (unblockable) kill at its
+                    // next boundary. The resume is the *sender's* action — the
+                    // stopped target can't process a signal while off-CPU.
                     (*t.add(i)).state = RunState::Runnable;
                 }
                 true
             }
             None => false,
         })
+    }
+}
+
+/// Stop the *current* process (SIGTSTP/SIGSTOP default action): mark it Stopped
+/// and park until a SIGCONT (or SIGKILL) flips it Runnable again. Mirrors
+/// `block_current_until` but for job-control suspend — the round-robin skips
+/// Stopped, so the CPU goes to other work; the parked kernel context resumes
+/// here when `send_signal` un-stops us. Stopping is unconditional (no readiness
+/// predicate), so there's no lost-wakeup window. Returns with IF=0 (the caller
+/// is the signal-delivery path inside a syscall handler).
+pub fn stop_current_and_wait() {
+    unsafe {
+        let cur = (&raw const CURRENT).read();
+        interrupts::without_interrupts(|| {
+            (*tcbs().add(cur)).state = RunState::Stopped;
+        });
+        while (*tcbs().add(cur)).state == RunState::Stopped {
+            interrupts::wait_for_interrupt_enabled();
+        }
+        interrupts::disable();
     }
 }
 
@@ -762,6 +801,7 @@ pub fn set_signal_mask(how: u32, mask: u32) -> u32 {
 /// a cross-module dependency).
 const SIGKILL_NUM: u32 = 9;
 const SIGSTOP_NUM: u32 = 19;
+const SIGCONT_NUM: u32 = 18;
 
 /// Reap one *dead* (exited) child of `parent_pid`: free its scheduler slot and
 /// return its pid + PML4 so the caller can tear down the address space + the

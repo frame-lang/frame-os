@@ -87,6 +87,7 @@ extern "C" fn ps_main() -> ! {
             1 => b'R',
             2 => b'S',
             3 => b'Z',
+            4 => b'T', // job-control stopped (SIGTSTP/SIGSTOP), S10
             _ => b'?',
         };
         let mut line = [0u8; 32];

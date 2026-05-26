@@ -1648,6 +1648,29 @@ fn run_console_test() -> Result<()> {
             .context("write pwd (trigger harvest after sigtest)")?;
         stdin.flush().ok();
         wait_for_output(&buf, "Done   sigtest", 90)?; // exited 0 on its own → harvested + reported
+        // S10 2c-i: job-control stop/continue. `spin &` (job 4) backgrounds a
+        // long-lived process; `kill -STOP %4` sends SIGSTOP — its default action
+        // suspends spin (RunState::Stopped, skipped by the round-robin); `kill
+        // -CONT %4` resumes it. The kernel's stop/continue log lines are unique to
+        // this step (no earlier occurrence), so they're unambiguous needles. A
+        // final `kill %4` terminates the resumed job (cleanup, not asserted — its
+        // exit log isn't distinguishable from the 2a spin's).
+        eprintln!("console-test: typing `spin &` + `kill -STOP/-CONT %4` (job-control suspend/resume)");
+        stdin.write_all(b"spin &\n").context("write spin bg (2c)")?;
+        stdin.flush().ok();
+        wait_for_output(&buf, "spin: alive", 90)?; // the long-lived job is running
+        stdin
+            .write_all(b"kill -STOP %4\n")
+            .context("write kill -STOP")?;
+        stdin.flush().ok();
+        wait_for_output(&buf, "stopped (sig 19", 90)?; // SIGSTOP default action → suspended
+        stdin
+            .write_all(b"kill -CONT %4\n")
+            .context("write kill -CONT")?;
+        stdin.flush().ok();
+        wait_for_output(&buf, "continued", 90)?; // SIGCONT resumed it from Stopped
+        stdin.write_all(b"kill %4\n").context("write kill (cleanup)")?;
+        stdin.flush().ok();
                                                                 // B9-2: argv reaches the program. Type a command WITH arguments; argtest
                                                                 // echoes argc + each argv string, so we can assert the args arrived.
         eprintln!("console-test: typing `/bin/argtest alpha beta`");
