@@ -226,6 +226,25 @@ extern "C" fn schedule(current_rsp: u64) -> u64 {
         let cur = (&raw const CURRENT).read();
         (*t.add(cur)).rsp = current_rsp;
 
+        // S10 2d: deliver a pending signal to the process being PREEMPTED, if it
+        // was running in ring 3 (so it has a deliverable signal but never reaches
+        // a syscall boundary on its own — a CPU-bound loop). This runs while CR3
+        // is still `cur`'s, so a handler-frame write / RIP rewrite lands in its
+        // address space. NATIVE ONLY (no Frame dispatch — the ISR invariant): a
+        // terminate redirects RIP to the exit trampoline (the process exits
+        // itself at its next syscall), a stop marks it Stopped (handled below by
+        // the round-robin skipping non-Runnable), a handler rewrites its frame.
+        // Guarded so the common no-pending-signal case is a cheap early-out.
+        if (*t.add(cur)).pid != 0
+            && (*t.add(cur)).pml4 != 0
+            && (*t.add(cur)).sig_pending & !(*t.add(cur)).sig_blocked != 0
+        {
+            let frame = current_rsp as *mut crate::usermode::TrapFrame;
+            if crate::usermode::frame_is_user(frame) {
+                crate::usermode::deliver_on_preempt(frame);
+            }
+        }
+
         // Round-robin over worker slots 1..n (skip boot slot 0); fall back
         // to boot (the idle context) when no worker is runnable.
         let mut next = 0usize;
@@ -667,6 +686,16 @@ pub fn send_signal(pid: u32, sig: u32) -> bool {
                     // next boundary. The resume is the *sender's* action — the
                     // stopped target can't process a signal while off-CPU.
                     (*t.add(i)).state = RunState::Runnable;
+                    // "continued" is logged HERE, on the resume, so it's emitted
+                    // exactly once regardless of HOW the process was stopped — the
+                    // syscall-path park (do_stop_current) and the timer-path mark
+                    // (deliver_on_preempt) both just become Runnable here. (Not for
+                    // SIGKILL: that un-stop is to let it die, not resume.)
+                    if sig == SIGCONT_NUM {
+                        serial::write_str("[signal] pid ");
+                        serial::write_u32_decimal(pid);
+                        serial::writeln(" continued");
+                    }
                 }
                 true
             }
@@ -682,6 +711,17 @@ pub fn send_signal(pid: u32, sig: u32) -> bool {
 /// here when `send_signal` un-stops us. Stopping is unconditional (no readiness
 /// predicate), so there's no lost-wakeup window. Returns with IF=0 (the caller
 /// is the signal-delivery path inside a syscall handler).
+/// Mark the current process Stopped WITHOUT parking (S10 2d). Used by the
+/// timer-path delivery from inside `schedule()`, which can't park — it just
+/// flags the state and lets the round-robin deschedule it (a later SIGCONT flips
+/// it Runnable). Contrast `stop_current_and_wait`, which parks the caller.
+pub fn mark_current_stopped() {
+    unsafe {
+        let cur = (&raw const CURRENT).read();
+        (*tcbs().add(cur)).state = RunState::Stopped;
+    }
+}
+
 pub fn stop_current_and_wait() {
     unsafe {
         let cur = (&raw const CURRENT).read();

@@ -504,10 +504,98 @@ fn do_stop_current(sig: u32) {
     serial::write_str(" stopped (sig ");
     serial::write_u32_decimal(sig);
     serial::writeln(")");
+    // Park until resumed. The "continued" log is emitted by send_signal on the
+    // SIGCONT resume (one canonical place, shared with the timer-path stop), so
+    // we don't print it here — stop_current_and_wait just returns once Runnable.
     sched::stop_current_and_wait();
-    serial::write_str("[signal] pid ");
-    serial::write_u32_decimal(me);
-    serial::writeln(" continued");
+}
+
+/// Fixed user VA of the per-process signal trampoline page (S10 2d). Sits above
+/// the brk heap (0x3000_0000) and well clear of the program (0x1000_0000) and
+/// stack (0x2000_0000). The ELF loader maps one RX-user page here in every user
+/// address space, holding `SIGTRAMP_CODE`; `fork` copies it like any user page.
+pub const SIGTRAMP_VA: u64 = 0x0000_0000_4000_0000;
+
+/// The trampoline page's machine code: `mov eax, 1` (the exit syscall number) +
+/// `syscall` + `ud2`. The timer-path delivery redirects a signalled process here
+/// with `rdi` = the exit status; on resume it calls exit() *itself*, so the
+/// terminate happens at the syscall boundary (where Frame dispatch is allowed) —
+/// never from the timer ISR (the no-Frame-in-ISR invariant). This is the vDSO
+/// `sigtramp` idea: deliver an async terminate to a CPU-bound process by making
+/// it trap into the kernel on its own next instruction.
+pub const SIGTRAMP_CODE: [u8; 9] = [
+    0xB8, 0x01, 0x00, 0x00, 0x00, // mov eax, 1   (exit)
+    0x0F, 0x05, // syscall
+    0x0F, 0x0B, // ud2 (exit never returns)
+];
+
+/// Whether `frame`'s saved CS is a ring-3 selector — i.e. the process was
+/// preempted in *user* mode (vs in a kernel syscall). Only then is it safe for
+/// the timer path to deliver a signal (rewrite RIP to a user handler / the exit
+/// trampoline); a process preempted mid-syscall takes its signal at the
+/// syscall-return boundary instead.
+pub fn frame_is_user(frame: *const TrapFrame) -> bool {
+    (unsafe { (*frame).cs } & 3) == 3
+}
+
+/// Timer-path signal delivery (S10 2d): deliver one pending signal to the
+/// process being *preempted* (whose ring-3 `frame` is at the timer's saved
+/// state). Called from `schedule()` at entry, while CR3 is still the preempted
+/// process's, so writes to its user stack / a RIP rewrite land in its address
+/// space. NATIVE ONLY — no Frame dispatch (the ISR invariant): a terminate is
+/// delivered by redirecting RIP to the exit trampoline (the process exits itself
+/// at its next syscall), a stop by marking it Stopped + notifying the parent, a
+/// handler by the usual frame rewrite. Returns true if the caller should treat
+/// the process as no-longer-runnable (stopped), so `schedule` picks another.
+pub fn deliver_on_preempt(frame: *mut TrapFrame) -> bool {
+    loop {
+        let sig = sched::take_deliverable_signal();
+        if sig == 0 {
+            return false;
+        }
+        let handler = sched::signal_handler(sig);
+        if handler == sched::SIG_IGN {
+            continue;
+        }
+        if handler != 0 {
+            let restorer = sched::signal_restorer();
+            if restorer != 0 {
+                unsafe { setup_signal_frame(&mut *frame, sig, handler, restorer) };
+                return false; // resume into the handler
+            }
+            // no restorer ⇒ fall through to the default action
+        }
+        match sig {
+            SIGCHLD | SIGCONT => { /* ignore */ }
+            SIGSTOP | SIGTSTP => {
+                // Stop without parking (we're in the ISR): mark it Stopped and
+                // tell the parent (SIGCHLD wakes a shell blocked in WUNTRACED
+                // waitpid). schedule() then deschedules it.
+                let me = sched::current_pid();
+                if let Some(p) = sched::parent_of(me) {
+                    if p != 0 {
+                        sched::send_signal(p, SIGCHLD);
+                    }
+                }
+                sched::mark_current_stopped();
+                serial::write_str("[signal] pid ");
+                serial::write_u32_decimal(me);
+                serial::write_str(" stopped (sig ");
+                serial::write_u32_decimal(sig);
+                serial::writeln(") [preempt]");
+                return true;
+            }
+            _ => {
+                // Terminate: redirect to the exit trampoline. The process runs
+                // `mov eax,1; syscall` on resume → exit(128+sig) at the syscall
+                // boundary, where do_exit (Frame dispatch) is allowed.
+                let f = unsafe { &mut *frame };
+                f.rip = SIGTRAMP_VA;
+                f.rdi = (128 + sig as i32) as u64;
+                return false;
+            }
+        }
+    }
 }
 
 /// Rewrite the user `frame` to enter signal handler `handler` for `sig` on

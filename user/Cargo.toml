@@ -130,6 +130,13 @@ path = "src/spin.rs"
 name = "sigtest"
 path = "src/sigtest.rs"
 
+# S10 2d signal-trampoline test: a CPU-bound process that makes NO syscalls, so
+# it's killable only via the timer-path delivery (the vDSO exit trampoline).
+# Staged at /bin/busyloop.
+[[bin]]
+name = "busyloop"
+path = "src/busyloop.rs"
+
 # File write path (B9-3): creates /tmp.txt and exercises write, lseek, fstat,
 # dup, and read-back. Baked into the kernel; run by usermode::run.
 [[bin]]

@@ -243,6 +243,27 @@ pub fn build_stack() -> bool {
         track(va, frame);
     }
     e.stack_top = USER_STACK_VA + USER_STACK_PAGES * PAGE - 16; // 16-aligned-ish top
+
+    // S10 2d: map the signal trampoline page (RX, user) at SIGTRAMP_VA. Holds the
+    // exit stub (`mov eax,1; syscall`); the timer-path signal delivery redirects a
+    // CPU-bound process here so it terminates itself at a syscall boundary. One
+    // private page per address space (fork copies it like any user page; teardown
+    // frees it via the tracked-page list — so it's never a shared dangling frame).
+    let Some(tramp) = frames::alloc_frame() else {
+        return false;
+    };
+    unsafe {
+        let dst = frames::phys_to_virt(tramp);
+        core::ptr::write_bytes(dst, 0, PAGE as usize);
+        core::ptr::copy_nonoverlapping(
+            crate::usermode::SIGTRAMP_CODE.as_ptr(),
+            dst,
+            crate::usermode::SIGTRAMP_CODE.len(),
+        );
+        // USER only (no WRITABLE): read+execute. The code must not be writable.
+        paging::map_in(e.pml4, crate::usermode::SIGTRAMP_VA, tramp, paging::USER);
+    }
+    track(crate::usermode::SIGTRAMP_VA, tramp);
     true
 }
 

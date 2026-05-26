@@ -428,6 +428,7 @@ fn prepare_qemu_artifacts_features(workspace: &Path, interactive: bool) -> Resul
     let ps_elf = build_user_disk_elf(workspace, "ps")?; // S9 process list
     let spin_elf = build_user_disk_elf(workspace, "spin")?; // S10 signal target
     let sigtest_elf = build_user_disk_elf(workspace, "sigtest")?; // S10 2b handler test
+    let busyloop_elf = build_user_disk_elf(workspace, "busyloop")?; // S10 2d timer-delivery test
     // B11-3e: the BuildDriver-FSM-driven build tool (compile→link→run via tcc).
     let build_elf = build_user_disk_elf(workspace, "buildc")?;
     // V1.0 capstone: the Hello Frame system (frame/hello.frs) transpiled to Rust
@@ -466,6 +467,7 @@ fn prepare_qemu_artifacts_features(workspace: &Path, interactive: bool) -> Resul
     files.push(("/bin/ps", &ps_elf));
     files.push(("/bin/spin", &spin_elf));
     files.push(("/bin/sigtest", &sigtest_elf));
+    files.push(("/bin/busyloop", &busyloop_elf));
     files.push(("/bin/chello", &chello_elf));
     files.push(("/bin/tcc", &tcc_elf));
     files.push(("/bin/buildc", &build_elf));
@@ -1724,6 +1726,25 @@ fn run_console_test() -> Result<()> {
         stdin.write_all(b"pwd\n").context("write pwd (reap 2c-ii)")?;
         stdin.flush().ok();
         wait_for_output(&buf, "Done   spin fg2c", 90)?; // reaped + reported before continuing
+        // S10 2d: signal a CPU-bound process via the timer-path delivery (the
+        // vDSO exit trampoline). `busyloop` makes NO syscalls after its banner, so
+        // syscall-boundary delivery can never reach it — the only way to kill it
+        // is for the timer to preempt it and redirect it to the exit trampoline.
+        // `kill -6 %6` (SIGABRT → exit 128+6 = 134, an exit code unique to this
+        // step) proves it: if busyloop reaches exit 134, the timer-path terminate
+        // worked. Then reap it (harvest) before the later sections.
+        eprintln!("console-test: typing `busyloop &` then `kill -6 %6` (timer-path signal delivery)");
+        stdin.write_all(b"busyloop &\n").context("write busyloop bg")?;
+        stdin.flush().ok();
+        wait_for_output(&buf, "busyloop: running", 90)?; // the CPU-bound (syscall-free) job is up
+        stdin.write_all(b"kill -6 %6\n").context("write kill -6 %6")?;
+        stdin.flush().ok();
+        wait_for_output(&buf, "exited with code 134", 90)?; // SIGABRT delivered via the timer trampoline → terminated
+        stdin
+            .write_all(b"echo reap6\n")
+            .context("write fg cmd (reap busyloop)")?;
+        stdin.flush().ok();
+        wait_for_output(&buf, "Done   busyloop", 90)?; // reaped + reported before continuing
                                                                 // B9-2: argv reaches the program. Type a command WITH arguments; argtest
                                                                 // echoes argc + each argv string, so we can assert the args arrived.
         eprintln!("console-test: typing `/bin/argtest alpha beta`");
