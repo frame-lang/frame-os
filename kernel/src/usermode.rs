@@ -438,11 +438,11 @@ pub fn is_known_syscall(num: u64) -> bool {
 }
 
 // POSIX signal numbers (Linux x86-64 ABI subset, S10). Only the ones Frame OS
-// generates or gives a non-default action are named; the rest still deliver
-// (default action = terminate) via the catch-all in maybe_deliver_signal.
+// gives a non-default action are named here; the rest (incl. SIGKILL=9,
+// SIGTERM=15) still deliver via the catch-all in maybe_deliver_signal, whose
+// default action is terminate. (`sched` keeps its own SIGKILL_NUM for the
+// can't-be-blocked / un-stop rules.)
 pub const SIGINT: u32 = 2; // Ctrl-C (2c)
-pub const SIGKILL: u32 = 9; // unconditional terminate
-pub const SIGTERM: u32 = 15; // polite terminate (default for `kill`)
 pub const SIGCHLD: u32 = 17; // child stopped/exited — default ignore
 pub const SIGCONT: u32 = 18; // continue if stopped — default ignore here (2c resumes)
 pub const SIGSTOP: u32 = 19; // unconditional stop (2c)

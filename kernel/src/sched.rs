@@ -780,15 +780,9 @@ pub fn set_signal_handler(sig: u32, handler: u64) -> u64 {
     }
 }
 
-/// Reset the current process's signal *dispositions* to default (exec semantics:
-/// a fresh image can't keep handler addresses from the old one). Pending and
-/// blocked sets are left intact, per POSIX. Called from the exec path.
-pub fn reset_signal_handlers() {
-    unsafe {
-        let cur = (&raw const CURRENT).read();
-        (*tcbs().add(cur)).sig_handlers = [0; NSIG];
-    }
-}
+// Resetting signal *dispositions* on exec is done inline in `exec_into` (a fresh
+// image can't keep the old one's handler VAs), alongside the brk + FPU resets —
+// pending + blocked sets persist there per POSIX.
 
 /// The current process's registered restorer trampoline VA (0 = none).
 pub fn signal_restorer() -> u64 {
@@ -807,14 +801,6 @@ pub fn set_signal_restorer(restorer: u64) {
     unsafe {
         let cur = (&raw const CURRENT).read();
         (*tcbs().add(cur)).sig_restorer = restorer;
-    }
-}
-
-/// The current process's blocked-signal mask.
-pub fn signal_mask() -> u32 {
-    unsafe {
-        let cur = (&raw const CURRENT).read();
-        (*tcbs().add(cur)).sig_blocked
     }
 }
 
