@@ -1655,10 +1655,10 @@ fn run_console_test() -> Result<()> {
         // this step (no earlier occurrence), so they're unambiguous needles. A
         // final `kill %4` terminates the resumed job (cleanup, not asserted — its
         // exit log isn't distinguishable from the 2a spin's).
-        eprintln!("console-test: typing `spin &` + `kill -STOP/-CONT %4` (job-control suspend/resume)");
-        stdin.write_all(b"spin &\n").context("write spin bg (2c)")?;
+        eprintln!("console-test: typing `spin sigb &` + `kill -STOP/-CONT %4` (job-control suspend/resume)");
+        stdin.write_all(b"spin sigb &\n").context("write spin bg (2c)")?;
         stdin.flush().ok();
-        wait_for_output(&buf, "spin: alive", 90)?; // the long-lived job is running
+        wait_for_output(&buf, "spin: alive sigb", 90)?; // the long-lived job is running (unique tag)
         stdin
             .write_all(b"kill -STOP %4\n")
             .context("write kill -STOP")?;
@@ -1669,8 +1669,23 @@ fn run_console_test() -> Result<()> {
             .context("write kill -CONT")?;
         stdin.flush().ok();
         wait_for_output(&buf, "continued", 90)?; // SIGCONT resumed it from Stopped
-        stdin.write_all(b"kill %4\n").context("write kill (cleanup)")?;
+        // Terminate + fully reap the job before moving on, so its async exit log
+        // can't interleave into a later test's output (a `pwd` triggers the
+        // harvest; wait for the unique Done line to confirm it's gone).
+        // Terminate with SIGINT (exit 128+2 = 130, an exit code unique to this
+        // step) so we can wait on the kernel's death log — that wait keeps the
+        // shell idle at its prompt, which is what lets the backgrounded spin get
+        // scheduled and actually die. Only THEN does a `pwd` trigger the harvest
+        // that reaps + reports it, so the job is fully gone before any later
+        // section (no async exit log left to interleave into, say, cmain's output).
+        stdin
+            .write_all(b"kill -INT %4\n")
+            .context("write kill -INT (cleanup)")?;
         stdin.flush().ok();
+        wait_for_output(&buf, "exited with code 130", 90)?; // SIGINT default terminate (unique code)
+        stdin.write_all(b"pwd\n").context("write pwd (reap 2c-i)")?;
+        stdin.flush().ok();
+        wait_for_output(&buf, "Done   spin sigb", 90)?; // reaped + reported before continuing
         // S10 2c-ii: terminal job control. `spin fg2c` runs in the FOREGROUND
         // (no `&`); the shell registers it via set_foreground and blocks in
         // waitpid. Sending Ctrl-Z (0x1A) makes the console deliver SIGTSTP to it
@@ -1691,8 +1706,19 @@ fn run_console_test() -> Result<()> {
         stdin.write_all(b"jobs\n").context("write jobs")?;
         stdin.flush().ok();
         wait_for_output(&buf, "] Running", 90)?; // bg resumed it (SIGCONT) → jobs shows it Running
-        stdin.write_all(b"kill %5\n").context("write kill %5 (cleanup)")?;
+        // Terminate + fully reap before later sections (else its async exit log
+        // interleaves into e.g. cmain's output and splits a needle).
+        // Terminate with SIGKILL (exit 128+9 = 137, unique to this step) and wait
+        // on the death log (shell idles → the bg spin dies) before harvesting, so
+        // nothing is left to interleave into later sections.
+        stdin
+            .write_all(b"kill -KILL %5\n")
+            .context("write kill -KILL (cleanup)")?;
         stdin.flush().ok();
+        wait_for_output(&buf, "exited with code 137", 90)?; // SIGKILL default terminate (unique code)
+        stdin.write_all(b"pwd\n").context("write pwd (reap 2c-ii)")?;
+        stdin.flush().ok();
+        wait_for_output(&buf, "Done   spin fg2c", 90)?; // reaped + reported before continuing
                                                                 // B9-2: argv reaches the program. Type a command WITH arguments; argtest
                                                                 // echoes argc + each argv string, so we can assert the args arrived.
         eprintln!("console-test: typing `/bin/argtest alpha beta`");

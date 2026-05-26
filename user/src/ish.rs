@@ -57,22 +57,32 @@ fn print(s: &[u8]) {
         write_char(b);
     }
 }
-/// Print an unsigned integer in decimal (no allocation). Used for job-control
-/// echoes like `[1] 7` and the `jobs` listing.
-fn print_u64(mut n: u64) {
+/// Emit a whole line in ONE write() syscall. ish's `print` writes a byte at a
+/// time (write_char, #0), so an async kernel log line (e.g. a signal-delivery
+/// trace) can interleave *between* bytes and split the output. The console
+/// write syscall emits the whole buffer atomically (a process's line is never
+/// split mid-way), so job-control reports — which print exactly when signals are
+/// firing — build the line in a buffer and emit it in one call.
+fn emit(line: &[u8]) {
+    unsafe { syscall3(12, 1, line.as_ptr() as u64, line.len() as u64) };
+}
+/// Append `n` in decimal to a byte buffer (no allocation in the hot path beyond
+/// the Vec the caller already holds).
+fn push_u64(out: &mut Vec<u8>, mut n: u64) {
     if n == 0 {
-        write_char(b'0');
+        out.push(b'0');
         return;
     }
-    let mut buf = [0u8; 20];
-    let mut i = buf.len();
+    let mut tmp = [0u8; 20];
+    let mut i = tmp.len();
     while n > 0 {
         i -= 1;
-        buf[i] = b'0' + (n % 10) as u8;
+        tmp[i] = b'0' + (n % 10) as u8;
         n /= 10;
     }
-    print(&buf[i..]);
+    out.extend_from_slice(&tmp[i..]);
 }
+
 /// Parse a base-10 `u32` (job id). None on empty or any non-digit.
 fn parse_u32(s: &str) -> Option<u32> {
     let bytes = s.as_bytes();
@@ -267,11 +277,13 @@ fn run_external(
         // `[id] pid` line bash-style. The child is harvested later by the
         // non-blocking reap sweep that runs before each prompt (see harvest()).
         jobs.launch_bg(child, String::from(cmd_str));
-        write_char(b'[');
-        print_u64(jobs.last_id() as u64);
-        print(b"] ");
-        print_u64(child);
-        write_char(b'\n');
+        let mut l = Vec::new();
+        l.push(b'[');
+        push_u64(&mut l, jobs.last_id() as u64);
+        l.extend_from_slice(b"] ");
+        push_u64(&mut l, child);
+        l.push(b'\n');
+        emit(&l);
     } else {
         // Foreground: drive the FSM into $Foreground for the duration, register
         // the child as the foreground job (so Ctrl-C/Ctrl-Z reach it), and wait
@@ -289,11 +301,13 @@ fn run_external(
             // becomes a tracked stopped background job, bash-style, so `jobs` /
             // `bg` / `fg` can manage it.
             jobs.launch_stopped(child, String::from(cmd_str));
-            write_char(b'[');
-            print_u64(jobs.last_id() as u64);
-            print(b"]+ Stopped   ");
-            print(cmd_str.as_bytes());
-            write_char(b'\n');
+            let mut l = Vec::new();
+            l.push(b'[');
+            push_u64(&mut l, jobs.last_id() as u64);
+            l.extend_from_slice(b"]+ Stopped   ");
+            l.extend_from_slice(cmd_str.as_bytes());
+            l.push(b'\n');
+            emit(&l);
         }
     }
 }
@@ -401,11 +415,13 @@ fn harvest(jobs: &mut IshJobs) {
     // calling jobs.remove() inside the loop doesn't disturb the iteration.
     for e in jobs.snapshot() {
         if e.done {
-            write_char(b'[');
-            print_u64(e.id as u64);
-            print(b"]+ Done   ");
-            print(e.cmd.as_bytes());
-            write_char(b'\n');
+            let mut l = Vec::new();
+            l.push(b'[');
+            push_u64(&mut l, e.id as u64);
+            l.extend_from_slice(b"]+ Done   ");
+            l.extend_from_slice(e.cmd.as_bytes());
+            l.push(b'\n');
+            emit(&l);
             jobs.remove(e.id);
         }
     }
@@ -464,11 +480,13 @@ fn fg_job(arg: Option<&str>, jobs: &mut IshJobs) {
     if st & WSTOPPED != 0 {
         // Stopped again (Ctrl-Z during the foreground run): keep it as a job.
         jobs.mark_stopped(id);
-        write_char(b'[');
-        print_u64(id as u64);
-        print(b"]+ Stopped   ");
-        print(cmd.as_bytes());
-        write_char(b'\n');
+        let mut l = Vec::new();
+        l.push(b'[');
+        push_u64(&mut l, id as u64);
+        l.extend_from_slice(b"]+ Stopped   ");
+        l.extend_from_slice(cmd.as_bytes());
+        l.push(b'\n');
+        emit(&l);
     } else {
         jobs.remove(id);
     }
@@ -493,11 +511,13 @@ fn bg_job(arg: Option<&str>, jobs: &mut IshJobs) {
     }
     kill(pid, SIGCONT);
     jobs.mark_running(id);
-    write_char(b'[');
-    print_u64(id as u64);
-    print(b"] ");
-    print(cmd.as_bytes());
-    print(b" &\n");
+    let mut l = Vec::new();
+    l.push(b'[');
+    push_u64(&mut l, id as u64);
+    l.extend_from_slice(b"] ");
+    l.extend_from_slice(cmd.as_bytes());
+    l.extend_from_slice(b" &\n");
+    emit(&l);
 }
 
 /// Map a signal spec (name without the `-`, or a number) to its number.
@@ -577,23 +597,26 @@ fn kill_cmd(toks: &[String], jobs: &mut IshJobs) {
     }
 }
 
-/// `jobs`: list tracked background jobs (id, state, pid, command).
+/// `jobs`: list tracked background jobs (id, state, pid, command). Each row is
+/// emitted in one write() so an async kernel log can't split it.
 fn list_jobs(jobs: &mut IshJobs) {
     for e in jobs.snapshot() {
-        write_char(b'[');
-        print_u64(e.id as u64);
-        print(b"] ");
+        let mut l = Vec::new();
+        l.push(b'[');
+        push_u64(&mut l, e.id as u64);
+        l.extend_from_slice(b"] ");
         if e.done {
-            print(b"Done    ");
+            l.extend_from_slice(b"Done    ");
         } else if e.stopped {
-            print(b"Stopped ");
+            l.extend_from_slice(b"Stopped ");
         } else {
-            print(b"Running ");
+            l.extend_from_slice(b"Running ");
         }
-        print_u64(e.pid);
-        write_char(b' ');
-        print(e.cmd.as_bytes());
-        write_char(b'\n');
+        push_u64(&mut l, e.pid);
+        l.push(b' ');
+        l.extend_from_slice(e.cmd.as_bytes());
+        l.push(b'\n');
+        emit(&l);
     }
 }
 
