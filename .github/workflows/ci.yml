@@ -56,10 +56,13 @@ jobs:
       - name: Test
         run: cargo test --workspace --exclude frame-os-kernel
 
-  # Kernel cross-build: ensures the bare-metal kernel compiles for its
-  # target. Doesn't actually boot it; that's the qemu-test job below.
+  # Kernel + user-crate cross-build and lint: ensures the bare-metal crates
+  # compile for their target and stay clippy-clean. Neither builds on the host
+  # (target x86_64-unknown-none), so they're excluded from the workspace `test`
+  # job's clippy and gated here instead. Doesn't boot the kernel; that's the
+  # qemu-test job below.
   kernel-build:
-    name: kernel build (x86_64-unknown-none)
+    name: kernel + user build/lint (x86_64-unknown-none)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -67,6 +70,7 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: x86_64-unknown-none
+          components: clippy
       # The kernel's build.rs runs framec on the Frame sources, and building
       # the kernel triggers the nested user-crate build (which also runs
       # framec on parser.frs for the ring-3 Parser reuse). Both need framec.
@@ -82,6 +86,17 @@ jobs:
           key: ${{ runner.os }}-kernel-cargo-${{ hashFiles('**/Cargo.lock') }}
       - name: Build kernel
         run: cargo build -p frame-os-kernel --target x86_64-unknown-none
+      # Lint the bare-metal crates with -D warnings to prevent drift. The kernel
+      # is linted in BOTH configs: default (what the smoke suite boots) and
+      # `interactive` (the typeable shell build, a superset of the signal/job-
+      # control code). The user crate (out-of-workspace, per-bin bare-metal) is
+      # linted across all its bins.
+      - name: Clippy (kernel, default)
+        run: cargo clippy -p frame-os-kernel --target x86_64-unknown-none -- -D warnings
+      - name: Clippy (kernel, interactive)
+        run: cargo clippy -p frame-os-kernel --target x86_64-unknown-none --features interactive -- -D warnings
+      - name: Clippy (user bins)
+        run: cd user && cargo clippy --bins -- -D warnings
 
   # QEMU smoke tests — boot the kernel under headless QEMU UEFI, assert
   # the captured serial output contains the expected banner and no
