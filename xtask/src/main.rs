@@ -1592,13 +1592,18 @@ fn run_console_test() -> Result<()> {
             .context("write background job")?;
         stdin.flush().ok();
         wait_for_output(&buf, "[1] ", 90)?; // `[1] <pid>` ⇒ job launched in background, not waited on
-        // Next command: its pre-prompt harvest reaps the finished bg child and
-        // prints the async Done report. `pwd` is innocuous; we assert the report.
+        // Trigger the harvest with a FOREGROUND EXTERNAL command (`echo` is
+        // /bin/echo — it forks + the shell waitpid's it), NOT a builtin. This
+        // also guards the S10 bug-1 fix: a foreground waitpid must reap only its
+        // own child, not silently drain the finished bg job out from under the
+        // job table. If it drained it (the old behavior), the bg job's Done report
+        // below would be lost. The bg job stays a zombie across the foreground
+        // wait and is reaped + reported by the next prompt's harvest.
         stdin
-            .write_all(b"pwd\n")
-            .context("write pwd (trigger harvest)")?;
+            .write_all(b"echo harvesttrigger\n")
+            .context("write fg cmd (trigger harvest + guard bug-1)")?;
         stdin.flush().ok();
-        wait_for_output(&buf, "[1]+ Done   echo bgjob", 90)?; // bg job harvested + reported at the prompt
+        wait_for_output(&buf, "[1]+ Done   echo bgjob", 90)?; // bg Done survived the foreground waitpid + was reported
         stdin.write_all(b"fg 99\n").context("write fg 99")?;
         stdin.flush().ok();
         wait_for_output(&buf, "fg: no such job", 90)?; // fg on an unknown id ⇒ clean error

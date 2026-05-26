@@ -1140,22 +1140,27 @@ fn do_wait_loop(target: u32) -> u64 {
     if !sched::child_reapable(me, target) && sched::child_stopped(me, target) {
         return WSTOPPED_FLAG;
     }
-    // A matching child is now dead (or vanished). Reap the dead children; for a
-    // specific target, drain the others too so unrelated zombies can't pile up.
+    // A matching child is now dead (or vanished). Reap EXACTLY what we waited on:
+    // for `target == 0` (wait-any) one dead child; for a specific `target` only
+    // that child. We deliberately do NOT drain other dead children here — a
+    // foreground `waitpid` must not silently reap finished *background* jobs out
+    // from under the shell's job table, or their `[id]+ Done` reports would be
+    // lost and their entries would linger as "Running" forever (S10 fix). Dead
+    // background children stay zombies until the shell's prompt-time harvest
+    // (`reap_nohang`) collects them — which is the path that notifies the
+    // IshJobs FSM. Zombies can't pile up unboundedly: the shell harvests every
+    // bg child before each prompt, and any parent that forks children waits on
+    // each one it spawns.
     let result = if target == 0 {
         match sched::reap_dead_child(me) {
             Some((child_pid, child_pml4)) => reap_child(me, child_pid, child_pml4) as u64,
             None => u64::MAX, // ECHILD
         }
     } else {
-        let mut target_status: Option<i32> = None;
-        while let Some((child_pid, child_pml4)) = sched::reap_dead_child(me) {
-            let status = reap_child(me, child_pid, child_pml4);
-            if child_pid == target {
-                target_status = Some(status);
-            }
+        match sched::reap_dead_pid(me, target) {
+            Some((child_pid, child_pml4)) => reap_child(me, child_pid, child_pml4) as u64,
+            None => u64::MAX, // target vanished
         }
-        target_status.map_or(u64::MAX, |s| s as u64)
     };
     result
 }

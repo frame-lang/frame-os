@@ -825,6 +825,34 @@ pub fn reap_dead_child(parent_pid: u32) -> Option<(u32, u64)> {
     }
 }
 
+/// Reap the *specific* dead child `target` of `parent_pid` (vs `reap_dead_child`,
+/// which takes any one). Returns its (pid, pml4) if it was a Dead child, else
+/// None. `waitpid(target)` uses this so it reaps ONLY what it waited on, leaving
+/// other dead children (e.g. finished background jobs) as zombies for the shell's
+/// prompt-time harvest to collect — which is what keeps the job table's
+/// "[id]+ Done" reports from being silently lost to a foreground wait (S10 fix).
+pub fn reap_dead_pid(parent_pid: u32, target: u32) -> Option<(u32, u64)> {
+    unsafe {
+        interrupts::without_interrupts(|| {
+            let t = tcbs();
+            let n = (&raw const N).read();
+            for i in 1..n {
+                if (*t.add(i)).parent_pid == parent_pid
+                    && (*t.add(i)).pid == target
+                    && (*t.add(i)).state == RunState::Dead
+                {
+                    let pid = (*t.add(i)).pid;
+                    let pml4 = (*t.add(i)).pml4;
+                    crate::vfs::clear_fds(i);
+                    (*t.add(i)) = TCB_INIT;
+                    return Some((pid, pml4));
+                }
+            }
+            None
+        })
+    }
+}
+
 /// Whether `parent_pid` has any child still tracked by the scheduler (alive,
 /// blocked, or exited-unreaped). False ⇒ `wait` should return "no children".
 pub fn has_children(parent_pid: u32) -> bool {
