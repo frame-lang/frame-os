@@ -1307,3 +1307,24 @@ preemption point, i.e. an **atomic line**. `argtest` now builds each line in a
 buffer and writes it with one `write(1, …)`. A real capability (a program can
 write an atomic line), not a test-only patch; the test keeps its strong
 `argv[1]=Z` assertion. Validated 8/8 isolated (was ~1/4) + full suite 49/49.
+
+## Deferred / open — storage (post-S10, 2026-05-26)
+
+Recorded so these don't get lost; none are on the critical path.
+
+- **#110 — disk flake (RESOLVED as to *nature*, host artifact).** A write-verify
+  probe (`write_sector` reads each just-written sector back below the fs cache)
+  showed `lost=0` across all failing `mv` runs: writes always land + verify
+  correct on disk; the wrong result is a **stale READ** from the emulated device
+  on the arm64-MTTCG host — below any guest abstraction, not guest-fixable. See
+  `frame_assessment.md` (2026-05-26). Real fixes are environmental (x86 hardware
+  / a different QEMU accel / a QEMU-MTTCG fix).
+- **Modern virtio-blk (1.0)** — deliberately deferred. It would NOT fix #110
+  (same QEMU read path) and is pure native transport churn with zero Frame
+  content (the `BlockRequest`/`IoScheduler` FSMs are unchanged). The driver speaks
+  legacy on purpose (header-documented). Revisit only for spec-currency /
+  modern-only-host portability, not as a bug fix.
+- **Single-flight → pipelined/multi-request I/O** — the *Frame-relevant* storage
+  step (richer `IoScheduler` slot-pool supervisor + N concurrent `BlockRequest`
+  instances). Full design in **`docs/plans/multiflight_io.md`**. Worth doing when
+  storage gets attention; not to "fix" anything.
