@@ -426,6 +426,7 @@ fn prepare_qemu_artifacts_features(workspace: &Path, interactive: bool) -> Resul
     let rmdir_elf = build_user_disk_elf(workspace, "rmdir")?;
     let mv_elf = build_user_disk_elf(workspace, "mv")?; // S8 rename
     let ps_elf = build_user_disk_elf(workspace, "ps")?; // S9 process list
+    let spin_elf = build_user_disk_elf(workspace, "spin")?; // S10 signal target
     // B11-3e: the BuildDriver-FSM-driven build tool (compile→link→run via tcc).
     let build_elf = build_user_disk_elf(workspace, "buildc")?;
     // V1.0 capstone: the Hello Frame system (frame/hello.frs) transpiled to Rust
@@ -462,6 +463,7 @@ fn prepare_qemu_artifacts_features(workspace: &Path, interactive: bool) -> Resul
     files.push(("/bin/rmdir", &rmdir_elf));
     files.push(("/bin/mv", &mv_elf));
     files.push(("/bin/ps", &ps_elf));
+    files.push(("/bin/spin", &spin_elf));
     files.push(("/bin/chello", &chello_elf));
     files.push(("/bin/tcc", &tcc_elf));
     files.push(("/bin/buildc", &build_elf));
@@ -1598,6 +1600,30 @@ fn run_console_test() -> Result<()> {
         stdin.write_all(b"fg 99\n").context("write fg 99")?;
         stdin.flush().ok();
         wait_for_output(&buf, "fg: no such job", 90)?; // fg on an unknown id ⇒ clean error
+        // S10 signals: `spin &` backgrounds a long-lived process (job id 2 — job 1
+        // was the harvested echo above; next_id is monotonic). `kill %2` resolves
+        // the job spec to spin's pid through the IshJobs FSM snapshot and sends
+        // SIGTERM (#29); the kernel delivers it at spin's next syscall boundary,
+        // whose default action terminates it (do_exit). The follow-up `pwd`'s
+        // pre-prompt harvest then reaps + reports the killed job. `spin: alive` is
+        // spin's own startup line (proves the bg job ran); `Done   spin` is the
+        // harvest report (proves kill landed + the job was reaped).
+        eprintln!("console-test: typing `spin &` then `kill %2` (signal a background job)");
+        stdin.write_all(b"spin &\n").context("write spin bg")?;
+        stdin.flush().ok();
+        wait_for_output(&buf, "spin: alive", 90)?; // the backgrounded long-lived job started + ran
+        stdin.write_all(b"kill %2\n").context("write kill %2")?;
+        stdin.flush().ok();
+        // SIGTERM's default action terminates spin at its next syscall boundary →
+        // exit 128+15. Wait for the kernel's exit log first (spin dies while the
+        // shell is idle at the prompt), THEN send a command whose pre-prompt
+        // harvest reaps + reports the now-dead job.
+        wait_for_output(&buf, "exited with code 143", 90)?; // SIGTERM (15) delivered → default terminate
+        stdin
+            .write_all(b"pwd\n")
+            .context("write pwd (trigger harvest after kill)")?;
+        stdin.flush().ok();
+        wait_for_output(&buf, "Done   spin", 90)?; // killed job reaped + reported by the IshJobs FSM
                                                                 // B9-2: argv reaches the program. Type a command WITH arguments; argtest
                                                                 // echoes argc + each argv string, so we can assert the args arrived.
         eprintln!("console-test: typing `/bin/argtest alpha beta`");

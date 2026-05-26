@@ -109,6 +109,11 @@ fn waitpid(pid: u64) -> u64 {
 fn reap_nohang() -> u64 {
     unsafe { syscall3(28, 0, 0, 0) }
 }
+/// kill (#29): send signal `sig` to process `pid`. Returns u64::MAX if no such
+/// process. The shell sends SIGTERM (15) for `kill %job` / `kill <pid>`.
+fn kill(pid: u64, sig: u64) -> u64 {
+    unsafe { syscall3(29, pid, sig, 0) }
+}
 fn open(path: &[u8]) -> u64 {
     unsafe { syscall3(5, path.as_ptr() as u64, path.len() as u64, 0) }
 }
@@ -428,6 +433,56 @@ fn fg_job(arg: Option<&str>, jobs: &mut IshJobs) {
     jobs.remove(id);
 }
 
+/// `kill %<job>` | `kill <pid>`: send SIGTERM. A `%N` argument is a job spec
+/// resolved to a pid through the IshJobs FSM snapshot; otherwise the argument is
+/// a raw pid. The killed background job is harvested at the next prompt (its
+/// `[id]+ Done` line), same as a job that exits on its own.
+fn kill_cmd(arg: Option<&str>, jobs: &mut IshJobs) {
+    let arg = match arg {
+        Some(a) => a,
+        None => {
+            print(b"kill: usage: kill %<job> | <pid>\n");
+            return;
+        }
+    };
+    let pid = if let Some(spec) = arg.strip_prefix('%') {
+        // Job spec: resolve %N → pid via the FSM's table.
+        let id = match parse_u32(spec) {
+            Some(n) => n,
+            None => {
+                print(b"kill: bad job spec\n");
+                return;
+            }
+        };
+        let mut p = 0u64;
+        for e in &jobs.snapshot() {
+            if e.id == id && !e.done {
+                p = e.pid;
+                break;
+            }
+        }
+        if p == 0 {
+            print(b"kill: no such job\n");
+            return;
+        }
+        p
+    } else {
+        // Raw pid.
+        match parse_u32(arg) {
+            Some(n) => n as u64,
+            None => {
+                print(b"kill: not a pid: ");
+                print(arg.as_bytes());
+                write_char(b'\n');
+                return;
+            }
+        }
+    };
+    if kill(pid, 15) == u64::MAX {
+        print(b"kill: no such process\n");
+    }
+}
+
 /// `jobs`: list tracked background jobs (id, state, pid, command).
 fn list_jobs(jobs: &mut IshJobs) {
     for e in jobs.snapshot() {
@@ -491,7 +546,7 @@ fn run_line(line: &str, jobs: &mut IshJobs) {
     match toks[0].as_str() {
         "exit" => exit(0),
         "help" => {
-            print(b"ish builtins: help, exit, cd [dir], pwd, clear, cat <path>..., jobs, fg [id]\n");
+            print(b"ish builtins: help, exit, cd [dir], pwd, clear, cat <path>..., jobs, fg [id], kill %<job>|<pid>\n");
             print(b"on disk in /bin: ls, echo, rm, cp, touch, wc, head, tail, grep, date, mkdir, rmdir, mv, ps, ...\n");
             print(b"redirection (external cmds): cmd > file, cmd >> file, cmd < file\n");
             print(b"pipes: cmd1 | cmd2 (connect cmd1's stdout to cmd2's stdin)\n");
@@ -501,6 +556,7 @@ fn run_line(line: &str, jobs: &mut IshJobs) {
         // which lives in the shell process (forking would lose it).
         "jobs" => list_jobs(jobs),
         "fg" => fg_job(toks.get(1).map(|s| s.as_str()), jobs),
+        "kill" => kill_cmd(toks.get(1).map(|s| s.as_str()), jobs),
         // cd must be a builtin: it changes *this shell's* cwd (per-process in the
         // kernel). No arg → go to root.
         "cd" => {

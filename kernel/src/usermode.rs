@@ -374,6 +374,12 @@ extern "C" fn syscall_dispatch(frame: *mut TrapFrame) {
         f.rax = do_pipe_read_loop(pr_fd, pr_buf, pr_len);
     }
 
+    // Deliver a pending signal at this syscall-return boundary (S10), after the
+    // deferred blocking ops have settled. A default-terminate action diverges
+    // here via do_exit (never returns to the killed program); otherwise this is
+    // a no-op and we fall through to the normal return.
+    maybe_deliver_signal(frame);
+
     // Honor a pending exit AFTER the dispatcher has returned to $Validating —
     // diverging inside the handler would leave it stuck in $Executing.
     let pending = unsafe { (&raw const PENDING_EXIT).read() };
@@ -402,7 +408,41 @@ fn proc_table() -> &'static mut ProcessTable {
 /// primitive; 23 is the S6 pipe; 24/25 are the S7 directory ops; 26 is S8 mv;
 /// 27 is the S9 process-table snapshot.)
 pub fn is_known_syscall(num: u64) -> bool {
-    num <= 28
+    num <= 29
+}
+
+// POSIX signal numbers (Linux x86-64 ABI subset, S10). Only the ones Frame OS
+// generates or gives a non-default action are named; the rest still deliver
+// (default action = terminate) via the catch-all in maybe_deliver_signal.
+pub const SIGINT: u32 = 2; // Ctrl-C (2c)
+pub const SIGKILL: u32 = 9; // unconditional terminate
+pub const SIGTERM: u32 = 15; // polite terminate (default for `kill`)
+pub const SIGCHLD: u32 = 17; // child stopped/exited — default ignore
+pub const SIGCONT: u32 = 18; // continue if stopped — default ignore here (2c resumes)
+pub const SIGSTOP: u32 = 19; // unconditional stop (2c)
+pub const SIGTSTP: u32 = 20; // Ctrl-Z stop (2c)
+
+/// Deliver at most one pending signal to the *current* process at the
+/// syscall-return boundary (S10). This is the single delivery site for now: a
+/// process gets its pending signals when it next returns from a syscall (a
+/// blocked target is flipped Runnable by `send_signal` so it returns and lands
+/// here). For SIG_DFL the default action runs; a terminate diverges through
+/// `do_exit` (so it never returns to the killed program). SIGCHLD/SIGCONT
+/// default to ignore. (User handler trampolines and the stop/continue actions
+/// land in the next sub-steps; today no handler can be registered and SIGTSTP
+/// isn't generated yet, so the terminate + ignore paths are all that fire.)
+fn maybe_deliver_signal(frame: *mut TrapFrame) {
+    let _ = frame; // used once handler trampolines land (sigaction sub-step)
+    loop {
+        let sig = sched::take_deliverable_signal();
+        if sig == 0 {
+            return;
+        }
+        match sig {
+            SIGCHLD | SIGCONT => { /* default action: ignore */ }
+            _ => do_exit(128 + sig as i32), // default action: terminate — never returns
+        }
+    }
 }
 
 /// Block until the console has a complete line, copy it into the user buffer
@@ -716,6 +756,16 @@ pub fn perform_syscall(num: u64, a0: u64, _a1: u64) -> u64 {
         26 => sys_rename(a0, _a1),
         27 => sys_ps(a0, _a1),
         28 => sys_reap_nohang(a0), // non-blocking reap-any for job control (S10)
+        29 => {
+            // kill(pid=a0, sig=a1): send signal a1 to process a0 (S10). a1 == 0
+            // is the POSIX existence check (no signal delivered). Returns 0 on
+            // success, u64::MAX (ESRCH) if no such live process.
+            if sched::send_signal(a0 as u32, _a1 as u32) {
+                0
+            } else {
+                u64::MAX
+            }
+        }
         _ => u64::MAX, // unreachable: validated by is_known_syscall
     }
 }

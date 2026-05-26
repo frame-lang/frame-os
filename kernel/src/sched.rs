@@ -58,6 +58,18 @@ struct Tcb {
     // at "/". Path syscalls resolve relative paths against it.
     cwd: [u8; CWD_MAX],
     cwd_len: u16,
+    // POSIX signal state (S10). These are native plumbing (bitmasks + a handler
+    // table), *not* a state machine: the signal *lifecycle* a process moves
+    // through (Running/Stopped/Terminated) lives in the Process Frame FSM; this
+    // is just the per-process pending/blocked sets the delivery path consults.
+    // `sig_pending`/`sig_blocked` are bit `sig` (1..=31) of a u32; `sig_handlers`
+    // holds the user handler VA per signal (0 = SIG_DFL default action,
+    // 1 = SIG_IGN ignore). fork() copies all three; exec() resets handlers to
+    // default (a fresh image can't keep the old image's handler addresses) but
+    // keeps the blocked mask, per POSIX.
+    sig_pending: u32,
+    sig_blocked: u32,
+    sig_handlers: [u64; NSIG],
 }
 
 const TCB_INIT: Tcb = Tcb {
@@ -70,7 +82,15 @@ const TCB_INIT: Tcb = Tcb {
     heap_brk: 0,
     cwd: [0; CWD_MAX],
     cwd_len: 0,
+    sig_pending: 0,
+    sig_blocked: 0,
+    sig_handlers: [0; NSIG],
 };
+
+/// Number of signals tracked (0 unused; 1..=31 valid), sized for a u32 mask.
+pub const NSIG: usize = 32;
+/// SIG_IGN sentinel stored in `sig_handlers` (distinct from 0 = SIG_DFL).
+pub const SIG_IGN: u64 = 1;
 
 /// Base VA of a user process's `brk` heap (B9-1). Sits well above the program
 /// image (0x1000_0000) and the user stack (0x2000_0000), so growing the heap
@@ -454,6 +474,13 @@ pub unsafe fn spawn_user_from_frame(
     // syscall, so its live x87/SSE registers are the state to copy — FXSAVE them
     // straight into the child's save area.
     fpu::save(fpu_area(n));
+    // fork inherits the parent's signal dispositions and blocked mask, but starts
+    // with an empty pending set (POSIX). alloc_slot() reset this slot to TCB_INIT
+    // (handlers default, masks clear); copy the parent's over the top.
+    if let Some(ps) = slot_of_pid(parent_pid) {
+        (*t.add(n)).sig_handlers = (*t.add(ps)).sig_handlers;
+        (*t.add(n)).sig_blocked = (*t.add(ps)).sig_blocked;
+    }
     with_sched(|s| s.task_ready());
 }
 
@@ -578,6 +605,103 @@ pub fn live_procs(out: &mut [(u32, u32, u8)]) -> usize {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Signals (S10) — native plumbing around the Process lifecycle FSM
+// ---------------------------------------------------------------------------
+//
+// Generation sets a pending bit on the target's TCB; delivery happens to the
+// *current* process at the syscall-return boundary (usermode::syscall_dispatch),
+// where there's a full TrapFrame to either redirect to a handler or act on. A
+// signal sent to a process blocked in a syscall flips it Runnable so it returns
+// from the block and the delivery check fires. (Interrupting an in-progress
+// blocking syscall with EINTR is a documented follow-up; today the block simply
+// completes normally, then the pending signal is delivered.)
+
+/// Whether a live process with `pid` exists (POSIX `kill(pid, 0)` existence
+/// check). False for a freed/never-existed pid.
+pub fn signal_exists(pid: u32) -> bool {
+    slot_of_pid(pid).is_some()
+}
+
+/// Send signal `sig` (1..=31) to process `pid`: set the pending bit. If the
+/// target is Blocked, flip it Runnable so it returns from its blocking syscall
+/// and the delivery check at the syscall boundary fires. Returns false if no
+/// such live process. Pure native — safe from an interrupt handler (the console
+/// RX IRQ calls this for Ctrl-C/Ctrl-Z).
+pub fn send_signal(pid: u32, sig: u32) -> bool {
+    if sig == 0 || sig as usize >= NSIG {
+        return signal_exists(pid); // sig 0 = existence check, no delivery
+    }
+    unsafe {
+        interrupts::without_interrupts(|| match slot_of_pid(pid) {
+            Some(i) => {
+                let t = tcbs();
+                (*t.add(i)).sig_pending |= 1 << sig;
+                if (*t.add(i)).state == RunState::Blocked {
+                    (*t.add(i)).state = RunState::Runnable;
+                }
+                true
+            }
+            None => false,
+        })
+    }
+}
+
+/// Pop the lowest-numbered deliverable signal for the *current* process —
+/// pending and not blocked — clearing its pending bit. Returns 0 if none.
+/// Called by the delivery path at the syscall-return boundary.
+pub fn take_deliverable_signal() -> u32 {
+    unsafe {
+        interrupts::without_interrupts(|| {
+            let cur = (&raw const CURRENT).read();
+            let t = tcbs();
+            let deliverable = (*t.add(cur)).sig_pending & !(*t.add(cur)).sig_blocked;
+            if deliverable == 0 {
+                return 0;
+            }
+            let sig = deliverable.trailing_zeros(); // lowest set bit = lowest signal
+            (*t.add(cur)).sig_pending &= !(1 << sig);
+            sig
+        })
+    }
+}
+
+/// The current process's handler VA for `sig`: 0 = SIG_DFL (default action),
+/// 1 (SIG_IGN) = ignore, else a user handler address.
+pub fn signal_handler(sig: u32) -> u64 {
+    if sig as usize >= NSIG {
+        return 0;
+    }
+    unsafe {
+        let cur = (&raw const CURRENT).read();
+        (*tcbs().add(cur)).sig_handlers[sig as usize]
+    }
+}
+
+/// Set the current process's handler for `sig` (0 = SIG_DFL, 1 = SIG_IGN, else a
+/// user VA). Returns the previous handler. Used by the sigaction syscall (2b).
+pub fn set_signal_handler(sig: u32, handler: u64) -> u64 {
+    if sig as usize >= NSIG {
+        return 0;
+    }
+    unsafe {
+        let cur = (&raw const CURRENT).read();
+        let prev = (*tcbs().add(cur)).sig_handlers[sig as usize];
+        (*tcbs().add(cur)).sig_handlers[sig as usize] = handler;
+        prev
+    }
+}
+
+/// Reset the current process's signal *dispositions* to default (exec semantics:
+/// a fresh image can't keep handler addresses from the old one). Pending and
+/// blocked sets are left intact, per POSIX. Called from the exec path.
+pub fn reset_signal_handlers() {
+    unsafe {
+        let cur = (&raw const CURRENT).read();
+        (*tcbs().add(cur)).sig_handlers = [0; NSIG];
+    }
+}
+
 /// Reap one *dead* (exited) child of `parent_pid`: free its scheduler slot and
 /// return its pid + PML4 so the caller can tear down the address space + the
 /// `Process`. Returns `None` if the parent has no exited-unreaped child.
@@ -665,6 +789,9 @@ pub unsafe fn exec_into(new_pml4: u64) {
     let cur = (&raw const CURRENT).read();
     (*tcbs().add(cur)).pml4 = new_pml4;
     (*tcbs().add(cur)).heap_brk = USER_HEAP_BASE; // new image ⇒ fresh, empty brk heap
+    // New image ⇒ signal handlers reset to default (the old image's handler VAs
+    // are meaningless in the new one). Pending + blocked sets persist (POSIX).
+    (*tcbs().add(cur)).sig_handlers = [0; NSIG];
                                                   // New image ⇒ fresh FPU: reset both the live registers and the saved area to
                                                   // the clean template, so the old image's x87/SSE state (esp. MXCSR) can't
                                                   // leak into the new program before its first context switch (B11-3a).
