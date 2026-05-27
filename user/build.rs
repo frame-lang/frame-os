@@ -17,6 +17,11 @@ use std::process::Command;
 // generated .rs stem in OUT_DIR; it must match the input stem.
 const FRAME_SYSTEMS: &[(&str, &str)] = &[
     ("parser", "parser.frs"),
+    // Pipeline (M3a): the shared command-line grammar FSM — the SAME
+    // frame/pipeline.frs the hosted shell compiles. ish drives its parsing
+    // through Parser -> Pipeline (one FSM source, both targets), retiring its
+    // hand-written parse_redirs / pipe split. src/frame_systems.rs include!s it.
+    ("pipeline", "pipeline.frs"),
     // IshJobs (S10): the interactive shell's job-control FSM ($Idle/$Foreground
     // + background-job table), the ish-resident adaptation of the hosted-shell
     // job_control.frs. Built for x86_64-unknown-none; src/frame_systems.rs

@@ -1,8 +1,12 @@
 // Frame OS interactive shell "ish" (B8).
 //
 // A real REPL, in ring 3: print a prompt, `read_line` from the console (the
-// kernel echoes keystrokes + hands back a whole line), tokenize the line with the
-// *same* `frame/parser.frs` FSM the hosted shell uses, then dispatch:
+// kernel echoes keystrokes + hands back a whole line), then parse it with the
+// *same* Frame FSMs the hosted shell uses — `frame/parser.frs` tokenizes (tagging
+// | < > >> & as typed tokens) and `frame/pipeline.frs` folds those into a command
+// pipeline + redirection + background flag (M3a). One FSM source, two radically
+// different targets. ish still owns the *execution* (fork/exec/dup2/pipe via
+// syscalls). After parsing, dispatch:
 //   - `exit`            → leave the shell (the kernel halts)
 //   - `help`            → list builtins
 //   - `cat <path>...`   → stream files to the console
@@ -31,7 +35,7 @@ use core::panic::PanicInfo;
 mod frame_systems;
 mod mem;
 
-use frame_systems::{IshJobs, Parser};
+use frame_systems::{IshJobs, Parser, Pipeline, Token, TokenKind};
 
 #[inline(always)]
 unsafe fn syscall3(num: u64, a0: u64, a1: u64, a2: u64) -> u64 {
@@ -357,42 +361,10 @@ fn run_pipeline(left: &[String], right: &[String]) {
     waitpid(rpid);
 }
 
-/// Split tokens into (command words, input redirect, output redirect). The
-/// redirection operators must be their own whitespace-separated tokens:
-/// `< file`, `> file`, `>> file`. The operator + its filename are removed from
-/// the returned command words; `>>` sets the append flag on the output redirect.
-fn parse_redirs(toks: &[String]) -> (Vec<String>, Option<String>, Option<(String, bool)>) {
-    let mut words: Vec<String> = Vec::new();
-    let mut redir_in: Option<String> = None;
-    let mut redir_out: Option<(String, bool)> = None;
-    let mut i = 0;
-    while i < toks.len() {
-        match toks[i].as_str() {
-            ">" | ">>" => {
-                let append = toks[i].as_str() == ">>";
-                if i + 1 < toks.len() {
-                    redir_out = Some((toks[i + 1].clone(), append));
-                    i += 2;
-                } else {
-                    i += 1;
-                }
-            }
-            "<" => {
-                if i + 1 < toks.len() {
-                    redir_in = Some(toks[i + 1].clone());
-                    i += 2;
-                } else {
-                    i += 1;
-                }
-            }
-            _ => {
-                words.push(toks[i].clone());
-                i += 1;
-            }
-        }
-    }
-    (words, redir_in, redir_out)
-}
+// (Token parsing — the `&` / `|` split and redirection extraction — used to
+// live here as `parse_redirs` + a manual pipe scan in run_line. M3a replaced
+// them with the shared Parser -> Pipeline FSM; the grammar is owned by
+// frame/pipeline.frs now, the same source the hosted shell compiles.)
 
 /// Harvest finished background (`&`) jobs without blocking. Called once before
 /// every prompt: loop the non-blocking reap syscall to collect every child that
@@ -622,44 +594,72 @@ fn list_jobs(jobs: &mut IshJobs) {
 
 /// Tokenize one line with the Frame `Parser` FSM and dispatch the first token.
 fn run_line(line: &str, jobs: &mut IshJobs) {
+    // Tokenize with the shared Parser FSM (tags | < > >> & as typed tokens).
     let mut p = Parser::__create();
     for c in line.chars() {
         p.consume(c);
     }
     p.finalize();
-    let mut raw: Vec<String> = p.tokens();
-    if raw.is_empty() {
+    if !p.error().is_empty() {
+        print(b"ish: ");
+        print(p.error().as_bytes());
+        write_char(b'\n');
         return;
     }
-    // Trailing `&` → run the command in the background (S10). Strip it here; the
-    // remaining tokens are the command. `&` on its own line is a no-op.
-    let background = raw.last().map(|t| t == "&").unwrap_or(false);
-    if background {
-        raw.pop();
-        if raw.is_empty() {
+
+    // Fold the typed tokens into a command pipeline with the shared Pipeline
+    // FSM — the SAME frame/pipeline.frs the hosted shell uses (M3a). This is
+    // where ish's hand-written `&` / `|` / redirection parsing used to live
+    // (parse_redirs + a manual pipe split); the FSM owns the grammar now, on
+    // bare metal exactly as on the host. ish still owns the *execution*
+    // (fork/exec/dup2/pipe via syscalls).
+    let mut pl = Pipeline::__create();
+    for tok in p.typed_tokens() {
+        let (kind, text) = match tok {
+            Token::Word(w) => (TokenKind::Word, w),
+            Token::Pipe => (TokenKind::Pipe, String::new()),
+            Token::RedirIn => (TokenKind::RedirIn, String::new()),
+            Token::RedirOut => (TokenKind::RedirOut, String::new()),
+            Token::RedirAppend => (TokenKind::RedirAppend, String::new()),
+            Token::Amp => (TokenKind::Amp, String::new()),
+        };
+        pl.consume(kind, text);
+    }
+    pl.finalize();
+    if !pl.error().is_empty() {
+        print(b"ish: ");
+        print(pl.error().as_bytes());
+        write_char(b'\n');
+        return;
+    }
+
+    let commands = pl.commands();
+    if commands.is_empty() {
+        return; // empty line, or a lone `&`
+    }
+    let background = pl.is_background();
+
+    // Pipeline (S6): a single `|` connects two external commands, foreground.
+    // ish wires exactly two stages; the Pipeline FSM parses N, so reject 3+
+    // explicitly rather than silently mishandle (the old hand-split was 2-stage
+    // too). A trailing `&` on a pipeline is ignored, as before.
+    if commands.len() >= 2 {
+        if commands.len() > 2 {
+            print(b"ish: only 2-stage pipelines are supported\n");
             return;
         }
-    }
-    // Pipeline: a single `|` connects two external commands (S6). Handled before
-    // redirection/builtins — `left | right` runs both with a pipe between them.
-    // (Pipelines always run in the foreground at S10; a trailing `&` on a
-    // pipeline is currently ignored.)
-    if let Some(pos) = raw.iter().position(|t| t == "|") {
-        let left = &raw[..pos];
-        let right = &raw[pos + 1..];
-        if left.is_empty() || right.is_empty() {
-            print(b"ish: syntax error near '|'\n");
-        } else {
-            run_pipeline(left, right);
-        }
+        run_pipeline(&commands[0].words, &commands[1].words);
         return;
     }
-    // Strip I/O redirection (`> file`, `>> file`, `< file`) from the token list;
-    // it's applied (for external commands) in the forked child before exec.
-    let (toks, redir_in, redir_out) = parse_redirs(&raw);
-    if toks.is_empty() {
+
+    // Single command. Pull its words + redirection out of the parsed Command.
+    let cmd = &commands[0];
+    if cmd.words.is_empty() {
         return;
     }
+    let toks = cmd.words.clone();
+    let redir_in: Option<String> = cmd.redir_in.clone();
+    let redir_out: Option<(String, bool)> = cmd.redir_out.clone().map(|f| (f, cmd.append));
     // The command line as typed (sans `&`/redirs), for job-control reporting.
     let cmd_str = toks.join(" ");
     match toks[0].as_str() {

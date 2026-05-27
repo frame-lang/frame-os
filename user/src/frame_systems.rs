@@ -25,6 +25,13 @@ pub use alloc::vec::Vec;
 
 include!(concat!(env!("OUT_DIR"), "/parser.rs"));
 
+// Pipeline (M3a): the shared command-line grammar FSM. Declares TokenKind +
+// Command in its native prolog; consumes the Parser's typed tokens. Included
+// after parser.rs so the generated module sees `Token` (parser's prolog type)
+// via its `use super::*` glob. The SAME frame/pipeline.frs the hosted shell
+// compiles — one FSM source, both targets.
+include!(concat!(env!("OUT_DIR"), "/pipeline.rs"));
+
 // One background-job table entry for the IshJobs FSM (S10). The FSM declares its
 // domain field as `Vec<JobEntry>`; Frame treats `JobEntry` as an opaque type and
 // passes it through verbatim, so it must resolve in the generated module's scope.

@@ -74,11 +74,21 @@ Sequenced lowest-risk-first; every milestone leaves both builds green.
   all H3 behavioral + E2E green, clippy/fmt/diagrams clean, kernel + user crates
   unaffected.
 
-- **M3 — Ring-3 `Shell` FSM reuse.** Compile `shell.frs` for `x86_64-unknown-none`
-  (Parser already does), drive `ish`'s loop through the `Shell` FSM, and implement
-  its actions + the M2 backend with **syscalls** (fork/exec/waitpid/dup2/pipe/kill).
-  Keep `ish`'s hand-written path until the FSM path passes. Validate: `console-test`
-  (full S1–S10) green, now FSM-driven.
+- **M3 — Ring-3 FSM reuse.** Staged (chosen 2026-05-27, lowest-risk-first):
+  - **M3a — `Pipeline` FSM into `ish`. ✅ DONE 2026-05-27.** `ish` now drives its
+    parsing through the shared `Parser` → `Pipeline` FSMs (the *same*
+    `frame/pipeline.frs` the hosted shell compiles), retiring its hand-written
+    `parse_redirs` + manual `|`-split. The Pipeline FSM is proven on **bare
+    metal**: `console-test` green end-to-end, exercising FSM-parsed redirection
+    (`echo > / >> / wc <`) and pipes (`echo … | wc`) plus the full S1–S10 suite.
+    `ish` still owns execution (fork/exec/dup2/pipe via syscalls). Headline so
+    far: `Parser` **and** `Pipeline` are now one source running on Linux *and*
+    bare metal. (`ish` net −37 lines.)
+  - **M3b — Ring-3 `Shell` control-flow FSM reuse (next).** Compile `shell.frs`
+    for `x86_64-unknown-none`, drive `ish`'s loop through the `Shell` FSM behind
+    an environment/exec seam (prompt/print/cwd/builtins/exec + the M2 process
+    backend with syscalls). Keep `ish`'s hand-written dispatch until the FSM path
+    passes. Validate: `console-test` green, now `Shell`-FSM-driven.
 
 - **M4 — Consolidate + retire `ish`'s hand-written dispatch.** Switch `ish` fully to
   the shared `Shell` + `JobControl` FSMs over the syscall backend; retire the

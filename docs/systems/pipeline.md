@@ -4,8 +4,8 @@
 
 | Property | Value |
 |---|---|
-| Track | Hosted (M1, H↔B parity). Designed to be reused in ring 3 (M3/M4), like `Parser`. |
-| Milestone introduced | M1 (H↔B shell parity) |
+| Track | Hosted **and** ring-3 userspace — the *same* `.frs` compiles for both (the `ish` reuse landed at M3a), like `Parser`. |
+| Milestone introduced | M1 (hosted); reused in ring-3 `ish` at M3a |
 | Source file | [`../../frame/pipeline.frs`](../../frame/pipeline.frs) |
 | State diagram | [`pipeline.svg`](pipeline.svg) |
 | Instances at runtime | One per Shell `$Parsing` activation — `Pipeline::__create()` per line, fed the `Parser`'s typed tokens |
