@@ -180,25 +180,35 @@ fn with_io_sched<R>(f: impl FnOnce(&mut IoScheduler) -> R) -> R {
 /// names us owner. The check-and-block in `block_current_until` is atomic, and on
 /// any wake we re-ask the supervisor — so a hand-off that races the block is
 /// never lost. (S6: replaces the ad-hoc native disk lock.)
-pub fn acquire_disk() {
+/// Acquire a disk request-slot for the current process via the `IoScheduler`
+/// slot-pool supervisor (multi-flight). Returns the granted slot index; if the
+/// pool is full the caller is queued and blocks here until a slot is handed off.
+/// Up to N requests can be in flight concurrently (one per slot).
+pub fn acquire_disk() -> usize {
     let pid = current_pid();
     // Boot / non-process context (early boot fs::mount, the idle slot): there's
-    // no concurrency and the supervisor may not exist yet — skip it. (pid 0 is
-    // also the "no owner" sentinel, so it must never enter the queue.)
+    // no concurrency and the supervisor may not exist yet — use slot 0 directly.
+    // (pid 0 is also the "no owner" sentinel, so it must never enter the FSM.)
     if !is_preemption_active() || pid == 0 {
-        return;
+        return 0;
     }
-    with_io_sched(|s| s.acquire_disk(pid));
-    block_current_until(|| with_io_sched(|s| s.disk_owner(pid)));
+    let slot = with_io_sched(|s| s.acquire(pid));
+    if slot < 0 {
+        // Pool full — `acquire` queued us. Block until handed a slot.
+        block_current_until(|| with_io_sched(|s| s.slot_of(pid)) >= 0);
+    }
+    with_io_sched(|s| s.slot_of(pid)) as usize
 }
 
-/// Release the disk engine and wake the next queued owner (if any) so it can
-/// claim it. Called by the holder after its transaction completes.
+/// Release the current process's disk slot and wake the next queued requester (if
+/// any) so it can claim the freed slot. Called by the holder after its
+/// transaction completes.
 pub fn release_disk() {
-    if !is_preemption_active() || current_pid() == 0 {
+    let pid = current_pid();
+    if !is_preemption_active() || pid == 0 {
         return; // paired with the bypass in `acquire_disk`
     }
-    let next = with_io_sched(|s| s.release_disk());
+    let next = with_io_sched(|s| s.release(pid));
     if next != 0 {
         wake_pid(next);
     }
@@ -1069,8 +1079,11 @@ pub fn init() {
     unsafe {
         let p = &raw mut SCHED;
         *p = Some(Scheduler::__create());
+        // The slot-pool supervisor admits up to N concurrent disk requests,
+        // matching the driver's request-slot pool (one DMA buffer + descriptor
+        // triple per slot).
         let q = &raw mut IO_SCHED;
-        *q = Some(IoScheduler::__create());
+        *q = Some(IoScheduler::__create(crate::virtio_blk::N_SLOTS as u32));
     }
     init_boot();
 }

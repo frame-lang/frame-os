@@ -1,3 +1,7 @@
+---
+source: kernel-tests/tests/state_graphs.rs
+expression: dot
+---
 digraph IoScheduler {
     compound=true
     node [color="deepskyblue4" style="rounded, filled" fillcolor="azure"]
@@ -28,4 +32,3 @@ acquire(pid: u32)<br ALIGN="LEFT"/>release(pid: u32)<br ALIGN="LEFT"/>is_full()<
     HasFreeSlots -> Full [label=" acquire "]
     Full -> HasFreeSlots [label=" release "]
 }
-

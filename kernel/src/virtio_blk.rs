@@ -58,7 +58,10 @@ pub const SECTOR_SIZE: usize = 512;
 //   - DMA frame at `slot_base + i*4096`, laid out header(16) + status(1) + data(512);
 //   - descriptor triple [3i, 3i+1, 3i+2] (chain head 3i). qsize (128/256) ≫ 3N,
 //     so static assignment never collides and the reverse map is `id / 3`.
-const N_SLOTS: usize = 8;
+/// Number of request slots (concurrent in-flight requests). The `IoScheduler`
+/// slot-pool supervisor admits up to this many; the driver has one DMA frame +
+/// descriptor triple per slot.
+pub const N_SLOTS: usize = 8;
 const SLOT_FRAME: u64 = 4096; // one DMA frame per slot
 
 // Per-slot DMA frame layout: request header, status byte, 512-byte data buffer.
@@ -74,12 +77,14 @@ struct Device {
     used_off: u64,
     avail_idx: u16, // our running available index
     last_used: u16, // last used-ring index we've drained
-    // Request-slot pool (multi-flight Step 1): N contiguous DMA frames, slot `i`
-    // at `slot_base_* + i*SLOT_FRAME` (header/status/data). `slot_in_use[i]`
-    // tracks allocation; submission is serialized so at most one is in flight.
+    // Request-slot pool (multi-flight): N contiguous DMA frames, slot `i` at
+    // `slot_base_* + i*SLOT_FRAME` (header/status/data). Up to N requests run
+    // concurrently, one per slot.
     slot_base_phys: u64,
     slot_base_virt: u64,
-    slot_in_use: [bool; N_SLOTS],
+    // Slot *allocation* (which slot each process holds, who's queued) lives in the
+    // `IoScheduler` Frame supervisor, reached via `sched::acquire_disk`/`release_disk`
+    // — not here. This module owns only the per-slot buffers + completion state.
     // Per-slot completion state (multi-flight Step 2): `drain_used()` consumes
     // used-ring elements, maps each `id/3` back to its slot, records the status
     // byte, and sets `slot_done`. A waiter's completion predicate is its own
@@ -100,7 +105,6 @@ static mut DEV: Device = Device {
     last_used: 0,
     slot_base_phys: 0,
     slot_base_virt: 0,
-    slot_in_use: [false; N_SLOTS],
     slot_done: [false; N_SLOTS],
     slot_status: [0; N_SLOTS],
     present: false,
@@ -152,25 +156,10 @@ fn slot_phys(i: usize) -> u64 {
     dev().slot_base_phys + i as u64 * SLOT_FRAME
 }
 
-/// Claim a free slot, marking it in-use. None if the pool is exhausted.
-/// Submission is serialized by the IoScheduler today, so this never actually
-/// contends — it's the pool API later steps lean on for concurrent in-flight
-/// requests.
-fn acquire_slot() -> Option<usize> {
-    let d = dev();
-    for i in 0..N_SLOTS {
-        if !d.slot_in_use[i] {
-            d.slot_in_use[i] = true;
-            return Some(i);
-        }
-    }
-    None
-}
-
-/// Return slot `i` to the pool.
-fn release_slot(i: usize) {
-    dev().slot_in_use[i] = false;
-}
+// (Slot *allocation* — which slot a process holds, who's queued when the pool is
+// full — lives in the `IoScheduler` Frame supervisor, reached via
+// `sched::acquire_disk`/`release_disk`. This module owns only the per-slot DMA
+// buffers `slot_virt`/`slot_phys` and the completion state below.)
 
 // --- init (B4 Step 1b) -----------------------------------------------------
 
@@ -238,7 +227,6 @@ pub fn init() -> bool {
     d.last_used = 0;
     d.slot_base_phys = slot_base_phys;
     d.slot_base_virt = slot_base_virt;
-    d.slot_in_use = [false; N_SLOTS];
     d.slot_done = [false; N_SLOTS];
     d.slot_status = [0; N_SLOTS];
     d.present = true;
@@ -264,36 +252,35 @@ pub fn init() -> bool {
 
 // --- the post/drain I/O path (B4 Step 1c) ----------------------------------
 
-/// The process pid blocked on a disk completion (0 = none / busy-wait path). The
-/// IRQ handler wakes it. Single outstanding request (single-flight I/O).
-static DISK_WAITER: AtomicU32 = AtomicU32::new(0);
+/// The process pid blocked on each slot's completion (0 = none / busy-wait
+/// path), indexed by slot. Multi-flight: with up to N requests in flight, a
+/// completion IRQ must wake the *specific* waiter whose slot finished — `drain_used`
+/// maps the used-ring id back to a slot and wakes `SLOT_WAITER[slot]`.
+static SLOT_WAITER: [AtomicU32; N_SLOTS] = [const { AtomicU32::new(0) }; N_SLOTS];
 
-/// IRQ post: ack the device ISR, flag the pending completion, and — if a process
-/// is blocked on this read/write — wake it (B8 blocking I/O). Native and
-/// interrupt-safe: no Frame dispatch here (that's `drain`'s job); `wake_pid` only
-/// flips a TCB state.
+/// IRQ post: ack the device ISR, then drain the used ring — marking every
+/// just-completed slot done and waking its waiter. Native + interrupt-safe (no
+/// Frame dispatch; `wake_pid` only flips a TCB state). This is where the drain
+/// lives in multi-flight: a single IRQ can complete several slots, and each
+/// waiter blocks on its own slot, so the IRQ must fan the wakes out by id.
 pub fn on_irq() {
     let d = dev();
     if d.present {
         let _ = io::inb(d.io_base + R_ISR); // read-to-ack
-        let waiter = DISK_WAITER.swap(0, Ordering::SeqCst);
-        if waiter != 0 {
-            sched::wake_pid(waiter);
-        }
+        drain_used();
     }
 }
 
-// Disk transaction serialization (S6): the driver is still single-flight — a
-// single completion `DISK_WAITER` and a `used.idx`-only completion test that
-// assumes one request in flight. The request-slot pool (multi-flight Step 1)
-// gives each request its own buffers + descriptor triple, removing the
-// shared-buffer clobber that originally forced serialization — but submit stays
-// serialized until the later steps (used-ring-element drain, then concurrent
-// submit) make completion per-request. So `read_sector`/`write_sector` hold the
-// disk engine for the whole transaction via the `IoScheduler` supervisor
-// (`sched::acquire_disk`/`release_disk`): a process that finds it busy is queued
-// and blocks, and the holder hands off to the next on release. The sequencing
-// (owner, queue, hand-off) lives in that FSM; here we just bracket the txn.
+// Disk concurrency (S6 → multi-flight): the driver runs up to N requests in
+// flight, one per slot. Each request gets its own DMA buffers + descriptor triple
+// (no shared-buffer clobber) and its own per-slot completion (used-ring-element
+// drain marks `slot_done[slot]` + wakes `SLOT_WAITER[slot]`). Admission — which
+// slot a requester holds, who queues when all N are busy, who's handed a freed
+// slot — is the `IoScheduler` slot-pool supervisor's job, reached via
+// `sched::acquire_disk` (returns a slot, or blocks until one frees) and
+// `sched::release_disk` (frees + admits the next). The sequencing lives in that
+// FSM; here `read_sector`/`write_sector` just bracket the txn around the
+// FSM-assigned slot.
 
 /// Submit slot `slot`'s 3-descriptor request (header, data, status) for `sector`
 /// and ring the doorbell. `write` selects BLK_T_OUT (memory → device) vs BLK_T_IN.
@@ -339,16 +326,20 @@ unsafe fn submit(slot: usize, sector: u64, write: bool) {
     io::outw(d.io_base + R_QUEUE_NOTIFY, 0);
 }
 
-/// Consume completed used-ring *elements* (multi-flight Step 2). For each new
+/// Consume completed used-ring *elements* (multi-flight Steps 2–3). For each new
 /// entry from `last_used` to the device's `used.idx`, map its descriptor id back
-/// to a slot (`id / 3` — slot `i` always uses chain head `3i`), read that slot's
-/// status byte, and mark `slot_done[slot]`. Each waiter's completion predicate is
-/// its own `slot_done` — so completion is per-request, replacing the old global
-/// `used.idx`-advanced test. Native + interrupt-safe (reads + flag writes, no
-/// Frame dispatch). The leading fence is the virtio read barrier: observe the
-/// device's buffer + `used.idx` writes before consuming them. Still serialized
-/// today (one in flight), so this drains exactly one element per request; Step 3
-/// will also call it from `on_irq` to wake concurrent waiters by id.
+/// to a slot (`id / 3` — slot `i` always uses chain head `3i`), record that slot's
+/// status byte, mark `slot_done[slot]`, and wake that slot's waiter. With up to N
+/// requests in flight, one IRQ can complete several slots, so the drain fans the
+/// wakes out by id — each waiter blocks on its own `slot_done[slot]`. Native +
+/// interrupt-safe (reads + flag writes + `wake_pid`, no Frame dispatch).
+///
+/// Called from `on_irq` (the common case) AND from the wait predicate (the boot
+/// busy-wait path, before the scheduler exists). Both run interrupts-off (the
+/// predicate inside `block_current_until`'s critical section; `on_irq` is an ISR),
+/// and the disk is BSP-only, so the two callers never race on `last_used`/the
+/// slot flags. The leading fence is the virtio read barrier: observe the device's
+/// buffer + `used.idx` writes before consuming them.
 fn drain_used() {
     let d = dev();
     let ub = used_base() as *const u8;
@@ -364,6 +355,10 @@ fn drain_used() {
                 unsafe { core::ptr::read_volatile((slot_virt(slot) + OFF_STATUS) as *const u8) };
             d.slot_status[slot] = status;
             d.slot_done[slot] = true;
+            let waiter = SLOT_WAITER[slot].load(Ordering::SeqCst);
+            if waiter != 0 {
+                sched::wake_pid(waiter);
+            }
         }
         d.last_used = d.last_used.wrapping_add(1);
     }
@@ -375,11 +370,12 @@ fn drain_used() {
 /// Completion is detected by `drain_used()` consuming the used-ring *element* for
 /// this request and setting `slot_done[slot]` — NOT by polling the status byte
 /// (the device may write status before the data DMA lands; the used-ring entry is
-/// the spec-correct "all buffers written" signal). The predicate drains then
-/// checks this slot's own flag, so it's per-request and — polled via
-/// `block_current_until`, re-checked after every wake — immune to a lost/early
-/// wakeup. Still serialized (the IoScheduler holds the engine for the whole txn),
-/// so exactly one element drains per request here.
+/// the spec-correct "all buffers written" signal). The predicate checks this
+/// slot's own flag, so it's per-request — multiple slots can be in flight and
+/// each waiter wakes on its own. `on_irq`'s drain wakes us by slot; correctness
+/// comes from `block_current_until` re-checking the predicate (a wake can't make
+/// us return before this slot's element has been drained). The predicate also
+/// drains, covering the boot busy-wait path that has no IRQ-driven scheduler.
 fn wait_and_drain(slot: usize) -> u8 {
     dev().slot_done[slot] = false; // fresh request; drain_used sets it on completion
     let done = move || {
@@ -388,13 +384,12 @@ fn wait_and_drain(slot: usize) -> u8 {
     };
     let pid = sched::current_pid();
     if sched::is_preemption_active() && pid != 0 {
-        // Blocking I/O: yield until the DMA completion. `on_irq` wakes us promptly
-        // via DISK_WAITER, but correctness comes from `block_current_until`
-        // re-checking the predicate — a wake can't make us return before this
-        // slot's used-ring element has been drained.
-        DISK_WAITER.store(pid, Ordering::SeqCst);
+        // Blocking I/O: register this slot's waiter so `on_irq`'s drain wakes us,
+        // then yield until our slot completes. Correctness comes from
+        // `block_current_until` re-checking the predicate, not the wake.
+        SLOT_WAITER[slot].store(pid, Ordering::SeqCst);
         sched::block_current_until(done);
-        DISK_WAITER.store(0, Ordering::SeqCst);
+        SLOT_WAITER[slot].store(0, Ordering::SeqCst);
     } else {
         // Boot / non-process context (no scheduler yet): busy-wait, interrupts on.
         interrupts::enable();
@@ -408,16 +403,18 @@ fn wait_and_drain(slot: usize) -> u8 {
 
 // --- block backend (transfer mechanism) ------------------------------------
 //
-// `read_sector`/`write_sector` keep the **Frame-system wrapper** — IoScheduler
-// serialization (`acquire_disk`/`release_disk`) + the `BlockRequest` lifecycle —
-// shared across BOTH builds. Only the transfer *mechanism* is swapped here: the
-// default build drives the virtqueue (slot + `submit` + `wait_and_drain`); the
-// interactive build copies to/from the in-kernel RAM disk (the #110 mitigation).
-// So the Frame systems sit on a *critical* path in both configs — exercised over
-// the real device in the smoke suite, and over RAM in the interactive shell —
-// rather than being bypassed. The RAM backend also isolates #110: it keeps the
-// Frame systems + `acquire_disk` and removes only the virtqueue/`wait_and_drain`/
-// QEMU completion, so a green interactive run is evidence the hang lived in that
+// `read_sector`/`write_sector` keep the **Frame-system wrapper** — the
+// `IoScheduler` slot-pool supervisor (`acquire_disk`/`release_disk`, which now
+// hands out a concurrency slot) + the `BlockRequest` lifecycle — shared across
+// BOTH builds. Only the transfer *mechanism* is swapped here: the default build
+// drives the virtqueue on the FSM-assigned `slot` (`submit` + `wait_and_drain`);
+// the interactive build copies to/from the in-kernel RAM disk (the #110
+// mitigation) and ignores the slot. So the Frame systems sit on a *critical* path
+// in both configs — coordinating up to N concurrent in-flight requests over the
+// real device in the smoke suite, and over RAM in the interactive shell — rather
+// than being bypassed. The RAM backend also isolates #110: it keeps the Frame
+// systems + `acquire_disk` and removes only the virtqueue/`wait_and_drain`/QEMU
+// completion, so a green interactive run is evidence the hang lived in that
 // transfer, not in the Frame systems.
 
 /// Whether the block backend is ready (device present, or RAM disk loaded).
@@ -430,12 +427,10 @@ fn backend_present() -> bool {
     crate::ramdisk::is_loaded()
 }
 
-/// Transfer one sector device→`out`. Returns true on success.
+/// Transfer one sector device→`out` on the given (FSM-assigned) slot. Returns
+/// true on success.
 #[cfg(not(feature = "interactive"))]
-fn backend_read(sector: u64, out: &mut [u8; SECTOR_SIZE]) -> bool {
-    let Some(slot) = acquire_slot() else {
-        return false;
-    };
+fn backend_read(slot: usize, sector: u64, out: &mut [u8; SECTOR_SIZE]) -> bool {
     unsafe { submit(slot, sector, false) };
     let ok = wait_and_drain(slot) == 0;
     if ok {
@@ -447,20 +442,17 @@ fn backend_read(sector: u64, out: &mut [u8; SECTOR_SIZE]) -> bool {
             );
         }
     }
-    release_slot(slot);
     ok
 }
 #[cfg(feature = "interactive")]
-fn backend_read(sector: u64, out: &mut [u8; SECTOR_SIZE]) -> bool {
+fn backend_read(_slot: usize, sector: u64, out: &mut [u8; SECTOR_SIZE]) -> bool {
     crate::ramdisk::read_sector(sector, out)
 }
 
-/// Transfer one sector `data`→device. Returns true on success.
+/// Transfer one sector `data`→device on the given (FSM-assigned) slot. Returns
+/// true on success.
 #[cfg(not(feature = "interactive"))]
-fn backend_write(sector: u64, data: &[u8; SECTOR_SIZE]) -> bool {
-    let Some(slot) = acquire_slot() else {
-        return false;
-    };
+fn backend_write(slot: usize, sector: u64, data: &[u8; SECTOR_SIZE]) -> bool {
     unsafe {
         core::ptr::copy_nonoverlapping(
             data.as_ptr(),
@@ -469,26 +461,25 @@ fn backend_write(sector: u64, data: &[u8; SECTOR_SIZE]) -> bool {
         );
         submit(slot, sector, true);
     }
-    let ok = wait_and_drain(slot) == 0;
-    release_slot(slot);
-    ok
+    wait_and_drain(slot) == 0
 }
 #[cfg(feature = "interactive")]
-fn backend_write(sector: u64, data: &[u8; SECTOR_SIZE]) -> bool {
+fn backend_write(_slot: usize, sector: u64, data: &[u8; SECTOR_SIZE]) -> bool {
     crate::ramdisk::write_sector(sector, data)
 }
 
-/// Read one 512-byte sector into `out`. Returns true on success. The transaction
-/// is serialized by the `IoScheduler` (`acquire_disk`) and tracked by a
-/// `BlockRequest` FSM (both builds); the backend does the actual transfer.
+/// Read one 512-byte sector into `out`. Returns true on success. The `IoScheduler`
+/// hands out a concurrency slot (`acquire_disk`, blocking if the pool is full),
+/// the transfer runs on that slot, and a `BlockRequest` FSM tracks its lifecycle
+/// (both builds). Up to N such transactions can be in flight at once.
 pub fn read_sector(sector: u64, out: &mut [u8; SECTOR_SIZE]) -> bool {
     if !backend_present() {
         return false;
     }
-    sched::acquire_disk(); // IoScheduler: serialize the whole transaction
+    let slot = sched::acquire_disk(); // IoScheduler: a concurrency slot for this txn
     let mut br = BlockRequest::__create();
     br.submit(); // $Queued → $InFlight
-    if backend_read(sector, out) {
+    if backend_read(slot, sector, out) {
         br.complete();
     } else {
         br.fail();
@@ -503,10 +494,10 @@ pub fn write_sector(sector: u64, data: &[u8; SECTOR_SIZE]) -> bool {
     if !backend_present() {
         return false;
     }
-    sched::acquire_disk();
+    let slot = sched::acquire_disk();
     let mut br = BlockRequest::__create();
     br.submit();
-    if backend_write(sector, data) {
+    if backend_write(slot, sector, data) {
         br.complete();
     } else {
         br.fail();

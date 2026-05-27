@@ -23,6 +23,7 @@ const FRAME_SYSTEMS: &[(&str, &str)] = &[
     ("process_table", "process_table.frs"),
     ("elf_loader", "elf_loader.frs"),
     ("block_request", "block_request.frs"),
+    ("io_scheduler", "io_scheduler.frs"),
     ("mount", "mount.frs"),
     ("open_file", "open_file.frs"),
     ("arp_resolver", "arp_resolver.frs"),

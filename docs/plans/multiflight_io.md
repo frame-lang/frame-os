@@ -118,6 +118,25 @@ the *concurrency coordination* is exactly what Frame is for.
 4. **`IoScheduler` → slot-pool supervisor + N `BlockRequest` instances** (the
    Frame redesign). Validate; update diagrams + `frame_assessment.md`.
 
+   **Steps 3 + 4 DONE 2026-05-27 (fused — you can't allow concurrent submit
+   without relaxing the `IoScheduler` serialization, and the Frame-correct way to
+   do that *is* the supervisor redesign, so they were done together, Frame-first):**
+   - `IoScheduler` redesigned single-engine owner → **slot-pool supervisor**
+     (`$HasFreeSlots/$Full`; `acquire`/`release`/`slot_of`/`is_full` over a free
+     pool + `owners` map + wait queue), created with the driver's `N_SLOTS`.
+     Added 8 behavioral tests + a state-graph snapshot (it had no host test).
+   - Native: per-slot `SLOT_WAITER[N]`; `drain_used` moved into `on_irq`, waking
+     each completed slot's waiter by `id/3`; the FSM now owns slot *allocation*
+     (the driver's own `acquire_slot`/`slot_in_use` removed). `sched::acquire_disk`
+     returns the FSM-assigned slot (blocking until granted); `release_disk` admits
+     the next. `read_sector`/`write_sector` run on that slot — up to N concurrent.
+     N `BlockRequest` instances arise naturally (one per concurrent call).
+   - Validated: 8 IoScheduler behavioral + snapshot; `blk_roundtrip_b4`,
+     `concurrent_exec_buffers` (genuine overlap), `vfs_path_lookup_b4`,
+     `userspace_shell_runs_program_from_disk_b4` PASS; `console-test` 3/3
+     (interactive, FSM slot-pool over RAM); clippy + fmt clean both configs;
+     diagrams regenerated. **Multi-flight I/O complete.**
+
 ## Caveats
 - BSP-only ring-3 today, so "concurrent" = one process blocked on I/O while
   another runs and also issues I/O (e.g. concurrent `exec`). Real, but bounded.

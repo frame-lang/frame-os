@@ -597,6 +597,9 @@ include!(concat!(env!("OUT_DIR"), "/process_table.rs"));
 include!(concat!(env!("OUT_DIR"), "/elf_loader.rs"));
 // BlockRequest (B4 Step 1): I/O request lifecycle. Pure (no native deps).
 include!(concat!(env!("OUT_DIR"), "/block_request.rs"));
+// IoScheduler (multi-flight Step 3/4): slot-pool admission supervisor. Pure
+// (VecDeque/BTreeMap over alloc; no native deps).
+include!(concat!(env!("OUT_DIR"), "/io_scheduler.rs"));
 // Mount (B4 Step 2): filesystem mount/unmount lifecycle. Pure (no native deps).
 include!(concat!(env!("OUT_DIR"), "/mount.rs"));
 // OpenFile (B4 Step 3): per-fd access-mode lifecycle. Pure (no native deps).

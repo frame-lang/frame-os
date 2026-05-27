@@ -1,92 +1,147 @@
 // frame/io_scheduler.frs
 //
-// IoScheduler — the kernel's single authority for blocking-I/O *sequencing* (S6
+// IoScheduler — the kernel's authority for blocking-I/O *sequencing* (S6
 // follow-up). Stateful coordination kept drifting out of sync when it lived in
 // scattered native flags (a disk-busy bool, a waiter array, per-syscall PENDING_*
 // statics), producing lost-wakeup / early-return / single-flight-clobber bugs.
 // This supervisor owns that sequencing as explicit states + queues so it is
 // correct by construction.
 //
-// Scope (built out incrementally): the genuinely *serialized* resource — the
-// single-flight virtio-blk engine — is the stateful core ($Idle/$Busy), since
-// `acquire` does different things by mode (grant vs enqueue). Reader/waiter
-// FIFOs for the other blocking paths (pipe-read, console read_line, wait())
-// live in the domain and are added as those paths migrate.
+// Multi-flight (Step 3/4): the disk engine is no longer single-flight. The
+// driver has a pool of N request slots (each its own DMA buffers + virtqueue
+// descriptor triple), so up to N requests can be in flight at once. This system
+// is the **slot-pool supervisor** — the "manager + N instances" pattern, here
+// admission control over the slots (cf. `ProcessTable`'s `$HasCapacity`/`$Full`
+// over the process array). It hands out a free slot index to each requester, or
+// queues the requester when the pool is full and admits it (into a freed slot)
+// on release. Native owns the *mechanism* (the slot buffers, `submit`, the
+// completion drain, `block_current_until`/`wake_pid`); this owns the *logic*
+// (which slots are free, who holds which, who's queued, who's next).
 //
 // Native/Frame split (load-bearing): this FSM is touched ONLY from syscall /
 // drained context, never an ISR (Frame dispatch is non-reentrant — the project's
-// standing rule). The actual TCB block/unblock is native (`block_current_until` /
-// `wake_pid`); IRQ-sourced wakes (disk *completion*, console RX) stay native
-// shims that wake a cached pid. So this owns the *logic* (who holds the engine,
-// who's queued, who's next); native owns the *mechanism* (mark Blocked, flip
-// Runnable, DMA).
+// standing rule). IRQ-sourced completion wakes stay native shims.
 //
-// Disk-engine state graph:
+// Slot-pool state graph:
 //
-//   ┌─────────┐  acquire(pid)  [grant: owner=pid]   ┌──────────┐
-//   │ $Idle   │ ─────────────────────────────────► │  $Busy   │
-//   │         │ ◄───────────────────────────────── │ owner set│
-//   └─────────┘  release() when the queue is empty  └──────────┘
-//      ▲ acquire(pid) while $Busy → enqueue pid (stay $Busy)        │
-//      └──── release() with a queued waiter → hand off to next (stay $Busy)
+//   ┌───────────────┐  acquire(pid) takes the last free slot   ┌──────────┐
+//   │ $HasFreeSlots │ ───────────────────────────────────────► │  $Full   │
+//   │  (initial)    │ ◄─────────────────────────────────────── │          │
+//   └───────────────┘  release frees a slot with none queued    └──────────┘
+//      ▲ acquire(pid) while free  → grant a slot, stay (if more free)
+//      └ acquire(pid) while $Full → queue pid (returns -1, caller blocks)
+//        release while $Full with a waiter → hand the freed slot to the waiter
+//        (stay $Full); with no waiter → the slot goes free (→ $HasFreeSlots)
+//
+// Like `Scheduler`'s $Idle/$Active, the two modes need no HSM parent: `acquire`
+// and `release` both behave differently per mode, and the queries (`slot_of`,
+// `is_full`) ride the interface defaults. Invariant: the wait queue is non-empty
+// only in `$Full` (a free slot is always granted immediately, never queued).
 
 @@[target("rust")]
 
-@@system IoScheduler {
+@@system IoScheduler(slots: u32) {
     interface:
-        // Disk single-flight engine. `acquire` returns the pid granted the engine
-        // now (== pid if it was idle), or 0 if the caller was enqueued and must
-        // block until it becomes the owner. `release` returns the next owner's
-        // pid to wake (0 if the engine went idle).
-        acquire_disk(pid: u32): u32 = 0
-        release_disk(): u32 = 0
-        disk_owner(pid: u32): bool = self.owner == pid
+        // Acquire a disk slot for `pid`. Returns the granted slot index
+        // (0..slots-1), or -1 if the pool was full and `pid` was queued — the
+        // caller then blocks until granted, polling `slot_of(pid)`.
+        acquire(pid: u32): i32 = -1
+        // Release `pid`'s slot. If a requester is queued, hand it the freed slot
+        // and return its pid (the caller wakes it so it rechecks `slot_of`); else
+        // the slot returns to the free pool and this returns 0.
+        release(pid: u32): u32 = 0
+        // The slot index assigned to `pid` (>= 0 once granted), or -1 if `pid` is
+        // queued / holds nothing. This is a waiter's block predicate (>= 0).
+        slot_of(pid: u32): i32 = self.slot_for(pid)
+        is_full(): bool = false
 
     machine:
-        $Idle {
-            acquire_disk(pid: u32): u32 {
-                self.owner = pid;
-                @@:(pid)
-                -> $Busy
+        $HasFreeSlots {
+            acquire(pid: u32): i32 {
+                // A free slot exists (the invariant of this state) → grant it.
+                @@:(self.assign(pid))
+                if self.free.is_empty() {
+                    -> $Full
+                }
+            }
+            release(pid: u32): u32 {
+                // The wait queue is empty here (a free slot is never queued), so
+                // release just returns `pid`'s slot to the pool — still has free.
+                @@:(self.do_release(pid))
             }
         }
 
-        $Busy {
-            acquire_disk(pid: u32): u32 {
-                // Engine in use — queue this requester; it blocks until handed off.
-                self.disk_q.push_back(pid);
-                @@:(0)
+        $Full {
+            acquire(pid: u32): i32 {
+                // No free slot — queue the requester; it blocks until handed one.
+                self.wait_q.push_back(pid);
+                @@:(-1)
             }
-            release_disk(): u32 {
-                // Hand the engine to the next waiter (sets `owner`), or 0 if none.
-                let next = self.hand_off();
-                @@:(next)
-                if next == 0 {
-                    -> $Idle
+            release(pid: u32): u32 {
+                let admitted = self.do_release(pid);
+                @@:(admitted)
+                // If `do_release` handed the freed slot straight to a queued
+                // waiter, the pool is still full; otherwise a slot is now free.
+                if !self.free.is_empty() {
+                    -> $HasFreeSlots
                 }
             }
-            disk_owner(pid: u32): bool {
-                @@:(self.owner == pid)
+            is_full(): bool {
+                @@:(true)
             }
         }
 
     actions:
-        // Pop the next queued disk waiter, making it the new owner; returns its
-        // pid, or 0 (and clears the owner) if the queue is empty.
-        hand_off(): u32 {
-            match self.disk_q.pop_front() {
+        // Pop a free slot, record `pid` → slot, return the slot index. Only called
+        // in `$HasFreeSlots`, where `free` is non-empty; the `None` arm is
+        // defensive (returns -1, the "queued" sentinel).
+        assign(pid: u32): i32 {
+            match self.free.pop_front() {
+                Some(s) => {
+                    self.owners.insert(pid, s);
+                    return s as i32;
+                }
+                None => return -1,
+            }
+        }
+
+        // Release `pid`'s slot: remove its ownership and either hand the freed
+        // slot to the next queued waiter (return its pid) or return it to the free
+        // pool (return 0). Returning the admitted pid is how the native caller
+        // knows whom to wake.
+        do_release(pid: u32): u32 {
+            let s = match self.owners.remove(&pid) {
+                Some(s) => s,
+                None => return 0,
+            };
+            match self.wait_q.pop_front() {
                 Some(next) => {
-                    self.owner = next;
+                    self.owners.insert(next, s);
                     return next;
                 }
                 None => {
-                    self.owner = 0;
+                    self.free.push_back(s);
                     return 0;
                 }
             }
         }
 
+        // The slot index owned by `pid`, or -1 if `pid` owns none (queued/absent).
+        slot_for(pid: u32): i32 {
+            match self.owners.get(&pid) {
+                Some(s) => *s as i32,
+                None => -1,
+            }
+        }
+
     domain:
-        owner: u32 = 0
-        disk_q: alloc::collections::VecDeque<u32> = alloc::collections::VecDeque::new()
+        // Free slot indices, seeded 0..slots at creation (references the ctor
+        // param, like ProcessTable's `capacity`). `$HasFreeSlots` is the initial
+        // state, valid for slots >= 1 (the kernel creates with the driver's N).
+        free: alloc::collections::VecDeque<u32> = (0..slots).collect()
+        // pid → granted slot index.
+        owners: alloc::collections::BTreeMap<u32, u32> = alloc::collections::BTreeMap::new()
+        // Requesters waiting for a slot (non-empty only in $Full).
+        wait_q: alloc::collections::VecDeque<u32> = alloc::collections::VecDeque::new()
+        slots: u32 = slots
 }
