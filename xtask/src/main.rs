@@ -1241,6 +1241,12 @@ fn qemu_base_command(
     net: &NetMode,
 ) -> Command {
     let mut cmd = Command::new("qemu-system-x86_64");
+    // #110 investigation hook: override the TCG accelerator from the environment,
+    // e.g. `FRAMEOS_QEMU_ACCEL=tcg,thread=single` to disable MTTCG. Opt-in; absent
+    // ⇒ QEMU's default (MTTCG when -smp > 1 on a TCG host). Not used by CI.
+    if let Ok(accel) = std::env::var("FRAMEOS_QEMU_ACCEL") {
+        cmd.args(["-accel", &accel]);
+    }
     cmd.args(["-machine", "q35", "-cpu", "qemu64", "-m", "256M"])
         // B7: 4 cores. Limine starts the APs; the kernel brings them up + parks
         // them (B7 Step 1), then schedules across them (later steps). Harmless
