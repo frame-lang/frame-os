@@ -1324,10 +1324,15 @@ Recorded so these don't get lost; none are on the critical path.
   content (the `BlockRequest`/`IoScheduler` FSMs are unchanged). The driver speaks
   legacy on purpose (header-documented). Revisit only for spec-currency /
   modern-only-host portability, not as a bug fix.
-- **Single-flight → pipelined/multi-request I/O** — the *Frame-relevant* storage
-  step (richer `IoScheduler` slot-pool supervisor + N concurrent `BlockRequest`
-  instances). Full design in **`docs/plans/multiflight_io.md`**. Worth doing when
-  storage gets attention; not to "fix" anything.
+- **Single-flight → pipelined/multi-request I/O — DONE 2026-05-27.** The
+  *Frame-relevant* storage step: `IoScheduler` redesigned to a slot-pool
+  supervisor (`$HasFreeSlots/$Full`) + N concurrent `BlockRequest` instances + an
+  N-slot driver pool with per-slot completion drain in `on_irq`. Done in 4
+  validated steps (`docs/plans/multiflight_io.md`); the FSM gained its first host
+  behavioral tests. *Caveat:* the capability is correct + validated, but runtime
+  in-flight **peaks at 1** on the host-RAM-cached emulated disk (completions are
+  effectively synchronous — see `frame_assessment.md` 2026-05-27); genuine
+  overlap needs real disk latency. A `DISK_IN_FLIGHT_PEAK` counter records it.
 
 ## Outstanding — consolidated (2026-05-26)
 
@@ -1388,8 +1393,10 @@ R-track refinements, and the S1–S10 bare-metal shell are all complete.
   `frame_assessment.md` (2026-05-26, "#110 — can it be fixed?" + the RAM-disk and
   write-back-verdict entries).
 - **Modern virtio-blk (1.0)** — deferred; wouldn't fix #110, zero Frame content.
-- **Single-flight → multi-flight I/O** — the Frame-relevant storage step
-  (`docs/plans/multiflight_io.md`).
+- **Single-flight → multi-flight I/O** — **DONE 2026-05-27** (`IoScheduler`
+  slot-pool supervisor + N `BlockRequest`; `docs/plans/multiflight_io.md`).
+  Correct + validated capability; runtime peaks at 1 in flight on the emulated
+  disk (needs real latency to overlap).
 
 ### Documented design deferrals (won't-do-until-needed)
 
