@@ -84,11 +84,25 @@ Sequenced lowest-risk-first; every milestone leaves both builds green.
     `ish` still owns execution (fork/exec/dup2/pipe via syscalls). Headline so
     far: `Parser` **and** `Pipeline` are now one source running on Linux *and*
     bare metal. (`ish` net −37 lines.)
-  - **M3b — Ring-3 `Shell` control-flow FSM reuse (next).** Compile `shell.frs`
-    for `x86_64-unknown-none`, drive `ish`'s loop through the `Shell` FSM behind
-    an environment/exec seam (prompt/print/cwd/builtins/exec + the M2 process
-    backend with syscalls). Keep `ish`'s hand-written dispatch until the FSM path
-    passes. Validate: `console-test` green, now `Shell`-FSM-driven.
+  - **M3b — Ring-3 `Shell` control-flow FSM reuse.** Chosen shape (2026-05-27):
+    *fat FSM, thin env* — keep all 6 Shell states + the full $Parsing routing in
+    the FSM; abstract every target-specific operation behind a `ShellEnv` trait.
+    - **M3b.1 — `ShellEnv` seam + hosted refactor. ✅ DONE 2026-05-27.** Added
+      `CommandKind` + the `ShellEnv` trait to the shell.frs prolog; the `Shell`
+      FSM now routes prompt/goodbye/tick/classify/run_builtin/run_foreground/
+      spawn_background/spawn_foreground/fg/run_pipeline/wait_foreground/println
+      through `self.env: Box<dyn ShellEnv>` and no longer mentions std, the
+      `Builtin` enum, `JobControl`, or a `PathBuf` cwd. Hosted `StdShellEnv`
+      (shell/src/shell_env.rs) wraps the existing classify/execute/exec +
+      JobControl + cwd, preserving behavior exactly — **state graph byte-stable,
+      all 200+ hosted tests green**, clippy/fmt/diagrams clean. The FSM is now
+      environment-agnostic and ready to compile for ring 3.
+    - **M3b.2 — ring-3 `IshShellEnv` + compile shell.frs for `x86_64-unknown-none`
+      (next).** Implement `ShellEnv` with ish's native syscalls (print/classify/
+      run_builtin/run_external/run_pipeline/fork/exec/wait + IshJobs).
+    - **M3b.3 — drive ish's loop through the `Shell` FSM; `console-test` green,
+      now Shell-FSM-driven.** Keep ish's hand-written dispatch until the FSM path
+      passes.
 
 - **M4 — Consolidate + retire `ish`'s hand-written dispatch.** Switch `ish` fully to
   the shared `Shell` + `JobControl` FSMs over the syscall backend; retire the

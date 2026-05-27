@@ -18,9 +18,13 @@
 // field referencing a type from another module of this crate? Import it
 // here so the generated module can see it.
 
-use crate::builtin::{classify, execute, is_fg, is_unknown, unknown_parts, Builtin};
+// The Shell FSM no longer references the Builtin enum / classify / execute
+// directly (M3b moved them behind the ShellEnv seam in shell_env.rs). It now
+// constructs its environment via default_env(). JobSummary + the process
+// backend are still referenced by the generated job_control.rs / job.rs.
 use crate::job_summary::JobSummary;
 use crate::process_backend::{default_backend, ProcessBackend};
+use crate::shell_env::default_env;
 
 include!(concat!(env!("OUT_DIR"), "/shell.rs"));
 include!(concat!(env!("OUT_DIR"), "/parser.rs"));

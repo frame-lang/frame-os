@@ -48,6 +48,69 @@
 
 @@[target("rust")]
 
+// Environment seam (M3b). Everything the Shell FSM's handlers do that is
+// target-specific — printing, classifying a command, running builtins /
+// externals / pipelines, spawning + waiting on jobs — lives behind the
+// `ShellEnv` trait, NOT inline in the FSM. `Shell` holds a `Box<dyn ShellEnv>`
+// from a per-crate `default_env()` and no longer mentions std, JobControl, the
+// Builtin enum, or a PathBuf cwd. The hosted env (`StdShellEnv`, shell/src/
+// shell_env.rs) wraps the existing classify/execute/exec + JobControl; the
+// ring-3 env (`IshShellEnv`, in the user crate) uses syscalls. This is the same
+// FSM-owns-logic / native-owns-mechanism split as virtio_blk's backend and the
+// M2 process backend — applied to the whole shell so the *same* Shell state
+// graph runs on Linux AND bare metal (the H↔B parity headline).
+//
+// CommandKind is the abstract classification the FSM routes on — the env maps a
+// command's words to it; the FSM decides the destination state. (`Command` is
+// the parsed pipeline stage from pipeline.frs.)
+#[derive(Clone, Debug, PartialEq)]
+pub enum CommandKind {
+    Builtin,
+    External,
+    Fg(Option<String>), // `fg [id]` — resumes a job into the foreground
+}
+
+pub trait ShellEnv {
+    /// Print a line (message + newline) to the console.
+    fn println(&mut self, s: &str);
+    /// Draw the prompt (target decides whether/how — e.g. hosted suppresses it
+    /// on a TTY where the line editor draws it).
+    fn print_prompt(&mut self);
+    /// Print the exit banner.
+    fn print_goodbye(&mut self);
+    /// Reap finished background jobs (called once before each prompt).
+    fn tick(&mut self);
+    /// Classify a command's words into the routing category.
+    fn classify(&self, words: &[String]) -> CommandKind;
+    /// Run a builtin, applying optional output redirection (`> f` / `>> f`).
+    /// `history` is the command history (for the `history` builtin); the
+    /// ring-3 env ignores it.
+    fn run_builtin(
+        &mut self,
+        words: &[String],
+        redir_out: Option<String>,
+        append: bool,
+        history: &[String],
+    );
+    /// Run a single external command in the foreground WITH redirection,
+    /// synchronously (returns when it completes).
+    fn run_foreground_redirected(&mut self, cmd: &Command);
+    /// Spawn a single external command in the background (optional redirection).
+    fn spawn_background(&mut self, cmd: &Command);
+    /// Start a single external command in the foreground (no redirection); the
+    /// shell then transitions to $RunningForeground, whose $> calls
+    /// wait_foreground() to block on it.
+    fn spawn_foreground(&mut self, words: &[String]);
+    /// Resume job `id` into the foreground. Returns true if a job was resumed
+    /// (the shell then waits on it); false if there was no such job.
+    fn fg(&mut self, id: u32) -> bool;
+    /// Run a multi-stage external pipeline in the foreground (synchronously).
+    fn run_pipeline(&mut self, commands: &[Command]);
+    /// Block until the current foreground job exits or is stopped; report its
+    /// exit code / spawn error.
+    fn wait_foreground(&mut self);
+}
+
 @@system Shell {
     interface:
         line(input: &str)
@@ -59,14 +122,14 @@
         $Prompting {
             $>() {
                 // Reap done background jobs (silently). Then prompt.
-                self.job_control.tick();
-                self.print_prompt();
+                self.env.tick();
+                self.env.print_prompt();
             }
 
             line(input: &str) {
                 let trimmed = input.trim();
                 if trimmed.is_empty() {
-                    self.print_prompt();
+                    self.env.print_prompt();
                 } else if trimmed == "exit" || trimmed == "quit" {
                     -> $Exiting
                 } else {
@@ -78,7 +141,7 @@
             interrupt() {
                 // Ctrl-C at the prompt is "abort this input." Rustyline
                 // already cleared the line buffer; re-prompt.
-                self.print_prompt();
+                self.env.print_prompt();
             }
 
             eof() {
@@ -95,7 +158,7 @@
                 }
                 p.finalize();
                 if !p.error().is_empty() {
-                    println!("parse error: {}", p.error());
+                    self.env.println(&format!("parse error: {}", p.error()));
                     -> $Prompting
                 }
 
@@ -117,7 +180,7 @@
                 }
                 pl.finalize();
                 if !pl.error().is_empty() {
-                    println!("frame-os: {}", pl.error());
+                    self.env.println(&format!("frame-os: {}", pl.error()));
                     -> $Prompting
                 }
 
@@ -138,78 +201,63 @@
                     -> $RunningPipeline
                 }
 
-                // Single command. Classify its words; carry its redirection.
+                // Single command. Classify its words (env-specific builtin set);
+                // the FSM routes on the abstract CommandKind.
                 let cmd = commands[0].clone();
                 let has_redir = cmd.redir_in.is_some() || cmd.redir_out.is_some();
-                self.current_builtin = classify(cmd.words.clone());
-                let unknown = is_unknown(&self.current_builtin);
-                let fg = is_fg(&self.current_builtin);
-
-                if unknown && background {
-                    // Background external command. Spawn and stay $Prompting.
-                    let (c, a) = unknown_parts(&self.current_builtin);
-                    if has_redir {
-                        crate::exec::spawn_background_redirected(&cmd, &self.cwd);
-                    } else {
-                        self.job_control.spawn_background(c, a);
-                    }
-                    self.history.push(self.current_line.clone());
-                    -> $Prompting
-                } else if unknown && has_redir {
-                    // Foreground external command WITH redirection: run it
-                    // natively (synchronous) so the redirected fds are wired,
-                    // then return to the prompt. (Non-redirected foreground
-                    // externals still go through JobControl so job control /
-                    // Ctrl-C work — the branch below.)
-                    crate::exec::run_foreground_redirected(&cmd, &self.cwd);
-                    self.history.push(self.current_line.clone());
-                    -> $Prompting
-                } else if unknown {
-                    // Foreground external command (no redirection).
-                    let (c, a) = unknown_parts(&self.current_builtin);
-                    self.job_control.spawn_foreground(c, a);
-                    self.last_foreground_id = self.job_control.foreground_id();
-                    -> $RunningForeground
-                } else if fg && background {
-                    // `fg &` is meaningless; reject.
-                    println!("fg: cannot run fg in the background");
-                    -> $Prompting
-                } else if fg {
-                    // `fg <id>` resumes a stopped or background job into
-                    // the foreground, then waits on it. Has its own
-                    // dispatch because it must transition to
-                    // $RunningForeground (not $RunningBuiltin).
-                    let arg = match &self.current_builtin {
-                        Builtin::Fg(a) => a.clone(),
-                        _ => None,
-                    };
-                    if let Some(id) = arg.as_deref().and_then(|s| s.parse::<u32>().ok()) {
-                        self.job_control.fg(id);
-                        if self.job_control.is_running_foreground() {
-                            self.last_foreground_id = self.job_control.foreground_id();
+                match self.env.classify(&cmd.words) {
+                    CommandKind::External => {
+                        if background {
+                            // Background external command; stays $Prompting.
+                            self.env.spawn_background(&cmd);
                             self.history.push(self.current_line.clone());
-                            -> $RunningForeground
+                            -> $Prompting
+                        } else if has_redir {
+                            // Foreground external WITH redirection: synchronous.
+                            self.env.run_foreground_redirected(&cmd);
+                            self.history.push(self.current_line.clone());
+                            -> $Prompting
                         } else {
-                            println!("fg: no such job: {}", id);
+                            // Foreground external (no redirection): start it, then
+                            // wait in $RunningForeground (job control / Ctrl-C).
+                            self.env.spawn_foreground(&cmd.words);
+                            -> $RunningForeground
+                        }
+                    }
+                    CommandKind::Fg(arg) => {
+                        if background {
+                            self.env.println("fg: cannot run fg in the background");
+                            -> $Prompting
+                        } else if let Some(id) =
+                            arg.as_deref().and_then(|s| s.parse::<u32>().ok())
+                        {
+                            if self.env.fg(id) {
+                                self.history.push(self.current_line.clone());
+                                -> $RunningForeground
+                            } else {
+                                self.env.println(&format!("fg: no such job: {}", id));
+                                -> $Prompting
+                            }
+                        } else {
+                            self.env.println("fg: missing or invalid job id");
+                            self.history.push(self.current_line.clone());
                             -> $Prompting
                         }
-                    } else {
-                        println!("fg: missing or invalid job id");
-                        self.history.push(self.current_line.clone());
-                        -> $Prompting
                     }
-                } else if background {
-                    // Background builtin (other than fg/bg/wait/kill which
-                    // wouldn't make sense backgrounded anyway). Reject.
-                    println!("frame-os: background builtins are not supported");
-                    -> $Prompting
-                } else {
-                    // Builtin. Carry any output redirection so $RunningBuiltin
-                    // can apply it around execute() (Unix fd redirect — so
-                    // e.g. `pwd > f` / `echo hi > f` write the file).
-                    self.current_redir_out = cmd.redir_out.clone();
-                    self.current_append = cmd.append;
-                    -> $RunningBuiltin
+                    CommandKind::Builtin => {
+                        if background {
+                            self.env
+                                .println("frame-os: background builtins are not supported");
+                            -> $Prompting
+                        } else {
+                            // Carry the words + output redirection to
+                            // $RunningBuiltin.
+                            self.current_words = cmd.words.clone();
+                            self.current_redir_out = cmd.redir_out.clone();
+                            self.current_append = cmd.append;
+                            -> $RunningBuiltin
+                        }
+                    }
                 }
             }
         }
@@ -221,31 +269,15 @@
 
         $RunningBuiltin {
             $>() {
-                // Apply output redirection if the command had `> f` / `>> f`.
-                // The guard repoints stdout (fd 1) at the file and restores it
-                // on drop; builtins write via println! so their output lands in
-                // the file. None when there's no redirection (or off-Unix).
-                match self.current_redir_out.clone() {
-                    Some(path) => {
-                        let _guard =
-                            crate::exec::redirect_stdout(&path, self.current_append, &self.cwd);
-                        execute(
-                            &self.current_builtin,
-                            &mut self.cwd,
-                            &self.history,
-                            &mut self.job_control,
-                        );
-                        // _guard drops here, flushing + restoring stdout.
-                    }
-                    None => {
-                        execute(
-                            &self.current_builtin,
-                            &mut self.cwd,
-                            &self.history,
-                            &mut self.job_control,
-                        );
-                    }
-                }
+                // The env runs the builtin, applying any `> f` / `>> f` output
+                // redirection itself (hosted: a Unix fd redirect around the
+                // call; ring-3: open + dup2 in the builtin path).
+                self.env.run_builtin(
+                    &self.current_words,
+                    self.current_redir_out.clone(),
+                    self.current_append,
+                    &self.history,
+                );
                 self.current_redir_out = None;
                 self.history.push(self.current_line.clone());
                 -> $Prompting
@@ -255,9 +287,10 @@
         $RunningPipeline {
             $>() {
                 // Run the multi-stage pipeline of external commands in the
-                // foreground (native std::process, OS pipes between stages).
-                // The Pipeline FSM already validated the structure.
-                crate::exec::run_foreground_pipeline(&self.current_pipeline, &self.cwd);
+                // foreground. The env owns the mechanism (hosted std::process
+                // OS pipes; ring-3 fork/exec/pipe/dup2). The Pipeline FSM
+                // already validated the structure.
+                self.env.run_pipeline(&self.current_pipeline);
                 self.current_pipeline = Vec::new();
                 -> $Prompting
             }
@@ -268,35 +301,10 @@
 
         $RunningForeground {
             $>() {
-                // Block-equivalent: drives JobControl's polling loop
-                // until the foreground job exits or is stopped.
-                self.job_control.wait_foreground();
-
-                // Surface non-zero exit codes for completed foreground
-                // jobs (preserves H2's "[exit code: N]" output).
-                let id = self.last_foreground_id;
-                for s in self.job_control.jobs().iter() {
-                    if s.id == id {
-                        if s.state == "Done" && s.exit_code != 0 {
-                            println!("[exit code: {}]", s.exit_code);
-                        } else if s.state.starts_with("Failed") {
-                            // Spawn failure (NotFound etc.). Print a
-                            // shell-shaped message similar to bash's
-                            // "command not found".
-                            let parsed: String = s.state
-                                .strip_prefix("Failed (")
-                                .and_then(|x| x.strip_suffix(")"))
-                                .map(|x| x.to_string())
-                                .unwrap_or_default();
-                            if parsed.contains("No such file") {
-                                println!("{}: command not found", s.cmd);
-                            } else {
-                                println!("{}: {}", s.cmd, parsed);
-                            }
-                        }
-                        break;
-                    }
-                }
+                // Block until the foreground job exits or is stopped, and
+                // report its exit code / spawn error. The env owns the
+                // mechanism (hosted JobControl poll loop; ring-3 waitpid).
+                self.env.wait_foreground();
                 self.history.push(self.current_line.clone());
                 -> $Prompting
             }
@@ -310,7 +318,7 @@
 
         $Exiting {
             $>() {
-                self.print_goodbye();
+                self.env.print_goodbye();
             }
 
             // Terminal. line / interrupt / eof have no handlers — Frame
@@ -319,30 +327,16 @@
             is_done(): bool { @@:(true) }
         }
 
-    actions:
-        print_prompt() {
-            use std::io::{IsTerminal, Write};
-            // On an interactive TTY the line editor (rustyline) renders the
-            // prompt, so it survives the editor's line redraws — printing it
-            // here too would just be erased on the first refresh (the prompt
-            // would flash and vanish). Only emit it ourselves for non-TTY
-            // (piped) input, where rustyline reads without drawing a prompt.
-            if !std::io::stdin().is_terminal() {
-                print!("$> ");
-                let _ = std::io::stdout().flush();
-            }
-        }
-
-        print_goodbye() {
-            println!("goodbye");
-        }
+    // No actions: every environment-specific operation moved to the ShellEnv
+    // trait (M3b). The FSM is pure coordination now.
 
     domain:
         // The most recent line being processed.
         current_line: String = String::new()
 
-        // The classified Builtin from the most recent parse.
-        current_builtin: Builtin = Builtin::Empty
+        // The words of the single builtin command to run in $RunningBuiltin
+        // (carried from $Parsing). The env classifies + executes them.
+        current_words: Vec<String> = Vec::new()
 
         // The pipeline stages to run in $RunningPipeline (set in $Parsing when
         // the line parsed to two or more `|`-joined commands).
@@ -353,17 +347,13 @@
         current_redir_out: Option<String> = None
         current_append: bool = false
 
-        // Job id of the most recently spawned foreground job. Stored so
-        // $RunningForeground.$> can find the exit info in jobs() after
-        // wait_foreground returns (which clears JobControl.foreground_id).
-        last_foreground_id: u32 = 0
-
-        // Shell's tracked working directory.
-        cwd: std::path::PathBuf = std::env::current_dir().unwrap_or_default()
-
-        // Command history.
+        // Command history. Plain alloc — works on both targets.
         history: Vec<String> = Vec::new()
 
-        // The job table + foreground-tracking manager.
-        job_control: JobControl = @@JobControl()
+        // The environment seam (M3b): printing, classification, builtin /
+        // external / pipeline execution, and job spawn/wait all go through here.
+        // default_env() is supplied per-crate — the hosted StdShellEnv (which
+        // owns the cwd + JobControl + Builtin classify/execute) or the ring-3
+        // IshShellEnv (syscalls). The Shell FSM is environment-agnostic.
+        env: Box<dyn ShellEnv> = default_env()
 }

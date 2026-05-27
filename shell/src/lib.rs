@@ -15,8 +15,11 @@ pub mod exec;
 pub mod frame_systems;
 pub mod job_summary;
 pub mod process_backend;
+pub mod shell_env;
 pub mod signals;
 
 pub use builtin::Builtin;
-pub use frame_systems::{Command, Job, JobControl, Parser, Pipeline, Shell, Token, TokenKind};
+pub use frame_systems::{
+    Command, CommandKind, Job, JobControl, Parser, Pipeline, Shell, ShellEnv, Token, TokenKind,
+};
 pub use job_summary::JobSummary;
