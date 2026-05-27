@@ -1328,3 +1328,59 @@ Recorded so these don't get lost; none are on the critical path.
   step (richer `IoScheduler` slot-pool supervisor + N concurrent `BlockRequest`
   instances). Full design in **`docs/plans/multiflight_io.md`**. Worth doing when
   storage gets attention; not to "fix" anything.
+
+## Outstanding — consolidated (2026-05-26)
+
+A single inventory of what is *not* done, so it doesn't get lost across the
+per-track notes above. **Nothing here is on the critical path** — the V1.0 north
+star (framec → C *and* Rust, both running from the shell) is met, and B0–B11, the
+R-track refinements, and the S1–S10 bare-metal shell are all complete.
+
+### Planned, not built
+
+- **`Shell` `.frs` reuse in ring 3** — the second half of **B4-6**. The `Parser`
+  FSM already compiles for both host and ring 3 (proven by
+  `userspace_frame_parser_reuse_b4`); the full `Shell` FSM does not. The ring-3
+  interactive shell (`ish`) is hand-written raw-syscall Rust. Closing this needs
+  the `Shell`'s `std`-only actions re-implemented for ring 3. Deferred since a
+  real input device landed (B8) — the remaining lift is the action rewrite.
+- **H-track (hosted shell) beyond H0** — H0 (minimum viable shell on Linux/macOS/
+  Windows) is done; **H1** (builtins), **H2** (job control + Ctrl-C kills a
+  running child via `signal-hook`/`ctrlc`), and later milestones are the parallel
+  hosted-application track, largely independent of the bare-metal kernel.
+
+### Deferred storage (see the section above for detail)
+
+- **#110** disk flake — resolved *as to nature* (irreducible QEMU/TCG-arm64
+  stale-read host artifact). Environmental fixes only. *This is the active blocker
+  for a reliably-green `console-test` when it clusters.* See the deeper analysis
+  in `frame_assessment.md` (2026-05-26, "#110 — can it be fixed?").
+- **Modern virtio-blk (1.0)** — deferred; wouldn't fix #110, zero Frame content.
+- **Single-flight → multi-flight I/O** — the Frame-relevant storage step
+  (`docs/plans/multiflight_io.md`).
+
+### Documented design deferrals (won't-do-until-needed)
+
+- **B0-4** boot-child panic-forwarding test — needs a fault-injection hook or an
+  event-stepped boot chain (the synchronous chain makes it non-observable).
+- **B0-9** dedicated `isa-debug-exit` clean-halt test — behind a future
+  `smoke-test` Cargo feature.
+- **B5-7** crates.io CI — blocked on publishing the typed-context framec.
+- **RFC-815** multi-datagram IP-reassembly hole management — single-flight
+  reassembly is correct; no workload needs the general case.
+- **TAP** as the standing network transport — slirp covers CI; TAP is validated
+  for ping but not the default.
+
+### Open-ended / ongoing
+
+- **Grow the C-shim** (`frame-os-libc`) as on-device tcc programs need more libc
+  surface — intentionally demand-driven.
+- Minor `cwd`/`exec` niceties.
+
+### POSIX nuances (low value, unhit today)
+
+- **`SIG_IGN` not preserved across `exec`.** `sched::exec_into` zeros all
+  `sig_handlers` to `SIG_DFL`; POSIX preserves `SIG_IGN` dispositions across
+  `exec` (only *caught* handlers reset). Unhit — no current program sets
+  `SIG_IGN` then `exec`s. A documented minimal-model simplification; revisit if a
+  program ever relies on inherited ignore-dispositions.
