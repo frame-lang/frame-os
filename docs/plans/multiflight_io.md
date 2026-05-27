@@ -91,8 +91,9 @@ the *concurrency coordination* is exactly what Frame is for.
    DMA frame + fixed descriptor triple `[3i,3i+1,3i+2]`; `acquire_slot`/`release_slot`
    pool; `submit(slot,..)` / `wait_and_drain(slot)` / `read_sector` / `write_sector`
    route through a slot. Completion still `used.idx`-only (one in flight), submit
-   still serialized by `IoScheduler`. Parity validated: `blk_roundtrip_b4` PASS;
-   clippy + fmt clean both kernel configs.
+   still serialized by `IoScheduler`. (Under serialization `acquire_slot` always
+   returns slot 0 → descriptors 0/1/2, byte-identical to the old single-scratch
+   path; slots 1–7 are unused until Step 3.) clippy + fmt clean both configs.
 2. **Used-ring-element drain** (`id → slot`, multi-completion) replacing the
    `used.idx`-only completion; still serialized; validate.
    **DONE 2026-05-26**: `drain_used()` consumes used-ring elements (fenced
@@ -100,8 +101,18 @@ the *concurrency coordination* is exactly what Frame is for.
    advances `last_used`). `wait_and_drain(slot)`'s predicate is now
    `{ drain_used(); slot_done[slot] }` — per-request, not the global
    `used.idx`-advanced test. Drain currently runs in the wait predicate (Step 3
-   moves it into `on_irq` to wake concurrent waiters by id). Parity validated:
-   `blk_roundtrip_b4` PASS; clippy + fmt clean both configs.
+   moves it into `on_irq` to wake concurrent waiters by id). clippy + fmt clean.
+
+   **Validation (Steps 1–2, virtqueue path), broadened 2026-05-27.** Initially
+   only `blk_roundtrip_b4` (a 2-transaction single-sector boot round-trip) — which
+   covers the slot-0 submit/drain but *not* many-transaction `drain_used` ring
+   indexing. After the RAM-disk rework moved the interactive build off the
+   virtqueue, the slot-pool/drain is exercised *only* by the non-interactive smoke
+   suite, so the full disk-heavy set was run and all PASS: `fs_file_roundtrip_b4`,
+   `file_write_roundtrip_b9`, `vfs_path_lookup_b4`,
+   `userspace_shell_runs_program_from_disk_b4` (multi-sector ELF exec = many
+   drains), `concurrent_exec_buffers` (IoScheduler hand-off under contention), and
+   `fs_persists_across_reboot_b4`. No regression from the slot-pool/drain refactor.
 3. **Concurrent submit** — allow a second request before the first completes;
    the drain wakes each by id. Validate with concurrent `exec` (a pipeline).
 4. **`IoScheduler` → slot-pool supervisor + N `BlockRequest` instances** (the
