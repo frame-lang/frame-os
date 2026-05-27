@@ -1364,13 +1364,20 @@ R-track refinements, and the S1–S10 bare-metal shell are all complete.
 
 - **#110** disk flake — resolved *as to nature* (irreducible QEMU/TCG-arm64
   host artifact in the emulated-disk completion path). **Mitigated for the
-  interactive build (2026-05-26):** the `interactive` kernel now serves its
-  filesystem from a baked-in **RAM disk** (`kernel/src/ramdisk.rs`), bypassing the
-  emulated device entirely — `console-test` went from ~80% flaky to **8/8 green**
-  on the same saturated host. The real virtio-blk driver + `BlockRequest`/
-  `IoScheduler` Frame systems are unchanged and still validated by the
-  (non-interactive) smoke suite (`blk_roundtrip_b4` re-confirmed PASS after the
-  refactor). The RAM disk is *ephemeral* (writes reset to the pristine image each
+  interactive build (2026-05-26):** the `interactive` kernel serves its
+  filesystem from a baked-in **RAM disk** (`kernel/src/ramdisk.rs`) that slots in
+  **UNDER `virtio_blk`** — `fs` still calls `virtio_blk::read_sector`/`write_sector`,
+  which keep the Frame-system wrapper (`IoScheduler` serialization + `BlockRequest`
+  lifecycle) in *both* builds; only the inner transfer mechanism is swapped
+  (virtqueue + `wait_and_drain` + QEMU vs RAM `memcpy`). So the Frame systems stay
+  on the critical disk path in the interactive shell, exercised over RAM, instead
+  of being bypassed. `console-test` went from ~80% flaky to **6/6 green** with the
+  Frame systems in-path (8/8 with the earlier bypass) on the same saturated host;
+  `blk_roundtrip_b4` (virtqueue path) re-confirmed PASS. **This also experimentally
+  isolated #110:** keeping the Frame systems + `acquire_disk` while removing only
+  the virtqueue/`wait_and_drain`/QEMU transfer leaves it green → the hang lived in
+  that transfer, not in the Frame systems (which the IoScheduler/BlockRequest audit
+  had already argued). The RAM disk is *ephemeral* (writes reset to the pristine image each
   boot — matches the fresh-per-run workflow). **Write-back was evaluated and is
   NOT worth pursuing on the emulation host:** cross-boot durability requires the
   *device* to be the boot source-of-truth, but the boot source is the baked

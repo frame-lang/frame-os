@@ -54,11 +54,9 @@ fn read_block(b: u32) -> Block {
         return c.data;
     }
     let mut buf = [0u8; fs::BLOCK_SIZE];
-    // Interactive build serves the disk from the baked RAM disk (#110 mitigation);
-    // every other build uses the real virtio-blk device.
-    #[cfg(feature = "interactive")]
-    crate::ramdisk::read_sector(b as u64, &mut buf);
-    #[cfg(not(feature = "interactive"))]
+    // Always through virtio_blk: it owns the Frame-system wrapper (IoScheduler +
+    // BlockRequest); its backend is the real device, or the RAM disk in the
+    // interactive build (#110 mitigation) — the swap is below `read_sector`.
     crate::virtio_blk::read_sector(b as u64, &mut buf);
     c.block = b;
     c.valid = true;
@@ -68,9 +66,6 @@ fn read_block(b: u32) -> Block {
 
 /// Write block `b` (write-through: disk + cache).
 fn write_block(b: u32, data: &Block) {
-    #[cfg(feature = "interactive")]
-    crate::ramdisk::write_sector(b as u64, data);
-    #[cfg(not(feature = "interactive"))]
     crate::virtio_blk::write_sector(b as u64, data);
     let slot = (b as usize) % CACHE_SLOTS;
     let c = &mut cache()[slot];

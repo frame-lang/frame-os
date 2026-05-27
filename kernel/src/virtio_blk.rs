@@ -406,27 +406,39 @@ fn wait_and_drain(slot: usize) -> u8 {
     dev().slot_status[slot]
 }
 
-/// Read one 512-byte sector into `out`. Returns true on success. Drives a
-/// `BlockRequest` through its lifecycle from the drained completion.
-pub fn read_sector(sector: u64, out: &mut [u8; SECTOR_SIZE]) -> bool {
-    if !dev().present {
-        return false;
-    }
-    sched::acquire_disk(); // serialize: hold the single-flight engine for this whole txn
+// --- block backend (transfer mechanism) ------------------------------------
+//
+// `read_sector`/`write_sector` keep the **Frame-system wrapper** — IoScheduler
+// serialization (`acquire_disk`/`release_disk`) + the `BlockRequest` lifecycle —
+// shared across BOTH builds. Only the transfer *mechanism* is swapped here: the
+// default build drives the virtqueue (slot + `submit` + `wait_and_drain`); the
+// interactive build copies to/from the in-kernel RAM disk (the #110 mitigation).
+// So the Frame systems sit on a *critical* path in both configs — exercised over
+// the real device in the smoke suite, and over RAM in the interactive shell —
+// rather than being bypassed. The RAM backend also isolates #110: it keeps the
+// Frame systems + `acquire_disk` and removes only the virtqueue/`wait_and_drain`/
+// QEMU completion, so a green interactive run is evidence the hang lived in that
+// transfer, not in the Frame systems.
+
+/// Whether the block backend is ready (device present, or RAM disk loaded).
+#[cfg(not(feature = "interactive"))]
+fn backend_present() -> bool {
+    dev().present
+}
+#[cfg(feature = "interactive")]
+fn backend_present() -> bool {
+    crate::ramdisk::is_loaded()
+}
+
+/// Transfer one sector device→`out`. Returns true on success.
+#[cfg(not(feature = "interactive"))]
+fn backend_read(sector: u64, out: &mut [u8; SECTOR_SIZE]) -> bool {
     let Some(slot) = acquire_slot() else {
-        sched::release_disk();
         return false;
     };
-    let mut br = BlockRequest::__create();
-    br.submit(); // $Queued → $InFlight
     unsafe { submit(slot, sector, false) };
-    let status = wait_and_drain(slot);
-    if status == 0 {
-        br.complete();
-    } else {
-        br.fail();
-    }
-    let ok = if br.is_complete() {
+    let ok = wait_and_drain(slot) == 0;
+    if ok {
         unsafe {
             core::ptr::copy_nonoverlapping(
                 (slot_virt(slot) + OFF_DATA) as *const u8,
@@ -434,27 +446,21 @@ pub fn read_sector(sector: u64, out: &mut [u8; SECTOR_SIZE]) -> bool {
                 SECTOR_SIZE,
             );
         }
-        true
-    } else {
-        false
-    };
+    }
     release_slot(slot);
-    sched::release_disk();
     ok
 }
+#[cfg(feature = "interactive")]
+fn backend_read(sector: u64, out: &mut [u8; SECTOR_SIZE]) -> bool {
+    crate::ramdisk::read_sector(sector, out)
+}
 
-/// Write one 512-byte sector from `data`. Returns true on success.
-pub fn write_sector(sector: u64, data: &[u8; SECTOR_SIZE]) -> bool {
-    if !dev().present {
-        return false;
-    }
-    sched::acquire_disk(); // serialize: hold the single-flight engine for this whole txn
+/// Transfer one sector `data`→device. Returns true on success.
+#[cfg(not(feature = "interactive"))]
+fn backend_write(sector: u64, data: &[u8; SECTOR_SIZE]) -> bool {
     let Some(slot) = acquire_slot() else {
-        sched::release_disk();
         return false;
     };
-    let mut br = BlockRequest::__create();
-    br.submit();
     unsafe {
         core::ptr::copy_nonoverlapping(
             data.as_ptr(),
@@ -463,14 +469,49 @@ pub fn write_sector(sector: u64, data: &[u8; SECTOR_SIZE]) -> bool {
         );
         submit(slot, sector, true);
     }
-    let status = wait_and_drain(slot);
-    if status == 0 {
+    let ok = wait_and_drain(slot) == 0;
+    release_slot(slot);
+    ok
+}
+#[cfg(feature = "interactive")]
+fn backend_write(sector: u64, data: &[u8; SECTOR_SIZE]) -> bool {
+    crate::ramdisk::write_sector(sector, data)
+}
+
+/// Read one 512-byte sector into `out`. Returns true on success. The transaction
+/// is serialized by the `IoScheduler` (`acquire_disk`) and tracked by a
+/// `BlockRequest` FSM (both builds); the backend does the actual transfer.
+pub fn read_sector(sector: u64, out: &mut [u8; SECTOR_SIZE]) -> bool {
+    if !backend_present() {
+        return false;
+    }
+    sched::acquire_disk(); // IoScheduler: serialize the whole transaction
+    let mut br = BlockRequest::__create();
+    br.submit(); // $Queued → $InFlight
+    if backend_read(sector, out) {
         br.complete();
     } else {
         br.fail();
     }
     let ok = br.is_complete();
-    release_slot(slot);
+    sched::release_disk();
+    ok
+}
+
+/// Write one 512-byte sector from `data`. Returns true on success.
+pub fn write_sector(sector: u64, data: &[u8; SECTOR_SIZE]) -> bool {
+    if !backend_present() {
+        return false;
+    }
+    sched::acquire_disk();
+    let mut br = BlockRequest::__create();
+    br.submit();
+    if backend_write(sector, data) {
+        br.complete();
+    } else {
+        br.fail();
+    }
+    let ok = br.is_complete();
     sched::release_disk();
     ok
 }

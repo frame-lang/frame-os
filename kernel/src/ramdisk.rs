@@ -1,14 +1,23 @@
 // kernel/src/ramdisk.rs
 //
-// RAM-backed block device for the `interactive` build (the #110 mitigation).
+// RAM-backed block *backend* for the `interactive` build (the #110 mitigation).
+//
+// IMPORTANT — this slots in UNDER `virtio_blk`, not around it. `fs` still calls
+// `virtio_blk::read_sector`/`write_sector`, which keep the Frame-system wrapper
+// (the `IoScheduler` serialization + the `BlockRequest` lifecycle) in BOTH
+// builds; only the inner *transfer mechanism* is swapped (see `virtio_blk`'s
+// `backend_read`/`backend_write`). So the Frame systems stay on the critical disk
+// path in the interactive shell — exercised over RAM — rather than being bypassed.
 //
 // The whole filesystem image is baked into the kernel at build time
 // (`include_bytes!(env!("FRAMEOS_BAKED_FS"))`, the image xtask assembles) and
-// copied into a writable RAM buffer at boot. Every `read_sector`/`write_sector`
-// is then a plain in-memory `memcpy` — no virtqueue, no DMA, no completion IRQ,
-// nothing for QEMU's emulated-disk completion path to lose or starve. That path
-// is exactly where the #110 "mv hang" lives, so serving the disk from RAM makes
-// the interactive shell flake-proof regardless of host load.
+// copied into a writable RAM buffer at boot. Each transfer is then a plain
+// in-memory `memcpy` — no virtqueue, no DMA, no completion IRQ, nothing for
+// QEMU's emulated-disk completion path to lose or starve. That path is exactly
+// where the #110 "mv hang" lives, so RAM-backing it makes the interactive shell
+// flake-proof regardless of host load. Because the wrapper stays while only the
+// transfer is removed, a green interactive run is also evidence the hang lived in
+// the virtqueue/`wait_and_drain`/QEMU transfer, not in the Frame systems.
 //
 // EPHEMERAL: writes live only in RAM and reset to the pristine baked image on
 // each boot — which matches how the disk is already used (every test run starts
@@ -18,6 +27,8 @@
 // (flush dirty blocks to the device at shutdown) is a documented future upgrade.
 //
 // Single-core / BSP-only, like the fs + buffer cache above it, so no locking.
+
+use core::sync::atomic::{AtomicBool, Ordering};
 
 use crate::serial;
 use crate::virtio_blk::SECTOR_SIZE;
@@ -33,9 +44,19 @@ const DISK_BYTES: usize = 16384 * SECTOR_SIZE;
 /// The writable in-RAM disk, seeded from `BAKED_FS` at boot.
 static mut DISK: [u8; DISK_BYTES] = [0; DISK_BYTES];
 
+/// Set once `init()` has copied the baked image in. `virtio_blk`'s interactive
+/// backend uses this as its device-presence check (the analogue of the real
+/// driver's `dev().present`).
+static LOADED: AtomicBool = AtomicBool::new(false);
+
 fn disk() -> &'static mut [u8; DISK_BYTES] {
     let p = &raw mut DISK;
     unsafe { &mut *p }
+}
+
+/// Whether the RAM disk has been loaded (the interactive block backend is ready).
+pub fn is_loaded() -> bool {
+    LOADED.load(Ordering::SeqCst)
 }
 
 /// Copy the baked image into the writable RAM disk. Called once at boot before
@@ -47,6 +68,7 @@ pub fn init() {
         "baked fs image size mismatch: image is not the expected disk size"
     );
     disk().copy_from_slice(BAKED_FS);
+    LOADED.store(true, Ordering::SeqCst);
     serial::write_str("[ramdisk] ");
     serial::write_u32_decimal((DISK_BYTES / 1024) as u32);
     serial::writeln(" KiB RAM disk loaded from baked image");

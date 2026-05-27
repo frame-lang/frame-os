@@ -733,10 +733,12 @@ unsafe extern "C" fn kmain() -> ! {
 
         vm::init(); // PageFaultHandler: a user fault kills the process, not the kernel
 
-        // #110 mitigation: the interactive shell serves its filesystem from a
-        // baked-in RAM disk rather than QEMU's emulated virtio-blk, so the heavy
-        // interactive I/O can't hit the host's flaky disk-completion path. The
-        // real virtio-blk driver is still built + validated by the smoke suite.
+        // #110 mitigation: load the baked-in RAM disk. The fs still goes through
+        // virtio_blk's Frame-system wrapper (IoScheduler + BlockRequest) — only
+        // the transfer backend is the RAM disk instead of the emulated virtqueue,
+        // so the heavy interactive I/O never hits the host's flaky disk-completion
+        // path while the Frame systems stay on the critical path. (virtio_blk's
+        // device init is skipped here; its virtqueue path is the smoke suite's.)
         ramdisk::init();
         if !fs::mount() {
             serial::writeln("[ish] WARNING: FS mount failed — /bin programs unavailable");
