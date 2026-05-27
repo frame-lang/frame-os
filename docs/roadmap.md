@@ -1343,27 +1343,19 @@ R-track refinements, and the S1–S10 bare-metal shell are all complete.
 
 ### Planned, not built
 
-- **`Shell` `.frs` reuse in ring 3** — the second half of **B4-6**. The `Parser`
-  FSM already compiles for both host and ring 3 (proven by
-  `userspace_frame_parser_reuse_b4`); the full `Shell` FSM does not. **Scoped
-  2026-05-26 — bigger + lower-value than it looks, so deliberately deferred:**
-  the hosted `Shell` FSM (`frame/shell.frs`) is a *simple lifecycle* model
-  (`$Prompting → $Parsing → $RunningBuiltin/$RunningForeground → $Exiting`) with
-  **no states for pipes or redirection**, and it is **std-coupled** — its actions
-  use `std::io`/`println!`/`std::path::PathBuf` and it **spawns via
-  `std::process::Command`** (through JobControl). Meanwhile ring-3 `ish` (740 LOC,
-  hand-written flat dispatch) already delivers **S1–S10** (pipes, redirection,
-  full job control) — a *superset* of what the Shell FSM models. So reusing the
-  Shell FSM in ring 3 is either (a) a minimal *demonstration* shell that discards
-  ish's S1–S10, or (b) a major FSM redesign (grow Shell to ish's feature set +
-  re-home all spawning onto fork/exec syscalls). Both risk the working `ish` for
-  debatable benefit; the `Parser` reuse already makes the "one source, two
-  targets" point. Revisit only if the Shell FSM itself is grown to model the
-  richer feature set (a design effort, not a port).
-- **H-track (hosted shell) beyond H0** — H0 (minimum viable shell on Linux/macOS/
-  Windows) is done; **H1** (builtins), **H2** (job control + Ctrl-C kills a
-  running child via `signal-hook`/`ctrlc`), and later milestones are the parallel
-  hosted-application track, largely independent of the bare-metal kernel.
+- **H↔B shell parity (active program, planned 2026-05-27)** — make the **same**
+  `Shell` + `JobControl` + `Parser` FSMs drive a full shell on **both** the hosted
+  target and bare-metal ring 3, at S1–S10 parity. This subsumes both the old
+  "`Shell` `.frs` ring-3 reuse" (B4-6 second half) and "H-track beyond H0" items.
+  Full milestone plan in **[`hb_parity.md`](hb_parity.md)**: M1 hosted feature
+  parity (H1→H3 + pipes/redirection, FSM-driven) · M2 process-backend seam
+  (FSM-owns-logic / native-owns-mechanism, like the disk backend) · M3 ring-3
+  `Shell` FSM reuse over a syscall backend · M4 consolidate + retire `ish`'s
+  hand-written dispatch (closes B4-6). The decided direction (over a
+  demonstration-only reuse) is **full architectural parity** — the headline "one
+  FSM, two radically different targets" result. The earlier 2026-05-26 scoping
+  (Shell FSM is a simple lifecycle, std-coupled, no pipe/redirection states; `ish`
+  is hand-written) is the starting point that M1–M4 address.
 
 ### Deferred storage (see the section above for detail)
 
