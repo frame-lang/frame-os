@@ -87,6 +87,12 @@ the *concurrency coordination* is exactly what Frame is for.
 ## Sequencing (incremental, each validated)
 1. **Slot pool + per-request buffers**, but keep submit *serialized* (one at a
    time) — pure refactor, no behavior change; validate parity with single-flight.
+   **DONE 2026-05-26** (`kernel/src/virtio_blk.rs`): N=8 slots, each its own 4 KiB
+   DMA frame + fixed descriptor triple `[3i,3i+1,3i+2]`; `acquire_slot`/`release_slot`
+   pool; `submit(slot,..)` / `wait_and_drain(slot)` / `read_sector` / `write_sector`
+   route through a slot. Completion still `used.idx`-only (one in flight), submit
+   still serialized by `IoScheduler`. Parity validated: `blk_roundtrip_b4` PASS;
+   clippy + fmt clean both kernel configs.
 2. **Used-ring-element drain** (`id → slot`, multi-completion) replacing the
    `used.idx`-only completion; still serialized; validate.
 3. **Concurrent submit** — allow a second request before the first completes;

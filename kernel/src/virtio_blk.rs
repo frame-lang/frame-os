@@ -47,8 +47,21 @@ const BLK_T_OUT: u32 = 1; // write (memory → device)
 
 pub const SECTOR_SIZE: usize = 512;
 
-// Scratch-frame layout (one 4 KiB DMA frame): request header, status byte, and
-// the 512-byte data buffer.
+// Request-slot pool (multi-flight Step 1). Replaces the single shared scratch
+// frame with N independent slots, each its own 4 KiB DMA frame and its own fixed
+// descriptor triple — groundwork for overlapping requests. Submission is still
+// serialized by the IoScheduler (one slot in flight at a time), so this step is
+// a pure structural refactor with no behavior change; later steps make it
+// concurrent (used-ring-element drain, then concurrent submit).
+//
+// Slot `i` owns:
+//   - DMA frame at `slot_base + i*4096`, laid out header(16) + status(1) + data(512);
+//   - descriptor triple [3i, 3i+1, 3i+2] (chain head 3i). qsize (128/256) ≫ 3N,
+//     so static assignment never collides and the reverse map is `id / 3`.
+const N_SLOTS: usize = 8;
+const SLOT_FRAME: u64 = 4096; // one DMA frame per slot
+
+// Per-slot DMA frame layout: request header, status byte, 512-byte data buffer.
 const OFF_HEADER: u64 = 0; // 16 bytes
 const OFF_STATUS: u64 = 16; // 1 byte
 const OFF_DATA: u64 = 512; // 512 bytes
@@ -59,10 +72,14 @@ struct Device {
     queue_virt: u64, // HHDM virt of the contiguous virtqueue region
     avail_off: u64,
     used_off: u64,
-    avail_idx: u16,    // our running available index
-    last_used: u16,    // last used-ring index we've drained
-    scratch_phys: u64, // DMA scratch frame (header + status + data)
-    scratch_virt: u64,
+    avail_idx: u16, // our running available index
+    last_used: u16, // last used-ring index we've drained
+    // Request-slot pool (multi-flight Step 1): N contiguous DMA frames, slot `i`
+    // at `slot_base_* + i*SLOT_FRAME` (header/status/data). `slot_in_use[i]`
+    // tracks allocation; submission is serialized so at most one is in flight.
+    slot_base_phys: u64,
+    slot_base_virt: u64,
+    slot_in_use: [bool; N_SLOTS],
     present: bool,
 }
 
@@ -74,14 +91,15 @@ static mut DEV: Device = Device {
     used_off: 0,
     avail_idx: 0,
     last_used: 0,
-    scratch_phys: 0,
-    scratch_virt: 0,
+    slot_base_phys: 0,
+    slot_base_virt: 0,
+    slot_in_use: [false; N_SLOTS],
     present: false,
 };
 
-// (The completion signal is the device-written status byte in the scratch
-// buffer, polled by `wait_and_drain`; the IRQ's only job is to wake a blocked
-// waiter promptly via `DISK_WAITER`.)
+// (The completion signal is the `used.idx` advance, polled by `wait_and_drain`,
+// which then reads the slot's status byte; the IRQ's only job is to wake a
+// blocked waiter promptly via `DISK_WAITER`.)
 
 fn dev() -> &'static mut Device {
     let p = &raw mut DEV;
@@ -113,6 +131,36 @@ fn avail_base() -> *mut u8 {
 }
 fn used_base() -> *mut u8 {
     (dev().queue_virt + dev().used_off) as *mut u8
+}
+
+// --- request-slot pool (multi-flight Step 1) -------------------------------
+
+/// HHDM virt / phys base of slot `i`'s DMA frame.
+fn slot_virt(i: usize) -> u64 {
+    dev().slot_base_virt + i as u64 * SLOT_FRAME
+}
+fn slot_phys(i: usize) -> u64 {
+    dev().slot_base_phys + i as u64 * SLOT_FRAME
+}
+
+/// Claim a free slot, marking it in-use. None if the pool is exhausted.
+/// Submission is serialized by the IoScheduler today, so this never actually
+/// contends — it's the pool API later steps lean on for concurrent in-flight
+/// requests.
+fn acquire_slot() -> Option<usize> {
+    let d = dev();
+    for i in 0..N_SLOTS {
+        if !d.slot_in_use[i] {
+            d.slot_in_use[i] = true;
+            return Some(i);
+        }
+    }
+    None
+}
+
+/// Return slot `i` to the pool.
+fn release_slot(i: usize) {
+    dev().slot_in_use[i] = false;
 }
 
 // --- init (B4 Step 1b) -----------------------------------------------------
@@ -161,12 +209,15 @@ pub fn init() -> bool {
     // Tell the device where the queue lives (legacy: a page frame number).
     io::outl(base + R_QUEUE_PFN, (queue_phys / VRING_ALIGN) as u32);
 
-    // A DMA scratch frame for the request header + status + data.
-    let Some(scratch_phys) = frames::alloc_frame() else {
-        serial::writeln("[blk] out of frames for scratch");
+    // The request-slot pool: N contiguous DMA frames (one per slot), zeroed.
+    let Some(slot_base_phys) = frames::alloc_contiguous(N_SLOTS) else {
+        serial::writeln("[blk] out of frames for request slots");
         return false;
     };
-    let scratch_virt = frames::phys_to_virt(scratch_phys) as u64;
+    let slot_base_virt = frames::phys_to_virt(slot_base_phys) as u64;
+    unsafe {
+        core::ptr::write_bytes(slot_base_virt as *mut u8, 0, N_SLOTS * SLOT_FRAME as usize);
+    }
 
     let d = dev();
     d.io_base = base;
@@ -176,8 +227,9 @@ pub fn init() -> bool {
     d.used_off = used_off;
     d.avail_idx = 0;
     d.last_used = 0;
-    d.scratch_phys = scratch_phys;
-    d.scratch_virt = scratch_virt;
+    d.slot_base_phys = slot_base_phys;
+    d.slot_base_virt = slot_base_virt;
+    d.slot_in_use = [false; N_SLOTS];
     d.present = true;
 
     // Route the completion IRQ (QEMU wires virtio-blk to IRQ11, the slave PIC;
@@ -220,48 +272,55 @@ pub fn on_irq() {
     }
 }
 
-// Disk transaction serialization (S6): the driver is single-flight — one shared
-// scratch buffer (header/data/status) and a single completion `DISK_WAITER`.
-// That holds when only one process does disk I/O at a time (sequential shell
-// commands), but NOT once two run concurrently (a pipeline forks two children
-// that both `exec`, reading their ELFs at once); overlapping transactions would
-// clobber the shared scratch buffer. `read_sector`/`write_sector` therefore hold
-// the disk engine for the whole transaction via the `IoScheduler` supervisor
+// Disk transaction serialization (S6): the driver is still single-flight — a
+// single completion `DISK_WAITER` and a `used.idx`-only completion test that
+// assumes one request in flight. The request-slot pool (multi-flight Step 1)
+// gives each request its own buffers + descriptor triple, removing the
+// shared-buffer clobber that originally forced serialization — but submit stays
+// serialized until the later steps (used-ring-element drain, then concurrent
+// submit) make completion per-request. So `read_sector`/`write_sector` hold the
+// disk engine for the whole transaction via the `IoScheduler` supervisor
 // (`sched::acquire_disk`/`release_disk`): a process that finds it busy is queued
 // and blocks, and the holder hands off to the next on release. The sequencing
 // (owner, queue, hand-off) lives in that FSM; here we just bracket the txn.
 
-/// Submit a 3-descriptor request (header, data, status) for `sector` and ring
-/// the doorbell. `write` selects BLK_T_OUT (memory → device) vs BLK_T_IN.
-unsafe fn submit(sector: u64, write: bool) {
+/// Submit slot `slot`'s 3-descriptor request (header, data, status) for `sector`
+/// and ring the doorbell. `write` selects BLK_T_OUT (memory → device) vs BLK_T_IN.
+/// Slot `i` uses its own buffers (`slot_*(i)`) and descriptor triple `[3i,3i+1,3i+2]`
+/// with chain head `3i`, so distinct slots never alias (groundwork for overlap).
+unsafe fn submit(slot: usize, sector: u64, write: bool) {
     let d = dev();
+    let sv = slot_virt(slot);
+    let sp = slot_phys(slot);
     // Header.
-    let hdr = (d.scratch_virt + OFF_HEADER) as *mut u8;
+    let hdr = (sv + OFF_HEADER) as *mut u8;
     (hdr as *mut u32).write(if write { BLK_T_OUT } else { BLK_T_IN });
     (hdr.add(4) as *mut u32).write(0); // reserved
     (hdr.add(8) as *mut u64).write(sector);
-    ((d.scratch_virt + OFF_STATUS) as *mut u8).write(0xFF); // sentinel
+    ((sv + OFF_STATUS) as *mut u8).write(0xFF); // sentinel
 
-    // Descriptor chain: header (R) → data (R for write / W for read) → status (W).
+    // Descriptor chain: header (R) → data (R for write / W for read) → status (W),
+    // at this slot's triple [head, head+1, head+2].
+    let head = (3 * slot) as u16;
     let data_flags = if write {
         VRING_DESC_F_NEXT
     } else {
         VRING_DESC_F_NEXT | VRING_DESC_F_WRITE
     };
-    set_desc(0, d.scratch_phys + OFF_HEADER, 16, VRING_DESC_F_NEXT, 1);
+    set_desc(head, sp + OFF_HEADER, 16, VRING_DESC_F_NEXT, head + 1);
     set_desc(
-        1,
-        d.scratch_phys + OFF_DATA,
+        head + 1,
+        sp + OFF_DATA,
         SECTOR_SIZE as u32,
         data_flags,
-        2,
+        head + 2,
     );
-    set_desc(2, d.scratch_phys + OFF_STATUS, 1, VRING_DESC_F_WRITE, 0);
+    set_desc(head + 2, sp + OFF_STATUS, 1, VRING_DESC_F_WRITE, 0);
 
-    // Publish desc 0 as available, bump the avail idx, notify queue 0.
+    // Publish the chain head in the avail ring, bump the avail idx, notify queue 0.
     let avail = avail_base();
     let ring = avail.add(4) as *mut u16; // ring[] starts after flags(2)+idx(2)
-    ring.add((d.avail_idx % d.qsize) as usize).write(0);
+    ring.add((d.avail_idx % d.qsize) as usize).write(head);
     core::sync::atomic::fence(Ordering::SeqCst);
     d.avail_idx = d.avail_idx.wrapping_add(1);
     (avail.add(2) as *mut u16).write(d.avail_idx); // avail.idx
@@ -284,9 +343,9 @@ unsafe fn submit(sector: u64, write: bool) {
 /// lost/early wakeup (the bug that intermittently dropped the S5 redirect's
 /// directory-entry write). Single-flight (the IoScheduler serializes whole
 /// transactions), so `used.idx` advances exactly one per completed request.
-fn wait_and_drain() -> u8 {
+fn wait_and_drain(slot: usize) -> u8 {
     let d = dev();
-    let status_ptr = (d.scratch_virt + OFF_STATUS) as *const u8;
+    let status_ptr = (slot_virt(slot) + OFF_STATUS) as *const u8;
     let used_idx_ptr = unsafe { (used_base() as *const u8).add(2) as *const u16 };
     let start = d.last_used; // device's used.idx before this request
     let done = move || unsafe { core::ptr::read_volatile(used_idx_ptr) } != start;
@@ -319,10 +378,14 @@ pub fn read_sector(sector: u64, out: &mut [u8; SECTOR_SIZE]) -> bool {
         return false;
     }
     sched::acquire_disk(); // serialize: hold the single-flight engine for this whole txn
+    let Some(slot) = acquire_slot() else {
+        sched::release_disk();
+        return false;
+    };
     let mut br = BlockRequest::__create();
     br.submit(); // $Queued → $InFlight
-    unsafe { submit(sector, false) };
-    let status = wait_and_drain();
+    unsafe { submit(slot, sector, false) };
+    let status = wait_and_drain(slot);
     if status == 0 {
         br.complete();
     } else {
@@ -331,7 +394,7 @@ pub fn read_sector(sector: u64, out: &mut [u8; SECTOR_SIZE]) -> bool {
     let ok = if br.is_complete() {
         unsafe {
             core::ptr::copy_nonoverlapping(
-                (dev().scratch_virt + OFF_DATA) as *const u8,
+                (slot_virt(slot) + OFF_DATA) as *const u8,
                 out.as_mut_ptr(),
                 SECTOR_SIZE,
             );
@@ -340,6 +403,7 @@ pub fn read_sector(sector: u64, out: &mut [u8; SECTOR_SIZE]) -> bool {
     } else {
         false
     };
+    release_slot(slot);
     sched::release_disk();
     ok
 }
@@ -350,23 +414,28 @@ pub fn write_sector(sector: u64, data: &[u8; SECTOR_SIZE]) -> bool {
         return false;
     }
     sched::acquire_disk(); // serialize: hold the single-flight engine for this whole txn
+    let Some(slot) = acquire_slot() else {
+        sched::release_disk();
+        return false;
+    };
     let mut br = BlockRequest::__create();
     br.submit();
     unsafe {
         core::ptr::copy_nonoverlapping(
             data.as_ptr(),
-            (dev().scratch_virt + OFF_DATA) as *mut u8,
+            (slot_virt(slot) + OFF_DATA) as *mut u8,
             SECTOR_SIZE,
         );
-        submit(sector, true);
+        submit(slot, sector, true);
     }
-    let status = wait_and_drain();
+    let status = wait_and_drain(slot);
     if status == 0 {
         br.complete();
     } else {
         br.fail();
     }
     let ok = br.is_complete();
+    release_slot(slot);
     sched::release_disk();
     ok
 }
