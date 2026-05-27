@@ -43,7 +43,11 @@ fn print_hex(mut n: u64) {
     let mut shift = 60i32;
     while shift >= 0 {
         let nib = ((n >> shift) & 0xF) as u8;
-        write_char(if nib < 10 { b'0' + nib } else { b'a' + nib - 10 });
+        write_char(if nib < 10 {
+            b'0' + nib
+        } else {
+            b'a' + nib - 10
+        });
         shift -= 4;
     }
     let _ = &mut n;

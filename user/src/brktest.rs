@@ -103,7 +103,11 @@ pub extern "C" fn _start() -> ! {
         let mut shift = 28u32;
         loop {
             let nib = ((base >> shift) & 0xF) as u8;
-            write_char(if nib < 10 { b'0' + nib } else { b'a' + nib - 10 });
+            write_char(if nib < 10 {
+                b'0' + nib
+            } else {
+                b'a' + nib - 10
+            });
             if shift == 0 {
                 break;
             }

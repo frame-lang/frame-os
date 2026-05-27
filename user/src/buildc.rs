@@ -77,19 +77,42 @@ fn set_paths(src: &[u8]) {
     };
     unsafe {
         fill((&raw mut SRC_BUF) as *mut u8, &raw mut SRC_LEN, &[src]);
-        fill((&raw mut OBJ_BUF) as *mut u8, &raw mut OBJ_LEN, &[stem, b".o"]);
-        fill((&raw mut OUT_BUF) as *mut u8, &raw mut OUT_LEN, &[stem, b".elf"]);
+        fill(
+            (&raw mut OBJ_BUF) as *mut u8,
+            &raw mut OBJ_LEN,
+            &[stem, b".o"],
+        );
+        fill(
+            (&raw mut OUT_BUF) as *mut u8,
+            &raw mut OUT_LEN,
+            &[stem, b".elf"],
+        );
     }
 }
 
 fn src_path() -> &'static [u8] {
-    unsafe { core::slice::from_raw_parts((&raw const SRC_BUF) as *const u8, (&raw const SRC_LEN).read()) }
+    unsafe {
+        core::slice::from_raw_parts(
+            (&raw const SRC_BUF) as *const u8,
+            (&raw const SRC_LEN).read(),
+        )
+    }
 }
 fn obj_path() -> &'static [u8] {
-    unsafe { core::slice::from_raw_parts((&raw const OBJ_BUF) as *const u8, (&raw const OBJ_LEN).read()) }
+    unsafe {
+        core::slice::from_raw_parts(
+            (&raw const OBJ_BUF) as *const u8,
+            (&raw const OBJ_LEN).read(),
+        )
+    }
 }
 fn out_path() -> &'static [u8] {
-    unsafe { core::slice::from_raw_parts((&raw const OUT_BUF) as *const u8, (&raw const OUT_LEN).read()) }
+    unsafe {
+        core::slice::from_raw_parts(
+            (&raw const OUT_BUF) as *const u8,
+            (&raw const OUT_LEN).read(),
+        )
+    }
 }
 
 #[inline(always)]

@@ -158,7 +158,8 @@ extern "C" fn main(argc: i32, argv: *const *const u8, _envp: *const *const u8) -
     }
     let mut line = [0u8; 64];
     let l1 = unsafe { fgets(line.as_mut_ptr(), line.len() as i32, h) };
-    let line1_ok = !l1.is_null() && unsafe { core::slice::from_raw_parts(l1, strlen(l1)) } == b"result=42\n";
+    let line1_ok =
+        !l1.is_null() && unsafe { core::slice::from_raw_parts(l1, strlen(l1)) } == b"result=42\n";
     let l2 = unsafe { fgets(line.as_mut_ptr(), line.len() as i32, h) };
     let line2_ok =
         !l2.is_null() && unsafe { core::slice::from_raw_parts(l2, strlen(l2)) } == b"second line\n";
@@ -252,7 +253,15 @@ extern "C" fn main(argc: i32, argv: *const *const u8, _envp: *const *const u8) -
     if !rf.is_null() {
         unsafe { fclose(rf) };
     }
-    if at_root && cd_usr && in_usr && cd_inc && in_inc && cd_up && back_usr && bad && cd_root
+    if at_root
+        && cd_usr
+        && in_usr
+        && cd_inc
+        && in_inc
+        && cd_up
+        && back_usr
+        && bad
+        && cd_root
         && rel_open
     {
         write(1, b"cmain: cwd chdir/getcwd + relative open ok\n");

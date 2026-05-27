@@ -710,6 +710,288 @@ fn run_line(line: &str, jobs: &mut IshJobs) {
     }
 }
 
+// ── Shell control-flow FSM reuse (M3b) ─────────────────────────────────────
+//
+// The SAME frame/shell.frs control-flow FSM the hosted shell compiles, here for
+// ring 3. Included in this LOCAL module (not the shared frame_systems, which
+// other user bins include and shouldn't have to supply a ShellEnv). The Shell
+// FSM owns the $Prompting → $Parsing → $Running* coordination; everything
+// target-specific goes through the `ShellEnv` trait (declared in shell.frs's
+// prolog), implemented here by `IshShellEnv` using ish's syscalls.
+//
+// M3b.2 lands the *compilation* (the whole Shell stack builds for
+// x86_64-unknown-none + IshShellEnv is complete); M3b.3 rewires `_start` to
+// drive the FSM. Until then the module is unused — hence #[allow(dead_code)] —
+// and `_start` keeps the proven hand-written `run_line` loop.
+#[allow(dead_code, unused_imports)]
+mod shell_fsm {
+    // Names the generated shell.rs references (its `mod _shell_framec` picks
+    // these up via `use super::*`), mirroring frame_systems.rs's re-exports.
+    pub use crate::frame_systems::{Command, Parser, Pipeline, Token, TokenKind};
+    pub use alloc::boxed::Box;
+    pub use alloc::string::{String, ToString};
+    pub use alloc::vec::Vec;
+
+    // ish's native syscalls / builtins / job table — the mechanism IshShellEnv
+    // drives (the same code the hand-written run_line used).
+    use super::harvest;
+    use super::{
+        bg_job, build_argv, cat, chdir, emit, exec_argv, exit, fork, getcwd, kill, kill_cmd,
+        list_jobs, print, push_u64, run_external, run_pipeline, set_foreground, waitpid,
+        write_char, IshJobs, SIGCONT, WSTOPPED,
+    };
+
+    include!(concat!(env!("OUT_DIR"), "/shell.rs"));
+
+    // The foreground command awaiting a wait_foreground(). ish executes
+    // synchronously (fork then waitpid), so the Shell FSM's spawn/wait split
+    // maps to: spawn_foreground/fg start the child (or resume a job) and stash
+    // it here; wait_foreground (in $RunningForeground) does the blocking
+    // waitpid + reports stop/exit — a faithful split, not a no-op wait.
+    enum FgPending {
+        /// A freshly fork+exec'd external. On stop → becomes a tracked job.
+        Fresh { pid: u64, cmd: String },
+        /// A resumed `fg <id>` job. On stop → re-mark stopped; on exit → remove.
+        Resumed { pid: u64, id: u32, cmd: String },
+    }
+
+    /// Ring-3 environment for the shared Shell FSM: ish's syscalls + the IshJobs
+    /// job table behind the ShellEnv seam.
+    pub struct IshShellEnv {
+        jobs: IshJobs,
+        fg_pending: Option<FgPending>,
+    }
+
+    impl IshShellEnv {
+        fn new() -> Self {
+            Self {
+                jobs: IshJobs::__create(),
+                fg_pending: None,
+            }
+        }
+    }
+
+    impl ShellEnv for IshShellEnv {
+        fn println(&mut self, s: &str) {
+            // One atomic write (a kernel log can't split it mid-line).
+            let mut l = Vec::with_capacity(s.len() + 1);
+            l.extend_from_slice(s.as_bytes());
+            l.push(b'\n');
+            emit(&l);
+        }
+
+        fn print_prompt(&mut self) {
+            print(b"frameos$ ");
+        }
+
+        fn print_goodbye(&mut self) {
+            // ish exits without a banner; the FSM's $Exiting + is_done() is what
+            // stops the loop (see _start at M3b.3).
+        }
+
+        fn tick(&mut self) {
+            harvest(&mut self.jobs);
+        }
+
+        fn classify(&self, words: &[String]) -> CommandKind {
+            // exit/quit are intercepted by the FSM before classify(). The rest
+            // split into ish's builtins vs disk programs.
+            match words[0].as_str() {
+                "fg" => CommandKind::Fg(words.get(1).cloned()),
+                "help" | "jobs" | "bg" | "kill" | "cd" | "pwd" | "clear" | "cat" => {
+                    CommandKind::Builtin
+                }
+                _ => CommandKind::External,
+            }
+        }
+
+        fn run_builtin(
+            &mut self,
+            words: &[String],
+            _redir_out: Option<String>,
+            _append: bool,
+            _history: &[String],
+        ) {
+            // ish builtins don't honor redirection (only externals do) — matches
+            // pre-M3b ish; builtin redirection isn't exercised by console-test.
+            match words[0].as_str() {
+                "help" => {
+                    print(b"ish builtins: help, exit, cd [dir], pwd, clear, cat <path>..., jobs, fg [id], bg [id], kill %<job>|<pid>\n");
+                    print(b"on disk in /bin: ls, echo, rm, cp, touch, wc, head, tail, grep, date, mkdir, rmdir, mv, ps, ...\n");
+                    print(b"redirection (external cmds): cmd > file, cmd >> file, cmd < file\n");
+                    print(b"pipes: cmd1 | cmd2 (connect cmd1's stdout to cmd2's stdin)\n");
+                    print(b"background: cmd &   (jobs/fg/bg manage; Ctrl-Z stops the foreground job, Ctrl-C interrupts)\n");
+                }
+                "jobs" => list_jobs(&mut self.jobs),
+                "bg" => bg_job(words.get(1).map(|s| s.as_str()), &mut self.jobs),
+                "kill" => kill_cmd(words, &mut self.jobs),
+                "cd" => {
+                    let target = if words.len() > 1 {
+                        words[1].as_str()
+                    } else {
+                        "/"
+                    };
+                    if chdir(target.as_bytes()) == u64::MAX {
+                        print(b"cd: no such directory: ");
+                        print(target.as_bytes());
+                        write_char(b'\n');
+                    }
+                }
+                "pwd" => {
+                    let mut buf = [0u8; 256];
+                    let n = getcwd(&mut buf);
+                    if n != u64::MAX {
+                        let mut l = Vec::new();
+                        l.extend_from_slice(&buf[..n as usize]);
+                        l.push(b'\n');
+                        emit(&l);
+                    }
+                }
+                "clear" => print(b"\x1b[2J\x1b[H"),
+                "cat" => {
+                    for path in &words[1..] {
+                        cat(path);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        fn run_foreground_redirected(&mut self, cmd: &Command) {
+            let redir_in = cmd.redir_in.clone();
+            let redir_out = cmd.redir_out.clone().map(|f| (f, cmd.append));
+            let cmd_str = cmd.words.join(" ");
+            run_external(
+                &cmd.words,
+                &redir_in,
+                &redir_out,
+                false,
+                &cmd_str,
+                &mut self.jobs,
+            );
+        }
+
+        fn spawn_background(&mut self, cmd: &Command) {
+            let redir_in = cmd.redir_in.clone();
+            let redir_out = cmd.redir_out.clone().map(|f| (f, cmd.append));
+            let cmd_str = cmd.words.join(" ");
+            run_external(
+                &cmd.words,
+                &redir_in,
+                &redir_out,
+                true,
+                &cmd_str,
+                &mut self.jobs,
+            );
+        }
+
+        fn spawn_foreground(&mut self, words: &[String]) {
+            // Fork+exec now; block in wait_foreground (the $RunningForeground
+            // state). No redirection on this path (that's run_foreground_redirected).
+            let cmd_str = words.join(" ");
+            let (argv, argc) = build_argv(words);
+            let child = fork();
+            if child == 0 {
+                exec_argv(&argv, argc);
+                print(b"ish: command not found: ");
+                print(words[0].as_bytes());
+                write_char(b'\n');
+                exit(127);
+            }
+            self.jobs.launch_fg();
+            set_foreground(child);
+            self.fg_pending = Some(FgPending::Fresh {
+                pid: child,
+                cmd: cmd_str,
+            });
+        }
+
+        fn fg(&mut self, id: u32) -> bool {
+            let mut pid = 0u64;
+            let mut was_stopped = false;
+            let mut cmd = String::new();
+            for e in &self.jobs.snapshot() {
+                if e.id == id && !e.done {
+                    pid = e.pid;
+                    was_stopped = e.stopped;
+                    cmd = e.cmd.clone();
+                    break;
+                }
+            }
+            if pid == 0 {
+                return false;
+            }
+            // Echo the command being foregrounded (bash-style).
+            self.println(&cmd);
+            if was_stopped {
+                kill(pid, SIGCONT);
+                self.jobs.mark_running(id);
+            }
+            self.jobs.launch_fg();
+            set_foreground(pid);
+            self.fg_pending = Some(FgPending::Resumed { pid, id, cmd });
+            true
+        }
+
+        fn run_pipeline(&mut self, commands: &[Command]) {
+            // ish wires exactly two external stages (S6); reject 3+ explicitly.
+            if commands.len() > 2 {
+                self.println("ish: only 2-stage pipelines are supported");
+                return;
+            }
+            run_pipeline(&commands[0].words, &commands[1].words);
+        }
+
+        fn wait_foreground(&mut self) {
+            let pending = match self.fg_pending.take() {
+                Some(p) => p,
+                None => return,
+            };
+            match pending {
+                FgPending::Fresh { pid, cmd } => {
+                    let st = waitpid(pid);
+                    set_foreground(0);
+                    self.jobs.fg_done();
+                    if st & WSTOPPED != 0 {
+                        // Ctrl-Z'd: becomes a tracked stopped job (bash-style).
+                        self.jobs.launch_stopped(pid, cmd.clone());
+                        let mut l = Vec::new();
+                        l.push(b'[');
+                        push_u64(&mut l, self.jobs.last_id() as u64);
+                        l.extend_from_slice(b"]+ Stopped   ");
+                        l.extend_from_slice(cmd.as_bytes());
+                        l.push(b'\n');
+                        emit(&l);
+                    }
+                }
+                FgPending::Resumed { pid, id, cmd } => {
+                    let st = waitpid(pid);
+                    set_foreground(0);
+                    self.jobs.fg_done();
+                    if st & WSTOPPED != 0 {
+                        self.jobs.mark_stopped(id);
+                        let mut l = Vec::new();
+                        l.push(b'[');
+                        push_u64(&mut l, id as u64);
+                        l.extend_from_slice(b"]+ Stopped   ");
+                        l.extend_from_slice(cmd.as_bytes());
+                        l.push(b'\n');
+                        emit(&l);
+                    } else {
+                        self.jobs.remove(id);
+                    }
+                }
+            }
+        }
+    }
+
+    /// The environment a freshly-created ring-3 `Shell` gets (the generated
+    /// shell.rs domain init calls this via `use super::*`).
+    pub fn default_env() -> Box<dyn ShellEnv> {
+        Box::new(IshShellEnv::new())
+    }
+}
+
 #[no_mangle]
 pub extern "C" fn _start() -> ! {
     mem::init();

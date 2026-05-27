@@ -22,6 +22,12 @@ const FRAME_SYSTEMS: &[(&str, &str)] = &[
     // through Parser -> Pipeline (one FSM source, both targets), retiring its
     // hand-written parse_redirs / pipe split. src/frame_systems.rs include!s it.
     ("pipeline", "pipeline.frs"),
+    // Shell (M3b): the SAME frame/shell.frs control-flow FSM the hosted shell
+    // compiles. Generated for x86_64-unknown-none; ish.rs (only) include!s it in
+    // a local module + supplies an IshShellEnv (the ShellEnv seam over
+    // syscalls). NOT included in the shared frame_systems.rs — other user bins
+    // don't reuse the Shell and shouldn't have to provide a ShellEnv.
+    ("shell", "shell.frs"),
     // IshJobs (S10): the interactive shell's job-control FSM ($Idle/$Foreground
     // + background-job table), the ish-resident adaptation of the hosted-shell
     // job_control.frs. Built for x86_64-unknown-none; src/frame_systems.rs
@@ -55,7 +61,11 @@ fn main() {
 }
 
 fn compile_frame_source(input: &Path, out_dir: &Path, expected_output: &Path) {
-    assert!(input.exists(), "Frame source not found: {}", input.display());
+    assert!(
+        input.exists(),
+        "Frame source not found: {}",
+        input.display()
+    );
 
     let result = Command::new("framec")
         .arg("compile")

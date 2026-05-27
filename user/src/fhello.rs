@@ -29,7 +29,10 @@ extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const u8)
     }
     h.greet();
     if h.greeted() {
-        write(1, b"fhello: hello from a Frame system, transpiled to Rust!\n");
+        write(
+            1,
+            b"fhello: hello from a Frame system, transpiled to Rust!\n",
+        );
         0
     } else {
         write(1, b"fhello: FAIL not greeted after greet\n");
