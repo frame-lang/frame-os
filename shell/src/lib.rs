@@ -14,6 +14,7 @@ pub mod builtin;
 pub mod exec;
 pub mod frame_systems;
 pub mod job_summary;
+pub mod process_backend;
 pub mod signals;
 
 pub use builtin::Builtin;

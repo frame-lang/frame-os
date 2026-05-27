@@ -64,10 +64,15 @@ Sequenced lowest-risk-first; every milestone leaves both builds green.
   **The cross-cutting modeling decision is now settled** (see Risks): Parser
   emits typed tokens + a dedicated `Pipeline` FSM consumes them.
 
-- **M2 — Process-backend seam.** Abstract `Job`'s spawn/poll/signal (`std::process`)
-  behind a native backend interface, the `Shell`/`JobControl`/`Job` FSMs unchanged.
-  Hosted backend = `std::process`; this prepares (not yet wires) the ring-3
-  backend. Validate: hosted behavior unchanged (e2e + behavioral green).
+- **M2 — Process-backend seam. ✅ DONE 2026-05-27.** `Job`'s spawn/poll/signal
+  mechanism moved behind the `ProcessBackend` trait (`shell/src/process_backend.rs`);
+  `Job` holds a `Box<dyn ProcessBackend>` from a per-crate `default_backend()` and
+  no longer mentions `std::process`/`libc`. Hosted impl = `StdProcessBackend`
+  (`std::process` + `libc::kill`). The `Shell`/`JobControl`/`Job` FSMs are
+  unchanged — **the `Job` state-graph snapshot is byte-stable** (pure mechanism
+  refactor). This prepares (does not wire) the ring-3 syscall backend. Validated:
+  all H3 behavioral + E2E green, clippy/fmt/diagrams clean, kernel + user crates
+  unaffected.
 
 - **M3 — Ring-3 `Shell` FSM reuse.** Compile `shell.frs` for `x86_64-unknown-none`
   (Parser already does), drive `ish`'s loop through the `Shell` FSM, and implement

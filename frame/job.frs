@@ -42,13 +42,14 @@
 // the transition. Per-state handlers make these legal-move boundaries
 // structural rather than conditional.
 //
-// PID-only design: the OS-level handle stored in domain is just the u32
-// PID, not std::process::Child. We use raw libc::kill / libc::waitpid
-// for signal delivery and exit detection. The child *is* spawned via
-// std::process::Command in the spawn() handler (for the convenience of
-// PATH lookup and the OsString plumbing), but its `Child` handle is held
-// in an Option in the action, not in long-term domain. See actions.rs
-// (TODO H3 Step 2) for the wait-handle wrapper.
+// Backend seam (M2): the OS mechanism — spawn, non-blocking reap, signal
+// delivery — lives behind the `ProcessBackend` trait (shell/src/process_backend.rs),
+// not inline in this FSM. The domain holds a `Box<dyn ProcessBackend>` obtained
+// from `default_backend()`; each crate that compiles job.frs supplies its own
+// (the hosted shell's `StdProcessBackend` = std::process + libc::kill; a syscall
+// backend when `ish` migrates onto this FSM at M3). The FSM owns only the
+// lifecycle/coordination; it no longer mentions std::process or libc. The job's
+// pid is still kept in domain for display (pid() / cmd reporting).
 
 @@[target("rust")]
 
@@ -77,70 +78,40 @@
             spawn(cmd: String, args: Vec<String>) {
                 self.cmd = cmd;
                 self.args = args;
-                match std::process::Command::new(&self.cmd)
-                    .args(&self.args)
-                    .spawn()
-                {
-                    Ok(child) => {
-                        self.pid = child.id();
-                        self.child = Some(child);
+                // Spawn via the backend (mechanism seam — std::process here,
+                // syscalls in ring 3 at M3). NotFound is normalized inside the
+                // backend so the shell's "command not found" mapping works.
+                match self.backend.spawn(&self.cmd, &self.args) {
+                    Ok(pid) => {
+                        self.pid = pid;
                         -> $Foreground
                     }
-                    Err(e) => {
-                        // Classify by ErrorKind, not the OS message: a missing
-                        // command is "No such file or directory" on Unix but
-                        // "The system cannot find the file specified" on Windows.
-                        // Normalize NotFound so the shell's "command not found"
-                        // mapping works cross-platform.
-                        self.spawn_error = if e.kind() == std::io::ErrorKind::NotFound {
-                            "No such file or directory".to_string()
-                        } else {
-                            e.to_string()
-                        };
+                    Err(msg) => {
+                        self.spawn_error = msg;
                         -> $Done
                     }
                 }
             }
 
             // Background-job spawn: redirect stdio to /dev/null AND put
-            // the child in its own process group via process_group(0).
+            // the child in its own process group. The backend owns those
+            // mechanics (the std backend uses Stdio::null + process_group(0)).
             //
-            // Stdio redirection prevents the orphaned background job
-            // from holding our pipes open after the shell exits (which
-            // would block assert_cmd / any pipe consumer). Process group
-            // means terminal Ctrl-C at the prompt doesn't reach the
-            // background job — only the shell process gets SIGINT, and
-            // rustyline handles that locally.
+            // Stdio redirection prevents the orphaned background job from
+            // holding our pipes open after the shell exits (which would block
+            // assert_cmd / any pipe consumer). Process group means terminal
+            // Ctrl-C at the prompt doesn't reach the background job — only the
+            // shell process gets SIGINT, and rustyline handles that locally.
             spawn_detached(cmd: String, args: Vec<String>) {
                 self.cmd = cmd;
                 self.args = args;
-
-                let mut command = std::process::Command::new(&self.cmd);
-                command
-                    .args(&self.args)
-                    .stdin(std::process::Stdio::null())
-                    .stdout(std::process::Stdio::null())
-                    .stderr(std::process::Stdio::null());
-
-                #[cfg(unix)]
-                {
-                    use std::os::unix::process::CommandExt;
-                    command.process_group(0);
-                }
-
-                match command.spawn() {
-                    Ok(child) => {
-                        self.pid = child.id();
-                        self.child = Some(child);
+                match self.backend.spawn_detached(&self.cmd, &self.args) {
+                    Ok(pid) => {
+                        self.pid = pid;
                         -> $Background
                     }
-                    Err(e) => {
-                        // Normalize NotFound cross-platform (see spawn() above).
-                        self.spawn_error = if e.kind() == std::io::ErrorKind::NotFound {
-                            "No such file or directory".to_string()
-                        } else {
-                            e.to_string()
-                        };
+                    Err(msg) => {
+                        self.spawn_error = msg;
                         -> $Done
                     }
                 }
@@ -238,63 +209,35 @@
         }
 
     actions:
-        // Non-blocking reap. Returns true if the child has exited and
-        // stores the exit code in domain. On Unix uses waitpid(WNOHANG);
-        // on Windows uses std::process::Child::try_wait (the Child handle
-        // is kept in domain specifically so we can call try_wait against
-        // it; raw libc::waitpid on the PID alone would also work on Unix
-        // but the Child path is cross-platform).
+        // Non-blocking reap via the backend. Returns true if the process has
+        // exited (storing the exit code in domain), false if still running.
+        // The backend owns the platform mechanism (std::process try_wait here;
+        // waitpid(WNOHANG) syscall in ring 3 at M3).
         try_reap(): bool {
-            if let Some(ref mut c) = self.child {
-                match c.try_wait() {
-                    Ok(Some(status)) => {
-                        self.exit_code = status.code().unwrap_or(-1);
-                        self.child = None;
-                        return true;
-                    }
-                    Ok(None) => {
-                        return false;
-                    }
-                    Err(_) => {
-                        // Treat unknown wait errors as terminal too — we
-                        // can't recover, so clear the child handle.
-                        self.exit_code = -1;
-                        self.child = None;
-                        return true;
-                    }
+            match self.backend.try_reap() {
+                Some(code) => {
+                    self.exit_code = code;
+                    @@:(true)
+                }
+                None => {
+                    @@:(false)
                 }
             }
-            // No child handle (already reaped, or spawn failed). Done.
-            true
         }
 
-        // Send SIGTSTP to the job's PID. Unix-only — Windows H3 doesn't
-        // support stop/resume (cleanly omitted at the JobControl layer).
+        // Signal delivery routes through the backend (libc::kill here; a kill
+        // syscall in ring 3). On non-Unix hosts the std backend's stop/continue
+        // are no-ops and kill falls back to Child::kill.
         send_signal_stop() {
-            #[cfg(unix)]
-            unsafe {
-                libc::kill(self.pid as i32, libc::SIGTSTP);
-            }
+            self.backend.signal_stop();
         }
 
         send_signal_continue() {
-            #[cfg(unix)]
-            unsafe {
-                libc::kill(self.pid as i32, libc::SIGCONT);
-            }
+            self.backend.signal_continue();
         }
 
         send_signal_kill() {
-            #[cfg(unix)]
-            unsafe {
-                libc::kill(self.pid as i32, libc::SIGKILL);
-            }
-            #[cfg(not(unix))]
-            {
-                if let Some(ref mut c) = self.child {
-                    let _ = c.kill();
-                }
-            }
+            self.backend.signal_kill();
         }
 
         format_cmd(): String {
@@ -310,7 +253,10 @@
         cmd: String = String::new()
         args: Vec<String> = Vec::new()
         pid: u32 = 0
-        child: Option<std::process::Child> = None
+        // The OS mechanism (spawn/reap/signal). default_backend() is supplied
+        // per-crate: the hosted shell's StdProcessBackend here, a syscall
+        // backend when ish migrates onto this FSM at M3. See process_backend.rs.
+        backend: Box<dyn ProcessBackend> = default_backend()
         exit_code: i32 = 0
         spawn_error: String = String::new()
 }

@@ -10,7 +10,7 @@
 | State diagram | [`job.svg`](job.svg) |
 | Constructor params | `id: u32` — the job number assigned by `JobControl` |
 | Instances at runtime | Many — one per spawned external command |
-| Status | In progress (H3 Step 1 — standalone FSM; integration at Step 3) |
+| Status | Documented (H3; M2 process-backend seam) |
 
 ## State diagram
 
@@ -93,12 +93,12 @@ The Frame argument here lands on `to_foreground()`, `to_background()`, and `kill
 | `id` | `u32` | from constructor param | Job number |
 | `cmd` | `String` | empty | Command name (binary path) |
 | `args` | `Vec<String>` | empty | Args passed at spawn |
-| `pid` | `u32` | `0` | OS PID (0 = not spawned or failed) |
-| `child` | `Option<std::process::Child>` | `None` | Handle for `try_wait`. Set in `spawn()`, cleared after reap. |
+| `pid` | `u32` | `0` | OS PID (0 = not spawned or failed); kept for display via `pid()` |
+| `backend` | `Box<dyn ProcessBackend>` | `default_backend()` | The OS mechanism (spawn / reap / signal). Owns the native handle (a `std::process::Child` in the hosted backend). See `process_backend.rs`. |
 | `exit_code` | `i32` | `0` | Set in `try_reap()` on natural exit |
 | `spawn_error` | `String` | empty | Set in `spawn()` failure path; surfaces via `state_name()` |
 
-The mixed PID+Child design: PID is used for signal delivery (`libc::kill(pid, SIG*)`), Child is used for `try_wait` and the natural-exit reap path. Keeping both avoids the dance of either fully going through libc (more `unsafe`) or fully through `std::process::Child` (which doesn't expose signal sending beyond SIGKILL).
+**Backend seam (M2).** The OS mechanism — spawn, non-blocking reap, signal delivery — lives behind the `ProcessBackend` trait, not inline in the FSM. `Job` holds a `Box<dyn ProcessBackend>` from `default_backend()`; each crate that compiles `job.frs` supplies its own (the hosted shell's `StdProcessBackend` = `std::process` + `libc::kill`; a syscall backend when `ish` migrates onto this FSM at M3). The FSM owns only the lifecycle; `pid` stays in domain purely for display. This is the same FSM-owns-logic / native-owns-mechanism split as virtio_blk's read/write backend.
 
 ## Why a state machine
 
@@ -108,13 +108,15 @@ The `$Created` → `$Done` shortcut on spawn failure is a small but real win: in
 
 ## Composition
 
-**Calls into:** native action helpers in `frame/job.frs`'s `actions:` block (`try_reap`, `send_signal_stop`, `send_signal_continue`, `send_signal_kill`, `format_cmd`). These use `libc` directly for signal delivery (Unix-only) and `std::process::Child::try_wait` for reap. No other Frame systems.
+**Calls into:** the `ProcessBackend` trait (`shell/src/process_backend.rs`) via `self.backend` — `spawn` / `spawn_detached` / `try_reap` / `signal_stop` / `signal_continue` / `signal_kill`. The FSM's own actions (`try_reap`, `send_signal_*`, `format_cmd`) are now thin wrappers that delegate to the backend. No other Frame systems.
 
-**Called from:** standalone at H3 Step 1 (tests only). At H3 Step 2, `JobControl` will hold `Vec<Job>` in its domain and call Job's interface methods to drive each instance.
+**Called from:** `JobControl` holds `Vec<Job>` in its domain and calls Job's interface methods to drive each instance.
 
-**Native modules used by actions:**
+**Native modules used (by the hosted `StdProcessBackend`, not the FSM):**
 - `std::process::{Command, Child}` — spawn + try_wait
 - `libc::{kill, SIGTSTP, SIGCONT, SIGKILL}` — signal delivery (Unix only; gated by `#[cfg(unix)]`)
+
+The ring-3 backend (M3) will implement the same trait with `fork`/`exec`/`waitpid`/`kill` syscalls; `job.frs` is unchanged across the two.
 
 ## Testing
 
@@ -154,14 +156,13 @@ Test file: [`../../shell/tests/job_behavior.rs`](../../shell/tests/job_behavior.
 
 ## Native action implementations
 
-Defined in the `actions:` block in `frame/job.frs`:
+Defined in the `actions:` block in `frame/job.frs` — since M2 these are thin wrappers that delegate to the `ProcessBackend` (`shell/src/process_backend.rs`):
 
-- `try_reap(): bool` — calls `self.child.try_wait()`; if `Some(status)`, records exit code and returns true; if `None`, returns false. Cross-platform.
-- `send_signal_stop()` / `send_signal_continue()` — Unix-only `libc::kill(pid, SIG*)`. Empty on Windows (gated by `#[cfg(unix)]`).
-- `send_signal_kill()` — Unix: `libc::kill(pid, SIGKILL)`. Windows: falls back to `Child::kill()`.
-- `format_cmd(): String` — joins `cmd` and `args` with spaces.
+- `try_reap(): bool` — `self.backend.try_reap()`; `Some(code)` records exit code and returns true, `None` returns false.
+- `send_signal_stop()` / `send_signal_continue()` / `send_signal_kill()` — delegate to `self.backend.signal_*()`.
+- `format_cmd(): String` — joins `cmd` and `args` with spaces (pure; not backend-related).
 
-The `unsafe` blocks are confined to `libc::kill` calls. Each is one line, the signal number is a known constant, and the PID is a `u32` from a Child handle we control — no UB surface.
+The OS mechanics (and the `unsafe` `libc::kill` blocks) now live in the hosted `StdProcessBackend`, not the FSM — confined to one module, swapped wholesale for a syscall backend in ring 3 (M3).
 
 ## Open questions
 
@@ -180,3 +181,4 @@ The `unsafe` blocks are confined to `libc::kill` calls. Each is one line, the si
 ## Change log
 
 - **2026-05-19** — initial doc, H3 Step 1: standalone `Job` FSM with 5 states ($Created, $Foreground, $Background, $Stopped, $Done) and 14 edges. 16 Level-3 behavioral tests (`shell/tests/job_behavior.rs`, all `#![cfg(unix)]`). Plus snapshot test for the graph. No Shell integration yet — that's Step 3.
+- **2026-05-27** — M2 (H↔B parity): process-backend seam. The OS mechanism (spawn / spawn_detached / try_reap / signal_*) moved out of `job.frs` into the `ProcessBackend` trait (`shell/src/process_backend.rs`), with `StdProcessBackend` (std::process + libc::kill) as the hosted impl. Domain field `child: Option<std::process::Child>` replaced by `backend: Box<dyn ProcessBackend> = default_backend()`; `pid` retained for display only. NotFound normalization moved into the backend. The FSM no longer mentions `std::process`/`libc`. **State graph unchanged** (snapshot stable) — pure mechanism refactor. Prepares (does not wire) the ring-3 syscall backend for M3. All H3 behavioral + E2E tests green.

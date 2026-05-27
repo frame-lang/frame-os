@@ -20,6 +20,7 @@
 
 use crate::builtin::{classify, execute, is_fg, is_unknown, unknown_parts, Builtin};
 use crate::job_summary::JobSummary;
+use crate::process_backend::{default_backend, ProcessBackend};
 
 include!(concat!(env!("OUT_DIR"), "/shell.rs"));
 include!(concat!(env!("OUT_DIR"), "/parser.rs"));
