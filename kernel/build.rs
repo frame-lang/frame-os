@@ -53,6 +53,10 @@ fn main() -> Result<()> {
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed={}", linker_script.display());
 
+    // Baked RAM-disk image (interactive build, #110 mitigation) — see the
+    // resolution below, after OUT_DIR is known. Track the env var here.
+    println!("cargo:rerun-if-env-changed=FRAMEOS_BAKED_FS");
+
     // Pass the linker script via rustc to LLD. The -T flag is the
     // standard "use this linker script" directive for ld-shaped linkers.
     println!("cargo:rustc-link-arg=-T{}", linker_script.display());
@@ -70,6 +74,36 @@ fn main() -> Result<()> {
         .ok_or_else(|| anyhow!("could not find workspace root from {}", manifest.display()))?;
     let frame_dir = workspace_root.join("frame");
     let out_dir = PathBuf::from(env_var("OUT_DIR")?);
+
+    // --- Baked RAM-disk image (interactive build, #110 mitigation) --------
+    // `ramdisk.rs` does `include_bytes!(env!("FRAMEOS_BAKED_FS"))` to serve the
+    // interactive fs from RAM, bypassing QEMU's flaky emulated disk. Resolve the
+    // path and re-export it to the crate compile via `rustc-env`:
+    //   - `cargo xtask` sets FRAMEOS_BAKED_FS to the real assembled image → use it.
+    //   - a bare `cargo build/clippy/check` (e.g. CI's interactive clippy gate)
+    //     has no image → write a disk-sized zero placeholder so the build still
+    //     compiles. (Such a kernel boots but won't mount a real fs — it's never
+    //     run; only type-checked.)
+    // For the non-interactive build, `ramdisk.rs` is cfg'd out, so the env! is
+    // never expanded and the value is irrelevant — but emitting it is harmless.
+    let baked_fs = match std::env::var("FRAMEOS_BAKED_FS") {
+        Ok(p) => Some(PathBuf::from(p)),
+        // Interactive but no image (bare `cargo`/CI clippy): write a disk-sized
+        // zero placeholder so `include_bytes!` compiles. 8 MiB (16384 × 512),
+        // matching ramdisk.rs's DISK_BYTES so its size assert would still hold.
+        Err(_) if std::env::var("CARGO_FEATURE_INTERACTIVE").is_ok() => {
+            let placeholder = out_dir.join("baked_fs_placeholder.img");
+            std::fs::write(&placeholder, vec![0u8; 16384 * 512])
+                .with_context(|| format!("failed to write {}", placeholder.display()))?;
+            Some(placeholder)
+        }
+        // Non-interactive: ramdisk.rs is cfg'd out, so the env! is never expanded
+        // — nothing to provide.
+        Err(_) => None,
+    };
+    if let Some(path) = baked_fs {
+        println!("cargo:rustc-env=FRAMEOS_BAKED_FS={}", path.display());
+    }
 
     check_framec_installed()?;
 

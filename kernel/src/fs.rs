@@ -12,7 +12,7 @@
 
 use frame_os_shared::fs;
 
-use crate::{serial, virtio_blk};
+use crate::serial;
 
 type Block = [u8; fs::BLOCK_SIZE];
 
@@ -54,7 +54,12 @@ fn read_block(b: u32) -> Block {
         return c.data;
     }
     let mut buf = [0u8; fs::BLOCK_SIZE];
-    virtio_blk::read_sector(b as u64, &mut buf);
+    // Interactive build serves the disk from the baked RAM disk (#110 mitigation);
+    // every other build uses the real virtio-blk device.
+    #[cfg(feature = "interactive")]
+    crate::ramdisk::read_sector(b as u64, &mut buf);
+    #[cfg(not(feature = "interactive"))]
+    crate::virtio_blk::read_sector(b as u64, &mut buf);
     c.block = b;
     c.valid = true;
     c.data = buf;
@@ -63,7 +68,10 @@ fn read_block(b: u32) -> Block {
 
 /// Write block `b` (write-through: disk + cache).
 fn write_block(b: u32, data: &Block) {
-    virtio_blk::write_sector(b as u64, data);
+    #[cfg(feature = "interactive")]
+    crate::ramdisk::write_sector(b as u64, data);
+    #[cfg(not(feature = "interactive"))]
+    crate::virtio_blk::write_sector(b as u64, data);
     let slot = (b as usize) % CACHE_SLOTS;
     let c = &mut cache()[slot];
     c.block = b;

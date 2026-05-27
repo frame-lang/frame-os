@@ -392,10 +392,10 @@ fn prepare_qemu_artifacts(workspace: &Path) -> Result<QemuArtifacts> {
 }
 
 fn prepare_qemu_artifacts_features(workspace: &Path, interactive: bool) -> Result<QemuArtifacts> {
-    let kernel_elf = build_kernel_features(workspace, interactive)?;
-    let limine_dir = ensure_limine_binaries(workspace)?;
-    let esp_img = build_esp_image(workspace, &kernel_elf, &limine_dir)?;
-
+    // Assemble the virtio-blk disk image FIRST: the interactive kernel bakes it
+    // in (FRAMEOS_BAKED_FS → ramdisk.rs) so it serves its fs from a RAM disk
+    // (#110 mitigation), which means the image must exist before the kernel is
+    // built. The kernel build moves below, after the image is written.
     let (ovmf_code, ovmf_vars_template) = find_ovmf()?;
     let qemu_dir = target_dir(workspace).join("qemu");
     std::fs::create_dir_all(&qemu_dir)?;
@@ -486,6 +486,21 @@ fn prepare_qemu_artifacts_features(workspace: &Path, interactive: bool) -> Resul
     let usb_disk = qemu_dir.join("usb-msd.img");
     std::fs::write(&usb_disk, build_usb_disk_image())
         .with_context(|| format!("failed to write {}", usb_disk.display()))?;
+
+    // Build the kernel now that the fs image exists. The interactive build bakes
+    // the assembled image in (FRAMEOS_BAKED_FS) so it serves its fs from a RAM
+    // disk; the default/smoke build ignores it and uses the real virtio-blk path.
+    let kernel_elf = build_kernel_features(
+        workspace,
+        interactive,
+        if interactive {
+            Some(blk_template.as_path())
+        } else {
+            None
+        },
+    )?;
+    let limine_dir = ensure_limine_binaries(workspace)?;
+    let esp_img = build_esp_image(workspace, &kernel_elf, &limine_dir)?;
 
     Ok(QemuArtifacts {
         esp_img,
@@ -3432,7 +3447,11 @@ fn run_smoke_test(
 /// Returns the path to the built ELF.
 /// Build the kernel, optionally with the `interactive` feature (B8). The output
 /// path is the same; cargo rebuilds when the feature set changes.
-fn build_kernel_features(workspace: &Path, interactive: bool) -> Result<PathBuf> {
+fn build_kernel_features(
+    workspace: &Path,
+    interactive: bool,
+    baked_fs: Option<&Path>,
+) -> Result<PathBuf> {
     let mut args = vec![
         "build",
         "-p",
@@ -3444,9 +3463,15 @@ fn build_kernel_features(workspace: &Path, interactive: bool) -> Result<PathBuf>
         args.push("--features");
         args.push("interactive");
     }
-    let status = Command::new("cargo")
-        .current_dir(workspace)
-        .args(&args)
+    let mut cmd = Command::new("cargo");
+    cmd.current_dir(workspace).args(&args);
+    // The interactive build bakes this fs image into the kernel (ramdisk.rs's
+    // `include_bytes!(env!("FRAMEOS_BAKED_FS"))`); the kernel's build.rs requires
+    // it when the feature is on. Absolute path so include_bytes! resolves it.
+    if let Some(path) = baked_fs {
+        cmd.env("FRAMEOS_BAKED_FS", path);
+    }
+    let status = cmd
         .status()
         .context("failed to invoke cargo for kernel build")?;
     if !status.success() {

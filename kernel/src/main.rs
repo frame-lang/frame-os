@@ -58,6 +58,10 @@ mod percpu;
 mod pic;
 mod pipe;
 mod pit;
+// RAM-backed block device for the interactive build (#110 mitigation): serves
+// the fs from a baked-in image in RAM, bypassing QEMU's flaky emulated disk.
+#[cfg(feature = "interactive")]
+mod ramdisk;
 mod reactor;
 mod rtc;
 mod sched;
@@ -67,6 +71,11 @@ mod spin;
 mod tcp;
 mod usermode;
 mod vfs;
+// The interactive build serves its fs from the RAM disk, so virtio-blk's
+// read/write data path is unused there (its `on_irq` is still wired into the
+// IDT); allow the resulting dead code only in that build. The default + smoke
+// builds use the driver fully and keep full dead-code warnings.
+#[cfg_attr(feature = "interactive", allow(dead_code))]
 mod virtio_blk;
 mod virtio_net;
 mod vm;
@@ -723,9 +732,12 @@ unsafe extern "C" fn kmain() -> ! {
         fpu::init_this_cpu(); // enable SSE/x87 + fninit on the BSP (B11-3a)
 
         vm::init(); // PageFaultHandler: a user fault kills the process, not the kernel
-        if !virtio_blk::init() {
-            serial::writeln("[ish] WARNING: no virtio-blk disk — /bin programs unavailable");
-        }
+
+        // #110 mitigation: the interactive shell serves its filesystem from a
+        // baked-in RAM disk rather than QEMU's emulated virtio-blk, so the heavy
+        // interactive I/O can't hit the host's flaky disk-completion path. The
+        // real virtio-blk driver is still built + validated by the smoke suite.
+        ramdisk::init();
         if !fs::mount() {
             serial::writeln("[ish] WARNING: FS mount failed — /bin programs unavailable");
         } else {
