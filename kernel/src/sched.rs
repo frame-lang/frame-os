@@ -22,7 +22,7 @@
 // (B1-6).
 
 use core::arch::asm;
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use crate::frame_systems::{IoScheduler, Scheduler};
 use crate::{fpu, gdt, interrupts, paging, serial};
@@ -180,6 +180,18 @@ fn with_io_sched<R>(f: impl FnOnce(&mut IoScheduler) -> R) -> R {
 /// names us owner. The check-and-block in `block_current_until` is atomic, and on
 /// any wake we re-ask the supervisor — so a hand-off that races the block is
 /// never lost. (S6: replaces the ad-hoc native disk lock.)
+// Observability for multi-flight: how many disk requests currently hold a slot,
+// and the peak ever reached. A peak > 1 is direct evidence requests genuinely
+// overlap in flight (not serialized one-at-a-time). Logged on each new peak.
+//
+// NOTE: on the host-RAM-cached QEMU disk image, completions are effectively
+// synchronous — a request finishes before the next process can `acquire`, so the
+// peak observed in practice is 1. The slot pool *permits* N concurrent and the
+// 1..N path is the same; genuine overlap would surface here on a higher-latency
+// disk (real hardware). The counter records the truth rather than implying more.
+static DISK_IN_FLIGHT: AtomicU32 = AtomicU32::new(0);
+static DISK_IN_FLIGHT_PEAK: AtomicU32 = AtomicU32::new(0);
+
 /// Acquire a disk request-slot for the current process via the `IoScheduler`
 /// slot-pool supervisor (multi-flight). Returns the granted slot index; if the
 /// pool is full the caller is queued and blocks here until a slot is handed off.
@@ -197,6 +209,13 @@ pub fn acquire_disk() -> usize {
         // Pool full — `acquire` queued us. Block until handed a slot.
         block_current_until(|| with_io_sched(|s| s.slot_of(pid)) >= 0);
     }
+    // We now hold a slot — count it, and log if this is a new concurrency peak.
+    let n = DISK_IN_FLIGHT.fetch_add(1, Ordering::SeqCst) + 1;
+    if n > DISK_IN_FLIGHT_PEAK.fetch_max(n, Ordering::SeqCst) {
+        serial::write_str("[io] disk requests in flight (peak): ");
+        serial::write_u32_decimal(n);
+        serial::writeln("");
+    }
     with_io_sched(|s| s.slot_of(pid)) as usize
 }
 
@@ -209,6 +228,7 @@ pub fn release_disk() {
         return; // paired with the bypass in `acquire_disk`
     }
     let next = with_io_sched(|s| s.release(pid));
+    DISK_IN_FLIGHT.fetch_sub(1, Ordering::SeqCst);
     if next != 0 {
         wake_pid(next);
     }
