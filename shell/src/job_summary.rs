@@ -12,6 +12,10 @@
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct JobSummary {
     pub id: u32,
+    /// OS process id. Used by the ring-3 shell to echo `[id] pid` on background
+    /// launch and to resolve `%job` specs to a pid for `kill`/`bg` (M4). The
+    /// hosted display doesn't show it, but carrying it keeps one snapshot type.
+    pub pid: u32,
     pub state: String,
     pub cmd: String,
     /// 0 unless the job is in `$Done`. Shell reads this after

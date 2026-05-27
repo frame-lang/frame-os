@@ -41,6 +41,10 @@
         kill_job(id: u32)
         wait_for(id: u32)
         tick()
+        // Drop a job from the table by id (after its "Done" line is reported).
+        // The hosted shell defers Done-notices, so it never calls this; the
+        // ring-3 shell reports + removes finished background jobs at the prompt.
+        remove(id: u32)
         // Interface defaults read from domain fields and helper actions.
         // Both states return the same values for these queries, so no
         // per-state overrides are needed.
@@ -126,6 +130,21 @@
                     if !j.is_done() {
                         j.poll();
                     }
+                }
+            }
+
+            remove(id: u32) {
+                // Find by index then Vec::remove — Job::id() is a Frame query
+                // (needs &mut self), so retain()'s &-closure can't call it.
+                let mut idx: Option<usize> = None;
+                for (i, j) in self.jobs.iter_mut().enumerate() {
+                    if j.id() == id {
+                        idx = Some(i);
+                        break;
+                    }
+                }
+                if let Some(i) = idx {
+                    self.jobs.remove(i);
                 }
             }
 
@@ -246,6 +265,7 @@
             for j in self.jobs.iter_mut() {
                 out.push(JobSummary {
                     id: j.id(),
+                    pid: j.pid(),
                     state: j.state_name(),
                     cmd: j.cmd_str(),
                     exit_code: j.exit_code(),

@@ -597,6 +597,7 @@ mod job_fsm {
     #[derive(Clone)]
     pub struct JobSummary {
         pub id: u32,
+        pub pid: u32,
         pub state: String,
         pub cmd: String,
         pub exit_code: i32,

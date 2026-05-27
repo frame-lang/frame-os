@@ -11,7 +11,7 @@ digraph JobControl {
             <tr><td><b>Idle</b></td></tr>
             <hr/>
             <tr><td align="left"><font point-size="10">
-spawn_foreground(cmd: String, args: Vec&lt;String&gt;)<br ALIGN="LEFT"/>spawn_background(cmd: String, args: Vec&lt;String&gt;)<br ALIGN="LEFT"/>fg(id: u32)<br ALIGN="LEFT"/>bg(id: u32)<br ALIGN="LEFT"/>kill_job(id: u32)<br ALIGN="LEFT"/>wait_for(id: u32)<br ALIGN="LEFT"/>tick()<br ALIGN="LEFT"/>
+spawn_foreground(cmd: String, args: Vec&lt;String&gt;)<br ALIGN="LEFT"/>spawn_background(cmd: String, args: Vec&lt;String&gt;)<br ALIGN="LEFT"/>fg(id: u32)<br ALIGN="LEFT"/>bg(id: u32)<br ALIGN="LEFT"/>kill_job(id: u32)<br ALIGN="LEFT"/>wait_for(id: u32)<br ALIGN="LEFT"/>tick()<br ALIGN="LEFT"/>remove(id: u32)<br ALIGN="LEFT"/>
             </font></td></tr>
         </table>
     > margin=0 shape=none]
