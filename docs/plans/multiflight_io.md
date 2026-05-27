@@ -95,6 +95,13 @@ the *concurrency coordination* is exactly what Frame is for.
    clippy + fmt clean both kernel configs.
 2. **Used-ring-element drain** (`id → slot`, multi-completion) replacing the
    `used.idx`-only completion; still serialized; validate.
+   **DONE 2026-05-26**: `drain_used()` consumes used-ring elements (fenced
+   `used.idx` read; `id/3 → slot`; records `slot_status`, sets `slot_done`,
+   advances `last_used`). `wait_and_drain(slot)`'s predicate is now
+   `{ drain_used(); slot_done[slot] }` — per-request, not the global
+   `used.idx`-advanced test. Drain currently runs in the wait predicate (Step 3
+   moves it into `on_irq` to wake concurrent waiters by id). Parity validated:
+   `blk_roundtrip_b4` PASS; clippy + fmt clean both configs.
 3. **Concurrent submit** — allow a second request before the first completes;
    the drain wakes each by id. Validate with concurrent `exec` (a pipeline).
 4. **`IoScheduler` → slot-pool supervisor + N `BlockRequest` instances** (the

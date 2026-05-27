@@ -80,6 +80,13 @@ struct Device {
     slot_base_phys: u64,
     slot_base_virt: u64,
     slot_in_use: [bool; N_SLOTS],
+    // Per-slot completion state (multi-flight Step 2): `drain_used()` consumes
+    // used-ring elements, maps each `id/3` back to its slot, records the status
+    // byte, and sets `slot_done`. A waiter's completion predicate is its own
+    // `slot_done[slot]` — so completion is per-request, not the old global
+    // `used.idx`-advanced test.
+    slot_done: [bool; N_SLOTS],
+    slot_status: [u8; N_SLOTS],
     present: bool,
 }
 
@@ -94,6 +101,8 @@ static mut DEV: Device = Device {
     slot_base_phys: 0,
     slot_base_virt: 0,
     slot_in_use: [false; N_SLOTS],
+    slot_done: [false; N_SLOTS],
+    slot_status: [0; N_SLOTS],
     present: false,
 };
 
@@ -230,6 +239,8 @@ pub fn init() -> bool {
     d.slot_base_phys = slot_base_phys;
     d.slot_base_virt = slot_base_virt;
     d.slot_in_use = [false; N_SLOTS];
+    d.slot_done = [false; N_SLOTS];
+    d.slot_status = [0; N_SLOTS];
     d.present = true;
 
     // Route the completion IRQ (QEMU wires virtio-blk to IRQ11, the slave PIC;
@@ -328,32 +339,59 @@ unsafe fn submit(slot: usize, sector: u64, write: bool) {
     io::outw(d.io_base + R_QUEUE_NOTIFY, 0);
 }
 
-/// Wait for the in-flight request to complete, then return the device status
+/// Consume completed used-ring *elements* (multi-flight Step 2). For each new
+/// entry from `last_used` to the device's `used.idx`, map its descriptor id back
+/// to a slot (`id / 3` — slot `i` always uses chain head `3i`), read that slot's
+/// status byte, and mark `slot_done[slot]`. Each waiter's completion predicate is
+/// its own `slot_done` — so completion is per-request, replacing the old global
+/// `used.idx`-advanced test. Native + interrupt-safe (reads + flag writes, no
+/// Frame dispatch). The leading fence is the virtio read barrier: observe the
+/// device's buffer + `used.idx` writes before consuming them. Still serialized
+/// today (one in flight), so this drains exactly one element per request; Step 3
+/// will also call it from `on_irq` to wake concurrent waiters by id.
+fn drain_used() {
+    let d = dev();
+    let ub = used_base() as *const u8;
+    core::sync::atomic::fence(Ordering::SeqCst);
+    let used_idx = unsafe { core::ptr::read_volatile(ub.add(2) as *const u16) };
+    while d.last_used != used_idx {
+        let ring_i = (d.last_used % d.qsize) as usize;
+        // used ring layout: flags(2) + idx(2) + ring[{id: u32, len: u32}; qsize].
+        let id = unsafe { core::ptr::read_volatile(ub.add(4 + ring_i * 8) as *const u32) };
+        let slot = (id / 3) as usize;
+        if slot < N_SLOTS {
+            let status =
+                unsafe { core::ptr::read_volatile((slot_virt(slot) + OFF_STATUS) as *const u8) };
+            d.slot_status[slot] = status;
+            d.slot_done[slot] = true;
+        }
+        d.last_used = d.last_used.wrapping_add(1);
+    }
+}
+
+/// Wait for slot `slot`'s request to complete, then return the device status
 /// byte (0 = OK).
 ///
-/// The completion signal is the **used-ring index** advancing — NOT the status
-/// byte. Virtio only guarantees that the device has written *all* of a request's
-/// buffers (data + status) once it bumps `used.idx`; the order in which the
-/// individual buffers are written is unspecified. Polling the status byte alone
-/// can therefore observe the status before the data DMA has landed — harmless for
-/// a one-sector read, but tcc's heavy multi-sector reads occasionally got stale
-/// data, producing a corrupt/missing `/out.elf`. Waiting on `used.idx` (then
-/// reading status) is the spec-correct, race-free completion test, and — polled
-/// via `block_current_until`, re-checked after every wake — it's also immune to a
-/// lost/early wakeup (the bug that intermittently dropped the S5 redirect's
-/// directory-entry write). Single-flight (the IoScheduler serializes whole
-/// transactions), so `used.idx` advances exactly one per completed request.
+/// Completion is detected by `drain_used()` consuming the used-ring *element* for
+/// this request and setting `slot_done[slot]` — NOT by polling the status byte
+/// (the device may write status before the data DMA lands; the used-ring entry is
+/// the spec-correct "all buffers written" signal). The predicate drains then
+/// checks this slot's own flag, so it's per-request and — polled via
+/// `block_current_until`, re-checked after every wake — immune to a lost/early
+/// wakeup. Still serialized (the IoScheduler holds the engine for the whole txn),
+/// so exactly one element drains per request here.
 fn wait_and_drain(slot: usize) -> u8 {
-    let d = dev();
-    let status_ptr = (slot_virt(slot) + OFF_STATUS) as *const u8;
-    let used_idx_ptr = unsafe { (used_base() as *const u8).add(2) as *const u16 };
-    let start = d.last_used; // device's used.idx before this request
-    let done = move || unsafe { core::ptr::read_volatile(used_idx_ptr) } != start;
+    dev().slot_done[slot] = false; // fresh request; drain_used sets it on completion
+    let done = move || {
+        drain_used();
+        dev().slot_done[slot]
+    };
     let pid = sched::current_pid();
     if sched::is_preemption_active() && pid != 0 {
         // Blocking I/O: yield until the DMA completion. `on_irq` wakes us promptly
         // via DISK_WAITER, but correctness comes from `block_current_until`
-        // re-checking `used.idx` — a wake can't make us return before completion.
+        // re-checking the predicate — a wake can't make us return before this
+        // slot's used-ring element has been drained.
         DISK_WAITER.store(pid, Ordering::SeqCst);
         sched::block_current_until(done);
         DISK_WAITER.store(0, Ordering::SeqCst);
@@ -365,10 +403,7 @@ fn wait_and_drain(slot: usize) -> u8 {
         }
         interrupts::disable();
     }
-    // The request is fully written (used.idx advanced); record the new cursor and
-    // read the now-valid status byte.
-    d.last_used = unsafe { core::ptr::read_volatile(used_idx_ptr) };
-    unsafe { core::ptr::read_volatile(status_ptr) }
+    dev().slot_status[slot]
 }
 
 /// Read one 512-byte sector into `out`. Returns true on success. Drives a
