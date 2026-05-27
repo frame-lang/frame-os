@@ -28,6 +28,12 @@ const FRAME_SYSTEMS: &[(&str, &str)] = &[
     // syscalls). NOT included in the shared frame_systems.rs — other user bins
     // don't reuse the Shell and shouldn't have to provide a ShellEnv.
     ("shell", "shell.frs"),
+    // Job + JobControl (M4): the SAME hosted job-control FSMs, now compiled for
+    // ring 3 over a syscall ProcessBackend — unifying the job table across
+    // targets (retiring the ish-specific IshJobs). ish.rs include!s them in its
+    // local shell_fsm module.
+    ("job", "job.frs"),
+    ("job_control", "job_control.frs"),
     // IshJobs (S10): the interactive shell's job-control FSM ($Idle/$Foreground
     // + background-job table), the ish-resident adaptation of the hosted-shell
     // job_control.frs. Built for x86_64-unknown-none; src/frame_systems.rs

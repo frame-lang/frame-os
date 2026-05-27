@@ -126,6 +126,13 @@ fn waitpid(pid: u64) -> u64 {
 fn reap_nohang() -> u64 {
     unsafe { syscall3(28, 0, 0, 0) }
 }
+/// Per-pid non-blocking reap: `reap_nohang` with a specific target (the kernel's
+/// sys_reap_nohang reaps exactly `pid` when target != 0). Returns
+/// `(pid<<32)|status` if that child has exited, else 0. The SyscallProcessBackend
+/// (M4) uses this for Job.poll()'s per-pid try_reap.
+fn reap_pid_nohang(pid: u64) -> u64 {
+    unsafe { syscall3(28, pid, 0, 0) }
+}
 /// kill (#29): send signal `sig` to process `pid`. Returns u64::MAX if no such
 /// process. The shell sends SIGTERM (15) for `kill %job` / `kill <pid>`.
 fn kill(pid: u64, sig: u64) -> u64 {
@@ -559,6 +566,163 @@ fn list_jobs(jobs: &mut IshJobs) {
 // (shell_fsm below), and its per-command dispatch lives in IshShellEnv. ish's
 // execution helpers above (run_external, run_pipeline, cat, the job builtins)
 // are unchanged; IshShellEnv calls them.)
+
+// ── Job-control FSM reuse (M4) ─────────────────────────────────────────────
+//
+// The SAME frame/job.frs + frame/job_control.frs the hosted shell compiles,
+// here for ring 3 over a syscall ProcessBackend — unifying the job table across
+// targets (replacing the ish-specific IshJobs). M4.2/.3-compile lands the
+// *compilation* (the whole job-control stack builds for x86_64-unknown-none +
+// SyscallProcessBackend is complete); the final M4.3 step rewires IshShellEnv
+// onto JobControl and retires IshJobs. Until then this module is unused —
+// #[allow(dead_code)] — and IshShellEnv keeps driving IshJobs.
+// clippy::wrong_self_convention: the generated Job FSM has `to_foreground` /
+// `to_background` taking `&mut self` (Frame interface methods, not conversions).
+#[allow(dead_code, unused_imports, clippy::wrong_self_convention)]
+mod job_fsm {
+    // Names the generated job.rs / job_control.rs reference via `use super::*`.
+    pub use alloc::boxed::Box;
+    pub use alloc::string::{String, ToString};
+    pub use alloc::vec::Vec;
+
+    // ish syscalls the SyscallProcessBackend drives.
+    use super::{
+        build_argv, exec_argv, exit, fork, kill, print, reap_pid_nohang, set_foreground, waitpid,
+        write_char, SIGCONT, WSTOPPED,
+    };
+
+    // Ring-3 JobSummary — the snapshot row job_control.frs's jobs() builds.
+    // Must match the fields job_control.frs constructs (id/state/cmd/exit_code),
+    // mirroring the hosted shell/src/job_summary.rs.
+    #[derive(Clone)]
+    pub struct JobSummary {
+        pub id: u32,
+        pub state: String,
+        pub cmd: String,
+        pub exit_code: i32,
+    }
+
+    // ProcessBackend + FgOutcome come from job.rs's prolog; Job from job.rs;
+    // JobControl from job_control.rs (uses Job + JobSummary).
+    include!(concat!(env!("OUT_DIR"), "/job.rs"));
+    include!(concat!(env!("OUT_DIR"), "/job_control.rs"));
+
+    /// The ring-3 process backend: fork/exec/waitpid/kill syscalls behind the
+    /// shared ProcessBackend trait. The blocking-waitpid counterpart of the
+    /// hosted StdProcessBackend's poll loop (same FgOutcome, different mechanism).
+    pub struct SyscallProcessBackend {
+        pid: u32,
+        exit_code: i32,
+        foreground: bool,
+    }
+
+    impl SyscallProcessBackend {
+        fn new() -> Self {
+            Self {
+                pid: 0,
+                exit_code: 0,
+                foreground: false,
+            }
+        }
+
+        fn do_spawn(
+            &mut self,
+            cmd: &str,
+            args: &[String],
+            foreground: bool,
+        ) -> Result<u32, String> {
+            // build_argv wants [cmd, args...]; it resolves cmd to /bin/<cmd>
+            // (unless absolute) and NUL-packs the rest.
+            let mut toks: Vec<String> = Vec::with_capacity(args.len() + 1);
+            toks.push(cmd.to_string());
+            for a in args {
+                toks.push(a.clone());
+            }
+            let (argv, argc) = build_argv(&toks);
+            let child = fork();
+            if child == 0 {
+                exec_argv(&argv, argc);
+                print(b"ish: command not found: ");
+                print(cmd.as_bytes());
+                write_char(b'\n');
+                exit(127);
+            }
+            self.pid = child as u32;
+            self.foreground = foreground;
+            if foreground {
+                // Route terminal Ctrl-C / Ctrl-Z to this child while it runs.
+                set_foreground(child);
+            }
+            Ok(self.pid)
+        }
+    }
+
+    impl ProcessBackend for SyscallProcessBackend {
+        fn spawn(&mut self, cmd: &str, args: &[String]) -> Result<u32, String> {
+            self.do_spawn(cmd, args, true)
+        }
+
+        fn spawn_detached(&mut self, cmd: &str, args: &[String]) -> Result<u32, String> {
+            self.do_spawn(cmd, args, false)
+        }
+
+        fn try_reap(&mut self) -> Option<i32> {
+            if self.pid == 0 {
+                return Some(self.exit_code);
+            }
+            let v = reap_pid_nohang(self.pid as u64);
+            if v == 0 {
+                None
+            } else {
+                self.exit_code = (v & 0xffff_ffff) as u32 as i32;
+                self.pid = 0;
+                Some(self.exit_code)
+            }
+        }
+
+        fn signal_stop(&mut self) {
+            if self.pid != 0 {
+                kill(self.pid as u64, 20); // SIGTSTP
+            }
+        }
+
+        fn signal_continue(&mut self) {
+            if self.pid != 0 {
+                kill(self.pid as u64, SIGCONT);
+            }
+        }
+
+        fn signal_kill(&mut self) {
+            if self.pid != 0 {
+                kill(self.pid as u64, 9); // SIGKILL
+            }
+        }
+
+        fn wait_foreground(&mut self) -> FgOutcome {
+            if self.pid == 0 {
+                return FgOutcome::Exited(self.exit_code);
+            }
+            // Block in the kernel; it routes terminal Ctrl-Z to the foreground
+            // child and returns WSTOPPED if it stopped rather than exited.
+            let st = waitpid(self.pid as u64);
+            if self.foreground {
+                set_foreground(0);
+            }
+            if st & WSTOPPED != 0 {
+                FgOutcome::Stopped
+            } else {
+                self.exit_code = (st & 0xffff_ffff) as u32 as i32;
+                self.pid = 0;
+                FgOutcome::Exited(self.exit_code)
+            }
+        }
+    }
+
+    /// The backend a ring-3 Job gets (job.rs's domain init calls this).
+    pub fn default_backend() -> Box<dyn ProcessBackend> {
+        Box::new(SyscallProcessBackend::new())
+    }
+}
 
 // ── Shell control-flow FSM reuse (M3b) ─────────────────────────────────────
 //
