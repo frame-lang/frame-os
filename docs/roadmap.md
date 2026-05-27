@@ -1358,12 +1358,17 @@ R-track refinements, and the S1–S10 bare-metal shell are all complete.
   emulated device entirely — `console-test` went from ~80% flaky to **8/8 green**
   on the same saturated host. The real virtio-blk driver + `BlockRequest`/
   `IoScheduler` Frame systems are unchanged and still validated by the
-  (non-interactive) smoke suite. The RAM disk is *ephemeral* (writes reset to the
-  pristine image each boot — matches the fresh-per-run workflow); a write-back
-  variant (flush dirty blocks to the real disk at shutdown) is the documented
-  next step if cross-boot persistence on this host is ever wanted. See the deeper
-  analysis in `frame_assessment.md` (2026-05-26, "#110 — can it be fixed?" + the
-  RAM-disk entry).
+  (non-interactive) smoke suite (`blk_roundtrip_b4` re-confirmed PASS after the
+  refactor). The RAM disk is *ephemeral* (writes reset to the pristine image each
+  boot — matches the fresh-per-run workflow). **Write-back was evaluated and is
+  NOT worth pursuing on the emulation host:** cross-boot durability requires the
+  *device* to be the boot source-of-truth, but the boot source is the baked
+  image, so flushing dirty blocks at shutdown wouldn't survive a reboot without
+  re-introducing the exact flaky bulk device-read the RAM disk exists to avoid.
+  Durability is a real-hardware concern via the unchanged virtio-blk path (where
+  #110 doesn't occur and the RAM disk isn't needed). See the deeper analysis in
+  `frame_assessment.md` (2026-05-26, "#110 — can it be fixed?" + the RAM-disk and
+  write-back-verdict entries).
 - **Modern virtio-blk (1.0)** — deferred; wouldn't fix #110, zero Frame content.
 - **Single-flight → multi-flight I/O** — the Frame-relevant storage step
   (`docs/plans/multiflight_io.md`).
