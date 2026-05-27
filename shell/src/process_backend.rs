@@ -16,29 +16,10 @@
 // the RAM-disk backend.) At M2 only the hosted `StdProcessBackend` exists; M3
 // adds the syscall backend when `ish` migrates onto the shared `Job` FSM.
 
-/// The OS mechanism behind a `Job`. One backend instance per `Job`; it owns
-/// whatever native handle the platform needs (a `std::process::Child` here).
-pub trait ProcessBackend {
-    /// Spawn the command in the foreground, inheriting the shell's stdio.
-    /// Returns the child pid, or a shell-shaped error message (NotFound is
-    /// normalized to "No such file or directory" so the shell's
-    /// "command not found" mapping works cross-platform).
-    fn spawn(&mut self, cmd: &str, args: &[String]) -> Result<u32, String>;
-
-    /// Spawn detached for background launch: stdio redirected to null and the
-    /// child placed in its own process group, so it neither holds the shell's
-    /// pipes open nor receives terminal Ctrl-C. Same return contract as spawn.
-    fn spawn_detached(&mut self, cmd: &str, args: &[String]) -> Result<u32, String>;
-
-    /// Non-blocking reap. `Some(code)` if the process has exited (or there is
-    /// no live child — already reaped / spawn failed); `None` if still running.
-    fn try_reap(&mut self) -> Option<i32>;
-
-    /// Deliver a stop (SIGTSTP), continue (SIGCONT), or kill (SIGKILL).
-    fn signal_stop(&mut self);
-    fn signal_continue(&mut self);
-    fn signal_kill(&mut self);
-}
+// The `ProcessBackend` trait + `FgOutcome` are declared in the job.frs native
+// prolog (so they're emitted into every crate that compiles job.frs — hosted
+// + ring-3 at M4). This module provides the hosted implementation.
+use crate::frame_systems::{FgOutcome, ProcessBackend};
 
 /// The hosted backend: `std::process` to spawn/reap, `libc::kill` to signal.
 /// This is exactly the mechanism that lived inline in `job.frs` before M2.
@@ -157,6 +138,25 @@ impl ProcessBackend for StdProcessBackend {
         {
             if let Some(ref mut c) = self.child {
                 let _ = c.kill();
+            }
+        }
+    }
+
+    fn wait_foreground(&mut self) -> FgOutcome {
+        // The hosted foreground-wait STRATEGY (moved out of JobControl at M4):
+        // poll the child while watching the SIGTSTP flag that shell/src/signals.rs
+        // sets on Ctrl-Z. On suspend, stop the child ourselves and report
+        // Stopped; otherwise loop until it exits. A brief sleep avoids pegging a
+        // CPU. (The ring-3 backend instead blocks in waitpid while the kernel
+        // routes terminal signals — same FgOutcome, different mechanism.)
+        loop {
+            if crate::signals::take_suspend_flag() {
+                self.signal_stop();
+                return FgOutcome::Stopped;
+            }
+            match self.try_reap() {
+                Some(code) => return FgOutcome::Exited(code),
+                None => std::thread::sleep(std::time::Duration::from_millis(20)),
             }
         }
     }

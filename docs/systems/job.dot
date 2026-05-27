@@ -20,7 +20,7 @@ spawn(cmd: String, args: Vec&lt;String&gt;)<br ALIGN="LEFT"/>spawn_detached(cmd:
             <tr><td><b>Foreground</b></td></tr>
             <hr/>
             <tr><td align="left"><font point-size="10">
-poll()<br ALIGN="LEFT"/>stop()<br ALIGN="LEFT"/>to_background()<br ALIGN="LEFT"/>kill()<br ALIGN="LEFT"/>state_name()<br ALIGN="LEFT"/>
+poll()<br ALIGN="LEFT"/>await_rest()<br ALIGN="LEFT"/>stop()<br ALIGN="LEFT"/>to_background()<br ALIGN="LEFT"/>kill()<br ALIGN="LEFT"/>state_name()<br ALIGN="LEFT"/>
             </font></td></tr>
         </table>
     > margin=0 shape=none]
@@ -29,7 +29,7 @@ poll()<br ALIGN="LEFT"/>stop()<br ALIGN="LEFT"/>to_background()<br ALIGN="LEFT"/
             <tr><td><b>Background</b></td></tr>
             <hr/>
             <tr><td align="left"><font point-size="10">
-poll()<br ALIGN="LEFT"/>stop()<br ALIGN="LEFT"/>to_foreground()<br ALIGN="LEFT"/>kill()<br ALIGN="LEFT"/>state_name()<br ALIGN="LEFT"/>
+poll()<br ALIGN="LEFT"/>await_rest()<br ALIGN="LEFT"/>stop()<br ALIGN="LEFT"/>to_foreground()<br ALIGN="LEFT"/>kill()<br ALIGN="LEFT"/>state_name()<br ALIGN="LEFT"/>
             </font></td></tr>
         </table>
     > margin=0 shape=none]
@@ -57,10 +57,14 @@ is_done()<br ALIGN="LEFT"/>state_name()<br ALIGN="LEFT"/>
     Created -> Background [label=" spawn_detached "]
     Created -> Done [label=" spawn_detached "]
     Foreground -> Done [label=" poll "]
+    Foreground -> Done [label=" await_rest "]
+    Foreground -> Stopped [label=" await_rest "]
     Foreground -> Stopped [label=" stop "]
     Foreground -> Background [label=" to_background "]
     Foreground -> Done [label=" kill "]
     Background -> Done [label=" poll "]
+    Background -> Done [label=" await_rest "]
+    Background -> Stopped [label=" await_rest "]
     Background -> Stopped [label=" stop "]
     Background -> Foreground [label=" to_foreground "]
     Background -> Done [label=" kill "]

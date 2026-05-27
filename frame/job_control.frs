@@ -201,65 +201,42 @@
         }
 
     actions:
-        // Drive the foreground job's poll() in a loop until it reaches a
-        // resting state (Done or Stopped). Sleeps briefly between polls
-        // to avoid pegging a CPU.
+        // Block until the foreground job reaches a resting state (Done or
+        // Stopped). The wait STRATEGY lives in the backend (Job.await_rest →
+        // ProcessBackend.wait_foreground): hosted polls + checks the SIGTSTP
+        // flag (sending the stop signal itself on suspend), ring-3 blocks in
+        // waitpid while the kernel routes terminal signals. So this is just
+        // "find the fg job, await it" — no sleep, no signal-flag, no poll loop
+        // here, which is exactly what lets JobControl compile for ring 3 (M4).
         drive_foreground_to_idle() {
             let fid = match self.foreground_id {
                 Some(id) => id,
                 None => return,
             };
-            loop {
-                let mut idx: Option<usize> = None;
-                for (i, j) in self.jobs.iter().enumerate() {
-                    if j.id == fid {
-                        idx = Some(i);
-                        break;
-                    }
-                }
-                let i = match idx {
-                    Some(i) => i,
-                    None => return,
-                };
-                // Check for SIGTSTP (Ctrl-Z) — the signal handler in
-                // shell/src/signals.rs set the flag if a SIGTSTP was
-                // delivered since the last check. If so, the child was
-                // stopped at the OS level; record the $Stopped transition
-                // on the Job and exit the loop.
-                if crate::signals::take_suspend_flag() {
-                    self.jobs[i].stop();
+            let mut idx: Option<usize> = None;
+            for (i, j) in self.jobs.iter().enumerate() {
+                if j.id == fid {
+                    idx = Some(i);
                     break;
                 }
-                self.jobs[i].poll();
-                if self.jobs[i].is_done() {
-                    break;
-                }
-                if self.jobs[i].state_name() == "Stopped" {
-                    break;
-                }
-                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            if let Some(i) = idx {
+                self.jobs[i].await_rest();
             }
         }
 
-        // Poll a specific job until it reaches $Done. Used by wait_for.
+        // Block on a specific job until it rests (Done or Stopped). Used by the
+        // `wait` builtin. Same backend-owned wait strategy as above.
         poll_until_done(id: u32) {
-            loop {
-                let mut idx: Option<usize> = None;
-                for (i, j) in self.jobs.iter().enumerate() {
-                    if j.id == id {
-                        idx = Some(i);
-                        break;
-                    }
+            let mut idx: Option<usize> = None;
+            for (i, j) in self.jobs.iter().enumerate() {
+                if j.id == id {
+                    idx = Some(i);
+                    break;
                 }
-                let i = match idx {
-                    Some(i) => i,
-                    None => return,
-                };
-                self.jobs[i].poll();
-                if self.jobs[i].is_done() {
-                    return;
-                }
-                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            if let Some(i) = idx {
+                self.jobs[i].await_rest();
             }
         }
 

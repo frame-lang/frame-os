@@ -53,6 +53,43 @@
 
 @@[target("rust")]
 
+// Process-backend seam (M2, extended M4). The OS mechanism behind a Job —
+// spawn, non-blocking reap, signal delivery, and the blocking foreground wait —
+// lives behind this trait, declared in the prolog so it is emitted into every
+// crate that compiles job.frs (hosted `shell` + bare-metal `user` at M4). The
+// hosted `StdProcessBackend` (shell/src/process_backend.rs) = std::process +
+// libc::kill + a poll/SIGTSTP-flag wait; the ring-3 backend = fork/exec/waitpid/
+// kill syscalls + a blocking waitpid. `default_backend()` is supplied per-crate.
+// The FSM is backend-agnostic — FSM-owns-logic / native-owns-mechanism.
+pub trait ProcessBackend {
+    /// Spawn in the foreground (inherit stdio). Ok(pid) or a shell-shaped error
+    /// (NotFound normalized to "No such file or directory").
+    fn spawn(&mut self, cmd: &str, args: &[String]) -> Result<u32, String>;
+    /// Spawn detached for background launch (stdio→null, own process group).
+    fn spawn_detached(&mut self, cmd: &str, args: &[String]) -> Result<u32, String>;
+    /// Non-blocking reap: Some(code) if exited (or no live child), None if still
+    /// running.
+    fn try_reap(&mut self) -> Option<i32>;
+    fn signal_stop(&mut self);
+    fn signal_continue(&mut self);
+    fn signal_kill(&mut self);
+    /// Block until the foreground process exits or is stopped, returning which.
+    /// This is the foreground-wait STRATEGY — the one place the targets truly
+    /// differ: hosted polls + checks a SIGTSTP flag (sending SIGTSTP itself on
+    /// suspend); ring-3 blocks in waitpid while the kernel routes terminal
+    /// signals (WSTOPPED). Pushing it here lets JobControl/Job stay identical
+    /// across targets.
+    fn wait_foreground(&mut self) -> FgOutcome;
+}
+
+/// Outcome of a foreground wait: the process exited (with a code) or stopped
+/// (job-control suspend — Ctrl-Z / SIGTSTP).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum FgOutcome {
+    Exited(i32),
+    Stopped,
+}
+
 @@system Job(id: u32) {
     interface:
         spawn(cmd: String, args: Vec<String>)
@@ -62,6 +99,9 @@
         to_background()
         kill()
         poll()
+        // Block until the foreground job rests (exits or stops), via the
+        // backend's wait_foreground strategy. Valid in $Foreground.
+        await_rest()
         // Interface defaults read directly from domain fields. They hold
         // the right value in every state — `id` is set at construction,
         // `pid` is 0 until spawn, `exit_code` is 0 until $Done. Only
@@ -125,6 +165,23 @@
                 }
             }
 
+            // Block until this foreground job rests. The backend's
+            // wait_foreground owns the strategy (hosted: poll + SIGTSTP-flag,
+            // sending the stop signal itself on suspend; ring-3: blocking
+            // waitpid). On Stopped we just record the state — the backend has
+            // already delivered/observed the stop.
+            await_rest() {
+                match self.backend.wait_foreground() {
+                    FgOutcome::Exited(code) => {
+                        self.exit_code = code;
+                        -> $Done
+                    }
+                    FgOutcome::Stopped => {
+                        -> $Stopped
+                    }
+                }
+            }
+
             stop() {
                 self.send_signal_stop();
                 -> $Stopped
@@ -147,6 +204,19 @@
             poll() {
                 if self.try_reap() {
                     -> $Done
+                }
+            }
+
+            // `wait <id>` on a background job blocks here until it rests.
+            await_rest() {
+                match self.backend.wait_foreground() {
+                    FgOutcome::Exited(code) => {
+                        self.exit_code = code;
+                        -> $Done
+                    }
+                    FgOutcome::Stopped => {
+                        -> $Stopped
+                    }
                 }
             }
 

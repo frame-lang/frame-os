@@ -23,7 +23,10 @@
 // constructs its environment via default_env(). JobSummary + the process
 // backend are still referenced by the generated job_control.rs / job.rs.
 use crate::job_summary::JobSummary;
-use crate::process_backend::{default_backend, ProcessBackend};
+// The ProcessBackend trait + FgOutcome are declared in job.frs's prolog (so
+// they're emitted into this module via the job.rs include, and into the ring-3
+// crate too at M4). Only the per-crate default_backend() factory is imported.
+use crate::process_backend::default_backend;
 use crate::shell_env::default_env;
 
 include!(concat!(env!("OUT_DIR"), "/shell.rs"));
