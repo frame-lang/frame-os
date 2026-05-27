@@ -1340,10 +1340,21 @@ R-track refinements, and the S1–S10 bare-metal shell are all complete.
 
 - **`Shell` `.frs` reuse in ring 3** — the second half of **B4-6**. The `Parser`
   FSM already compiles for both host and ring 3 (proven by
-  `userspace_frame_parser_reuse_b4`); the full `Shell` FSM does not. The ring-3
-  interactive shell (`ish`) is hand-written raw-syscall Rust. Closing this needs
-  the `Shell`'s `std`-only actions re-implemented for ring 3. Deferred since a
-  real input device landed (B8) — the remaining lift is the action rewrite.
+  `userspace_frame_parser_reuse_b4`); the full `Shell` FSM does not. **Scoped
+  2026-05-26 — bigger + lower-value than it looks, so deliberately deferred:**
+  the hosted `Shell` FSM (`frame/shell.frs`) is a *simple lifecycle* model
+  (`$Prompting → $Parsing → $RunningBuiltin/$RunningForeground → $Exiting`) with
+  **no states for pipes or redirection**, and it is **std-coupled** — its actions
+  use `std::io`/`println!`/`std::path::PathBuf` and it **spawns via
+  `std::process::Command`** (through JobControl). Meanwhile ring-3 `ish` (740 LOC,
+  hand-written flat dispatch) already delivers **S1–S10** (pipes, redirection,
+  full job control) — a *superset* of what the Shell FSM models. So reusing the
+  Shell FSM in ring 3 is either (a) a minimal *demonstration* shell that discards
+  ish's S1–S10, or (b) a major FSM redesign (grow Shell to ish's feature set +
+  re-home all spawning onto fork/exec syscalls). Both risk the working `ish` for
+  debatable benefit; the `Parser` reuse already makes the "one source, two
+  targets" point. Revisit only if the Shell FSM itself is grown to model the
+  richer feature set (a design effort, not a port).
 - **H-track (hosted shell) beyond H0** — H0 (minimum viable shell on Linux/macOS/
   Windows) is done; **H1** (builtins), **H2** (job control + Ctrl-C kills a
   running child via `signal-hook`/`ctrlc`), and later milestones are the parallel
