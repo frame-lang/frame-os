@@ -174,6 +174,7 @@ enum DiagramMode {
 const DIAGRAMS: &[(&str, &str)] = &[
     ("shell.frs", "shell.svg"),
     ("parser.frs", "parser.svg"),
+    ("pipeline.frs", "pipeline.svg"),
     ("job.frs", "job.svg"),
     ("job_control.frs", "job_control.svg"),
     ("kernel.frs", "kernel.svg"),

@@ -26,6 +26,7 @@ use anyhow::{anyhow, Context, Result};
 const FRAME_SYSTEMS: &[(&str, &str)] = &[
     ("shell", "shell.frs"),
     ("parser", "parser.frs"),
+    ("pipeline", "pipeline.frs"),
     ("job", "job.frs"),
     ("job_control", "job_control.frs"),
 ];

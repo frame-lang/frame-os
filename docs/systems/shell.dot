@@ -33,6 +33,15 @@ $&gt;()<br ALIGN="LEFT"/>
             </font></td></tr>
         </table>
     > margin=0 shape=none]
+    RunningPipeline [label = <
+        <table CELLBORDER="0" CELLPADDING="5" style="rounded">
+            <tr><td><b>RunningPipeline</b></td></tr>
+            <hr/>
+            <tr><td align="left"><font point-size="10">
+$&gt;()<br ALIGN="LEFT"/>
+            </font></td></tr>
+        </table>
+    > margin=0 shape=none]
     RunningForeground [label = <
         <table CELLBORDER="0" CELLPADDING="5" style="rounded">
             <tr><td><b>RunningForeground</b></td></tr>
@@ -57,6 +66,10 @@ $&gt;()<br ALIGN="LEFT"/>is_done()<br ALIGN="LEFT"/>
     Prompting -> Exiting [label=" eof "]
     Parsing -> Prompting [label=" $> "]
     Parsing -> Prompting [label=" $> "]
+    Parsing -> Prompting [label=" $> "]
+    Parsing -> RunningPipeline [label=" $> "]
+    Parsing -> Prompting [label=" $> "]
+    Parsing -> Prompting [label=" $> "]
     Parsing -> RunningForeground [label=" $> "]
     Parsing -> Prompting [label=" $> "]
     Parsing -> RunningForeground [label=" $> "]
@@ -65,6 +78,7 @@ $&gt;()<br ALIGN="LEFT"/>is_done()<br ALIGN="LEFT"/>
     Parsing -> Prompting [label=" $> "]
     Parsing -> RunningBuiltin [label=" $> "]
     RunningBuiltin -> Prompting [label=" $> "]
+    RunningPipeline -> Prompting [label=" $> "]
     RunningForeground -> Prompting [label=" $> "]
 }
 

@@ -96,9 +96,36 @@ Terminal state. Tokenization failed due to an unterminated quoted string. All fu
 |---|---|---|---|
 | `consume` | `c: char` | `()` | Feed one character to the scanner |
 | `finalize` | `()` | `()` | Tell the scanner there are no more characters |
-| `tokens` | `()` | `Vec<String>` | Accumulated tokens (clones; ownership transfers to the caller) |
+| `tokens` | `()` | `Vec<String>` | Accumulated tokens as flat literal strings (legacy view; clones) |
+| `typed_tokens` | `()` | `Vec<Token>` | Accumulated tokens as operator-aware `Token`s (M1; clones) |
 | `error` | `()` | `String` | Failure description, empty string if no failure |
 | `is_complete` | `()` | `bool` | Whether the scanner has reached a terminal state (`$Done` or `$Failed`) |
+
+### Typed tokens (M1, H↔B parity)
+
+The scanner tags shell operators. A completed **unquoted** token equal to an
+operator string becomes that operator; a quoted token, or any other text, is a
+`Word`. Operator recognition lives in the Parser precisely *because* it is a
+scanner-mode decision — only the scanner knows whether a `|` came from inside
+quotes (a literal `Word`) or not (the `Pipe` operator).
+
+```rust
+pub enum Token { Word(String), Pipe, RedirIn, RedirOut, RedirAppend, Amp }
+//                              |        <         >          >>         &
+```
+
+Two query surfaces over the same `Vec<Token>` domain:
+
+- **`typed_tokens()`** — the structured view, consumed by the `Pipeline` FSM,
+  which folds the token stream into a command pipeline + redirection.
+- **`tokens()`** — the legacy flat view. Reconstructs each token's literal text,
+  so existing consumers (the bare-metal `ish`, which still reads `tokens()`) are
+  byte-identical and unaffected until they migrate to the `Pipeline` FSM (M3/M4).
+
+Operators must be their own whitespace-separated token (`a|b` is one `Word`,
+matching `ish`'s parser). `Token` is declared in the `.frs` native prolog, so it
+is emitted once at the top level of the generated file and shared by every crate
+that compiles `parser.frs` (hosted `shell` + bare-metal `user`).
 
 `consume(c)` always succeeds at the type level. State-dependent dispatch decides what the char means.
 
@@ -122,7 +149,7 @@ let tokens = p.tokens();
 
 | Field | Type | Initial value | Purpose | Lifetime |
 |---|---|---|---|---|
-| `tokens` | `Vec<String>` | `Vec::new()` | Accumulated tokens | System lifetime — grows as tokens complete |
+| `tokens` | `Vec<Token>` | `Vec::new()` | Accumulated tokens (operator-aware; exposed flat via `tokens()`, structured via `typed_tokens()`) | System lifetime — grows as tokens complete |
 | `current` | `String` | `String::new()` | Token under construction | Cleared on each token boundary |
 | `open_quote` | `char` | `'\0'` | Which quote character opened `$InQuotedString` | Set in `$ReadingWord` on `"`/`'`; cleared on matching close |
 | `error_msg` | `String` | `String::new()` | Failure description | Set on transition to `$Failed`; empty otherwise |

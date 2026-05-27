@@ -15,7 +15,7 @@ targets* — currently proven only for `Parser`.
 | Shell control flow | `Shell` FSM (`$Prompting/$Parsing/$RunningBuiltin/$RunningForeground/$Exiting`) | **hand-written flat dispatch** (NOT the Shell FSM) |
 | Job control | `JobControl` + `Job` FSMs, spawn via `std::process` | `IshJobs` FSM (flat job table), fork/exec/wait via **syscalls** |
 | Builtins | `Builtin` enum, `std::fs`/`std::env` | hand-written, syscalls |
-| Pipes `\|` / redirection `<` `>` `>>` | **not modeled** anywhere (Parser treats as words) | implemented natively in `ish` (`parse_redirs`, `run_pipeline` + `dup2`) |
+| Pipes `\|` / redirection `<` `>` `>>` | **`Pipeline` FSM** (M1 ✅) — Parser tags operators, Pipeline parses the grammar; native `exec.rs` runs it | implemented natively in `ish` (`parse_redirs`, `run_pipeline` + `dup2`) — migrates onto the shared `Pipeline` FSM at M3/M4 |
 
 **The crux.** The execution *mechanism* differs (sibling `std::process` spawn vs
 hierarchical syscall fork/exec/wait), but the *coordination* (parse → classify →
@@ -37,12 +37,32 @@ Two genuine modeling gaps beyond the seam:
 
 Sequenced lowest-risk-first; every milestone leaves both builds green.
 
-- **M1 — Hosted feature parity (H1→H3, FSM-driven).** Bring the hosted shell up to
-  the bare-metal feature set *on the hosted side first* (lower risk: `std` + the
-  existing e2e tests + CI matrix). Confirm/complete builtins (H1), external
-  foreground (H2), job control (H3: `&`/`fg`/`bg`/`jobs`/`kill`/Ctrl-Z), then add
-  **pipes + redirection** to the hosted `Shell` (the first cross-cutting modeling
-  decision — see Risks). Validate: `shell/tests/e2e.rs` + behavioral + CI matrix.
+- **M1 — Hosted feature parity (H1→H3, FSM-driven). ✅ DONE 2026-05-27.** The
+  hosted shell was already at H0–H3 (builtins, external foreground, job control:
+  `&`/`fg`/`bg`/`jobs`/`kill`/Ctrl-Z) — confirmed green (159 tests) at M1 start.
+  The one gap was **pipes + redirection**, now added FSM-first:
+  - **`Parser` tags operators** (`parser.frs`): unquoted `|` `<` `>` `>>` `&`
+    become typed `Token`s; quoted `"|"` stays a `Word` (operator-vs-word is a
+    scanner-mode decision, so it belongs in the Parser). New `typed_tokens()`
+    query; legacy `tokens(): Vec<String>` reconstructs literals so `ish` is
+    byte-identical (migrates at M3/M4). +7 Parser tests.
+  - **New `Pipeline` FSM** (`pipeline.frs`): folds the token stream into a
+    `Vec<Command>` (stages + `< > >>` redirs) + background flag, owning the
+    grammar with `$ReadingCommand`/`$ExpectingTarget`/`$TrailingAmp`/`$Done`/
+    `$Error` states. 16 behavioral tests + state-graph snapshot + diagram + doc.
+    (Decision recorded under Risks: option (a)+(b) — Parser emits typed tokens
+    **and** a dedicated Pipeline FSM parses them, per the user's call.)
+  - **Execution mechanism** stays native (`shell/src/exec.rs`, std::process):
+    `Shell` gains `$RunningPipeline` (foreground external pipelines via OS
+    pipes); single-command `< > >>` runs inline; builtin `> f` uses a Unix
+    fd-redirect guard so `echo hi > f` writes the file (user-visible parity with
+    `ish`, where echo is `/bin/echo`). 13 new E2E tests.
+  - Validated: full host suite green, clippy (host + kernel both configs + user
+    crate) clean, fmt clean, check-diagrams clean. `ish` unchanged + still
+    builds bare-metal.
+
+  **The cross-cutting modeling decision is now settled** (see Risks): Parser
+  emits typed tokens + a dedicated `Pipeline` FSM consumes them.
 
 - **M2 — Process-backend seam.** Abstract `Job`'s spawn/poll/signal (`std::process`)
   behind a native backend interface, the `Shell`/`JobControl`/`Job` FSMs unchanged.
@@ -63,10 +83,15 @@ Sequenced lowest-risk-first; every milestone leaves both builds green.
   bare metal" result.
 
 ## Risks / open design decisions
-- **Pipes/redirection modeling (M1).** Options: (a) `Parser` emits typed operator
-  tokens + a `Shell`-side pipeline/redirection struct (cleanest, most Frame); (b)
-  keep parsing native, driven by the FSM (less FSM, faster). Decide at M1 start;
-  prefer (a) for the thesis, but bound the scope.
+- **Pipes/redirection modeling (M1). ✅ DECIDED 2026-05-27.** `Parser` emits typed
+  operator tokens **and** a dedicated `Pipeline` FSM parses them into a
+  `Vec<Command>` (option (a) + a second FSM, the user's call — "maximal Frame").
+  The grouping is a genuine token-driven FSM (`$ReadingCommand`/`$ExpectingTarget`/
+  `$TrailingAmp`), not a native fold. Execution stays native (`exec.rs`). Note: the
+  `Pipeline` event is `consume(kind: TokenKind, text: String)` rather than
+  `consume(t: Token)` because framec moves a non-Copy enum event-param out of a
+  shared ref (won't compile) — a Copy tag + a cloned String is the supported
+  shape (documented in `pipeline.frs`).
 - **Execution model asymmetry.** Hosted = sibling processes (`std::process`);
   ring-3 = hierarchical fork→exec→wait. The backend seam must express both behind
   one interface the FSM drives — the hard part of M2/M3.

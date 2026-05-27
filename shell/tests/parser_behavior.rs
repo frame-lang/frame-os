@@ -26,7 +26,7 @@
 //   $Failed + consume(c)              — ignored (terminal)
 //   $Failed + finalize()              — idempotent (terminal)
 
-use frame_os_shell::Parser;
+use frame_os_shell::{Parser, Token};
 
 /// Helper: feed an entire string through Parser and finalize.
 fn parse(input: &str) -> Parser {
@@ -317,4 +317,114 @@ fn parses_many_short_tokens() {
     assert_eq!(toks.len(), 10);
     assert_eq!(toks[0], "a");
     assert_eq!(toks[9], "j");
+}
+
+// ---------------------------------------------------------------------------
+// Typed tokens (M1) — operator recognition + legacy reconstruction.
+//
+// typed_tokens() tags |, <, >, >>, & as operators when they appear as bare
+// (unquoted) whitespace-separated tokens; everything else is a Word. The
+// legacy tokens() view must keep reconstructing literal text so the bare-metal
+// `ish` (which still reads tokens()) is byte-identical.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn typed_tokens_tags_pipe_operator() {
+    let mut p = parse("ls | grep frame");
+    assert_eq!(
+        p.typed_tokens(),
+        vec![
+            Token::Word("ls".to_string()),
+            Token::Pipe,
+            Token::Word("grep".to_string()),
+            Token::Word("frame".to_string()),
+        ]
+    );
+}
+
+#[test]
+fn typed_tokens_tags_redirection_operators() {
+    let mut p = parse("cat < in > out >> log");
+    assert_eq!(
+        p.typed_tokens(),
+        vec![
+            Token::Word("cat".to_string()),
+            Token::RedirIn,
+            Token::Word("in".to_string()),
+            Token::RedirOut,
+            Token::Word("out".to_string()),
+            Token::RedirAppend,
+            Token::Word("log".to_string()),
+        ]
+    );
+}
+
+#[test]
+fn typed_tokens_tags_trailing_ampersand() {
+    let mut p = parse("sleep 5 &");
+    assert_eq!(
+        p.typed_tokens(),
+        vec![
+            Token::Word("sleep".to_string()),
+            Token::Word("5".to_string()),
+            Token::Amp,
+        ]
+    );
+}
+
+#[test]
+fn quoted_operator_stays_a_word() {
+    // The whole point of putting operator recognition in the scanner: a quoted
+    // "|" is a literal Word, not the pipe operator.
+    let mut p = parse(r#"echo "|" '>' "&""#);
+    assert_eq!(
+        p.typed_tokens(),
+        vec![
+            Token::Word("echo".to_string()),
+            Token::Word("|".to_string()),
+            Token::Word(">".to_string()),
+            Token::Word("&".to_string()),
+        ]
+    );
+}
+
+#[test]
+fn operator_chars_inside_a_word_are_not_operators() {
+    // Operators must be their own whitespace-separated token. `a|b` is one
+    // Word (matching ish's parser), not Pipe.
+    let mut p = parse("a|b c>d");
+    assert_eq!(
+        p.typed_tokens(),
+        vec![
+            Token::Word("a|b".to_string()),
+            Token::Word("c>d".to_string())
+        ]
+    );
+}
+
+#[test]
+fn legacy_tokens_reconstructs_operator_literals() {
+    // tokens() (the flat view ish reads) is byte-identical to the pre-M1
+    // behavior: operators come back as their literal strings.
+    let mut p = parse("ls | grep x > out &");
+    assert_eq!(
+        p.tokens(),
+        vec![
+            "ls".to_string(),
+            "|".to_string(),
+            "grep".to_string(),
+            "x".to_string(),
+            ">".to_string(),
+            "out".to_string(),
+            "&".to_string(),
+        ]
+    );
+}
+
+#[test]
+fn legacy_tokens_reconstructs_quoted_operator_literal() {
+    // A quoted "|" reconstructs to "|" in the flat view too — so ish's existing
+    // (quote-blind) behavior is unchanged.
+    let mut p = parse(r#"echo "|""#);
+    assert_eq!(p.tokens(), vec!["echo".to_string(), "|".to_string()]);
 }

@@ -1,0 +1,239 @@
+// frame/pipeline.frs
+//
+// Pipeline — command-line grammar over the Parser's tokens (M1, H↔B parity).
+// The Parser FSM tokenizes characters into `Token`s; this FSM folds that token
+// stream into the structure a shell actually executes:
+//
+//     pipeline := command ('|' command)* '&'?
+//     command  := word+ ( ('<' | '>' | '>>') word )*
+//
+// i.e. one or more commands joined by pipes, each command being a run of words
+// plus optional input/output redirection, and an optional trailing `&` for
+// background launch.
+//
+//   `ls -l | grep frame > out &`
+//        → commands = [ {words:[ls,-l]},
+//                       {words:[grep,frame], redir_out:Some("out")} ]
+//          background = true
+//
+// Both shells share this one grammar: the hosted `Shell` (M1) drives it
+// directly; the bare-metal `ish` migrates onto it in M3/M4. The *execution
+// mechanism* still differs per target (std::process pipes vs. syscall
+// fork/exec/dup2) — that is the native side. This FSM owns only the
+// coordination/structure, exactly the FSM-owns-logic / native-owns-mechanism
+// split the rest of Frame OS follows.
+//
+// Feeding it: a token is delivered as a (TokenKind, text) pair. The Parser's
+// `Token` enum carries its word text inline (`Word(String)`); the driver splits
+// each `Token` into its Copy `TokenKind` tag plus the word text (empty for
+// operators) and calls `consume(kind, text)`. (Why split rather than pass the
+// `Token` itself: framec's event machinery moves a non-Copy enum param out of a
+// shared reference, which won't compile — a Copy tag + a String the codegen
+// clones is the supported shape.)
+//
+// State graph (consume(kind,..) events; finalize() drives to a terminal state):
+//
+//   ┌──────────────────────────────────────────────────────────────────┐
+//   │ $ReadingCommand (initial) — accumulating words into the current   │
+//   │ command.                                                           │
+//   │   Word          → push word, stay                                  │
+//   │   < | > | >>    → record pending redirection, → $ExpectingTarget   │
+//   │   |             → commit current command, start a new one, stay    │
+//   │                   (error if the command so far has no words)       │
+//   │   &             → set background, → $TrailingAmp                    │
+//   │   finalize()    → commit current command, → $Done                  │
+//   │                   (error if a trailing `|` left an empty command)  │
+//   └──────────────────────────────────────────────────────────────────┘
+//                              │ < | > | >>
+//                              ▼
+//   ┌──────────────────────────────────────────────────────────────────┐
+//   │ $ExpectingTarget — the previous token was a redirection operator; │
+//   │ the next token must be the target filename.                        │
+//   │   Word          → set redir target on current command,             │
+//   │                   → $ReadingCommand                                │
+//   │   any operator  → error ("expected filename after redirection")    │
+//   │   finalize()    → error ("missing redirection target")             │
+//   └──────────────────────────────────────────────────────────────────┘
+//
+//   ┌──────────────────────────────────────────────────────────────────┐
+//   │ $TrailingAmp — `&` was seen; it must be the last token.           │
+//   │   any token     → error ("unexpected token after &")               │
+//   │   finalize()    → commit current command, → $Done                  │
+//   └──────────────────────────────────────────────────────────────────┘
+//
+//   $Done   (terminal) — commands()/is_background() hold the parsed pipeline.
+//   $Error  (terminal) — error() holds the syntax-error message.
+//
+// Why a state machine: a command line is a small grammar, and "what may a
+// token mean here" is exactly state-dependent — a `<` starts a redirection in
+// $ReadingCommand but is a syntax error in $ExpectingTarget (two operators in a
+// row), and *any* token after `&` is illegal. Per-state handlers make those
+// legal-move boundaries structural rather than a tangle of native flags.
+
+@@[target("rust")]
+
+// The Copy tag of a Parser `Token`, used as the Pipeline's consume() kind. The
+// word text travels alongside it as a separate String param. Declared in the
+// native prolog so it is emitted once at the top level of the generated file.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum TokenKind {
+    Word,
+    Pipe,        // |
+    RedirIn,     // <
+    RedirOut,    // >
+    RedirAppend, // >>
+    Amp,         // &
+}
+
+// One stage of a pipeline: a command word list plus its optional redirections.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Command {
+    pub words: Vec<String>,
+    pub redir_in: Option<String>,
+    pub redir_out: Option<String>,
+    pub append: bool, // true → >> (append), false → > (truncate)
+}
+
+@@system Pipeline {
+    interface:
+        // Feed one token: its Copy kind tag + its word text ("" for operators).
+        consume(kind: TokenKind, text: String)
+        finalize()
+        // Interface defaults read the domain. Valid once is_complete() is true
+        // (the final command is committed on finalize()).
+        commands(): Vec<Command> = self.commands.clone()
+        is_background(): bool = self.background
+        error(): String = self.error_msg.clone()
+        is_complete(): bool = false
+
+    machine:
+        $ReadingCommand {
+            consume(kind: TokenKind, text: String) {
+                match kind {
+                    TokenKind::Word => {
+                        self.current.words.push(text);
+                    }
+                    TokenKind::RedirIn => {
+                        self.pending_input = true;
+                        -> $ExpectingTarget
+                    }
+                    TokenKind::RedirOut => {
+                        self.pending_input = false;
+                        self.current.append = false;
+                        -> $ExpectingTarget
+                    }
+                    TokenKind::RedirAppend => {
+                        self.pending_input = false;
+                        self.current.append = true;
+                        -> $ExpectingTarget
+                    }
+                    TokenKind::Pipe => {
+                        if self.current.words.is_empty() {
+                            self.error_msg = "syntax error near '|'".to_string();
+                            -> $Error
+                        } else {
+                            self.commit_command();
+                        }
+                    }
+                    TokenKind::Amp => {
+                        self.background = true;
+                        -> $TrailingAmp
+                    }
+                }
+            }
+
+            finalize() {
+                if self.current.words.is_empty() {
+                    if self.commands.is_empty() {
+                        // Empty input — a valid empty pipeline.
+                        -> $Done
+                    } else {
+                        // A `|` with nothing after it.
+                        self.error_msg = "syntax error near '|'".to_string();
+                        -> $Error
+                    }
+                } else {
+                    self.commit_command();
+                    -> $Done
+                }
+            }
+        }
+
+        $ExpectingTarget {
+            consume(kind: TokenKind, text: String) {
+                match kind {
+                    TokenKind::Word => {
+                        if self.pending_input {
+                            self.current.redir_in = Some(text);
+                        } else {
+                            self.current.redir_out = Some(text);
+                        }
+                        -> $ReadingCommand
+                    }
+                    _ => {
+                        self.error_msg =
+                            "expected filename after redirection operator".to_string();
+                        -> $Error
+                    }
+                }
+            }
+
+            finalize() {
+                self.error_msg = "missing redirection target".to_string();
+                -> $Error
+            }
+        }
+
+        $TrailingAmp {
+            consume(kind: TokenKind, text: String) {
+                self.error_msg = "unexpected token after '&'".to_string();
+                -> $Error
+            }
+
+            finalize() {
+                // `&` alone (no command) leaves commands empty — a no-op the
+                // shell ignores. Otherwise commit the backgrounded command.
+                if !self.current.words.is_empty() {
+                    self.commit_command();
+                }
+                -> $Done
+            }
+        }
+
+        // Terminal states. Per V4 explicit-only-forwarding, unhandled events
+        // are silently ignored, so only is_complete() needs overriding.
+        $Done {
+            is_complete(): bool { @@:(true) }
+        }
+
+        $Error {
+            is_complete(): bool { @@:(true) }
+        }
+
+    actions:
+        // Push the command under construction onto the pipeline and start a
+        // fresh one. Shared by the `|` handler and both finalize paths.
+        commit_command() {
+            self.commands.push(self.current.clone());
+            self.current = Command::default();
+        }
+
+    domain:
+        // Completed commands in the pipeline (left to right). The command under
+        // construction is committed here on `|` and on finalize().
+        commands: Vec<Command> = Vec::new()
+
+        // The command being accumulated.
+        current: Command = Command::default()
+
+        // True once a trailing `&` is seen.
+        background: bool = false
+
+        // In $ExpectingTarget: does the pending redirection target apply to
+        // input (`<`) or output (`>`/`>>`)? The append flag is already recorded
+        // on `current` when the operator was consumed.
+        pending_input: bool = false
+
+        // Syntax-error message, set on transition to $Error. Empty otherwise.
+        error_msg: String = String::new()
+}

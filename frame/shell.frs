@@ -1,13 +1,14 @@
 // frame/shell.frs
 //
-// Frame OS Shell — H3 Step 3 (JobControl integration + background jobs).
+// Frame OS Shell — M1 (H↔B parity): Pipeline FSM + pipes/redirection.
 //
-// State graph at H3 — 5 states, plus Entry → $Prompting:
+// State graph — 6 states, plus Entry → $Prompting:
 //
 //   $Prompting ── line(exit/quit) ──────────────────────────────► $Exiting
 //                                                                  (terminal)
 //   $Prompting ── line(builtin) ──► $Parsing ──► $RunningBuiltin ──► $Prompting
 //   $Prompting ── line(extern, no &) ► $Parsing ──► $RunningForeground ──► $Prompting
+//   $Prompting ── line(pipeline a|b) ► $Parsing ──► $RunningPipeline ──► $Prompting
 //   $Prompting ── line(extern, ends &) ► $Parsing ── spawn_background ──► $Prompting
 //   $Prompting ── eof() ──────────────────────────────────────► $Exiting
 //   $Prompting ── interrupt() ──► $Prompting   (stay — line was cleared)
@@ -15,6 +16,20 @@
 // $RunningExternal (H2) is gone. $RunningForeground replaces it and
 // delegates to JobControl, which holds Vec<Job> and the FG/BG/Stopped
 // bookkeeping.
+//
+// M1 — pipes + redirection (H↔B parity). $Parsing now runs two FSMs in
+// sequence: Parser (chars → typed tokens) then Pipeline (tokens → a
+// Vec<Command> pipeline + background flag, owning the | / < > >> / & grammar).
+// The execution *mechanism* stays native (shell/src/exec.rs, std::process):
+//   - a multi-stage pipeline (a | b) runs foreground in the new
+//     $RunningPipeline state (external stages only, like `ish`);
+//   - a single external command with `< > >>` runs foreground (or detached for
+//     `&`) via exec.rs;
+//   - a single builtin with `> f` / `>> f` runs in $RunningBuiltin with stdout
+//     temporarily redirected to the file (Unix fd redirect), so e.g.
+//     `echo hi > f` writes the file — user-visible parity with `ish`, where
+//     `echo` is an external /bin program.
+// The Pipeline FSM is shared: the bare-metal `ish` migrates onto it at M3/M4.
 //
 // Ctrl-Z / SIGTSTP handling: NOT a Frame event. shell/src/signals.rs
 // installs a SIGTSTP handler that sets a global flag. JobControl's
@@ -73,6 +88,7 @@
 
         $Parsing {
             $>() {
+                // Stage 1: tokenize (Parser FSM), tagging operators.
                 let mut p = @@Parser();
                 for c in self.current_line.chars() {
                     p.consume(c);
@@ -83,27 +99,75 @@
                     -> $Prompting
                 }
 
-                // Detect trailing `&` for background launch.
-                let mut tokens = p.tokens();
-                let background = tokens.last().map(|s| s.as_str()) == Some("&");
-                if background {
-                    tokens.pop();
+                // Stage 2: fold the typed tokens into a command pipeline
+                // (Pipeline FSM). It owns the | / < > >> / & grammar; we own
+                // the execution mechanism below (native std::process). The
+                // bare-metal `ish` will share this exact FSM at M3/M4.
+                let mut pl = @@Pipeline();
+                for tok in p.typed_tokens() {
+                    let (kind, text) = match tok {
+                        Token::Word(w) => (TokenKind::Word, w),
+                        Token::Pipe => (TokenKind::Pipe, String::new()),
+                        Token::RedirIn => (TokenKind::RedirIn, String::new()),
+                        Token::RedirOut => (TokenKind::RedirOut, String::new()),
+                        Token::RedirAppend => (TokenKind::RedirAppend, String::new()),
+                        Token::Amp => (TokenKind::Amp, String::new()),
+                    };
+                    pl.consume(kind, text);
+                }
+                pl.finalize();
+                if !pl.error().is_empty() {
+                    println!("frame-os: {}", pl.error());
+                    -> $Prompting
                 }
 
-                self.current_builtin = classify(tokens);
+                let commands = pl.commands();
+                let background = pl.is_background();
+
+                if commands.is_empty() {
+                    // Lone `&` or otherwise empty — nothing to run.
+                    -> $Prompting
+                }
+
+                if commands.len() >= 2 {
+                    // A pipeline of external commands. Runs in the foreground,
+                    // synchronously (a trailing `&` on a pipeline is ignored —
+                    // same as `ish`). Builtins are not piped.
+                    self.current_pipeline = commands;
+                    self.history.push(self.current_line.clone());
+                    -> $RunningPipeline
+                }
+
+                // Single command. Classify its words; carry its redirection.
+                let cmd = commands[0].clone();
+                let has_redir = cmd.redir_in.is_some() || cmd.redir_out.is_some();
+                self.current_builtin = classify(cmd.words.clone());
                 let unknown = is_unknown(&self.current_builtin);
                 let fg = is_fg(&self.current_builtin);
 
                 if unknown && background {
                     // Background external command. Spawn and stay $Prompting.
-                    let (cmd, args) = unknown_parts(&self.current_builtin);
-                    self.job_control.spawn_background(cmd, args);
+                    let (c, a) = unknown_parts(&self.current_builtin);
+                    if has_redir {
+                        crate::exec::spawn_background_redirected(&cmd, &self.cwd);
+                    } else {
+                        self.job_control.spawn_background(c, a);
+                    }
+                    self.history.push(self.current_line.clone());
+                    -> $Prompting
+                } else if unknown && has_redir {
+                    // Foreground external command WITH redirection: run it
+                    // natively (synchronous) so the redirected fds are wired,
+                    // then return to the prompt. (Non-redirected foreground
+                    // externals still go through JobControl so job control /
+                    // Ctrl-C work — the branch below.)
+                    crate::exec::run_foreground_redirected(&cmd, &self.cwd);
                     self.history.push(self.current_line.clone());
                     -> $Prompting
                 } else if unknown {
-                    // Foreground external command.
-                    let (cmd, args) = unknown_parts(&self.current_builtin);
-                    self.job_control.spawn_foreground(cmd, args);
+                    // Foreground external command (no redirection).
+                    let (c, a) = unknown_parts(&self.current_builtin);
+                    self.job_control.spawn_foreground(c, a);
                     self.last_foreground_id = self.job_control.foreground_id();
                     -> $RunningForeground
                 } else if fg && background {
@@ -140,6 +204,11 @@
                     println!("frame-os: background builtins are not supported");
                     -> $Prompting
                 } else {
+                    // Builtin. Carry any output redirection so $RunningBuiltin
+                    // can apply it around execute() (Unix fd redirect — so
+                    // e.g. `pwd > f` / `echo hi > f` write the file).
+                    self.current_redir_out = cmd.redir_out.clone();
+                    self.current_append = cmd.append;
                     -> $RunningBuiltin
                 }
             }
@@ -152,19 +221,50 @@
 
         $RunningBuiltin {
             $>() {
-                execute(
-                    &self.current_builtin,
-                    &mut self.cwd,
-                    &self.history,
-                    &mut self.job_control,
-                );
+                // Apply output redirection if the command had `> f` / `>> f`.
+                // The guard repoints stdout (fd 1) at the file and restores it
+                // on drop; builtins write via println! so their output lands in
+                // the file. None when there's no redirection (or off-Unix).
+                match self.current_redir_out.clone() {
+                    Some(path) => {
+                        let _guard =
+                            crate::exec::redirect_stdout(&path, self.current_append, &self.cwd);
+                        execute(
+                            &self.current_builtin,
+                            &mut self.cwd,
+                            &self.history,
+                            &mut self.job_control,
+                        );
+                        // _guard drops here, flushing + restoring stdout.
+                    }
+                    None => {
+                        execute(
+                            &self.current_builtin,
+                            &mut self.cwd,
+                            &self.history,
+                            &mut self.job_control,
+                        );
+                    }
+                }
+                self.current_redir_out = None;
                 self.history.push(self.current_line.clone());
                 -> $Prompting
             }
         }
 
-        // $RunningBuiltin: same transient story as $Parsing — only $>
-        // matters.
+        $RunningPipeline {
+            $>() {
+                // Run the multi-stage pipeline of external commands in the
+                // foreground (native std::process, OS pipes between stages).
+                // The Pipeline FSM already validated the structure.
+                crate::exec::run_foreground_pipeline(&self.current_pipeline, &self.cwd);
+                self.current_pipeline = Vec::new();
+                -> $Prompting
+            }
+        }
+
+        // $RunningBuiltin / $RunningPipeline: same transient story as
+        // $Parsing — only $> matters.
 
         $RunningForeground {
             $>() {
@@ -243,6 +343,15 @@
 
         // The classified Builtin from the most recent parse.
         current_builtin: Builtin = Builtin::Empty
+
+        // The pipeline stages to run in $RunningPipeline (set in $Parsing when
+        // the line parsed to two or more `|`-joined commands).
+        current_pipeline: Vec<Command> = Vec::new()
+
+        // Output redirection (`> f` / `>> f`) carried from $Parsing to
+        // $RunningBuiltin for a single builtin command. None when absent.
+        current_redir_out: Option<String> = None
+        current_append: bool = false
 
         // Job id of the most recently spawned foreground job. Stored so
         // $RunningForeground.$> can find the exit info in jobs() after

@@ -11,10 +11,11 @@
 // The Frame-generated code is included via the frame_systems module.
 
 pub mod builtin;
+pub mod exec;
 pub mod frame_systems;
 pub mod job_summary;
 pub mod signals;
 
 pub use builtin::Builtin;
-pub use frame_systems::{Job, JobControl, Parser, Shell};
+pub use frame_systems::{Command, Job, JobControl, Parser, Pipeline, Shell, Token, TokenKind};
 pub use job_summary::JobSummary;

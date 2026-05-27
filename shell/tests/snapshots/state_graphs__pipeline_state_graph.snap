@@ -1,0 +1,72 @@
+---
+source: shell/tests/state_graphs.rs
+expression: dot
+---
+digraph Pipeline {
+    compound=true
+    node [color="deepskyblue4" style="rounded, filled" fillcolor="azure"]
+    edge[color="red"]
+
+    Entry[width=0.2 shape="circle" style="filled" fillcolor="black" label=""]
+    Entry -> ReadingCommand
+
+    ReadingCommand [label = <
+        <table CELLBORDER="0" CELLPADDING="5" style="rounded">
+            <tr><td><b>ReadingCommand</b></td></tr>
+            <hr/>
+            <tr><td align="left"><font point-size="10">
+consume(kind: TokenKind, text: String)<br ALIGN="LEFT"/>finalize()<br ALIGN="LEFT"/>
+            </font></td></tr>
+        </table>
+    > margin=0 shape=none]
+    ExpectingTarget [label = <
+        <table CELLBORDER="0" CELLPADDING="5" style="rounded">
+            <tr><td><b>ExpectingTarget</b></td></tr>
+            <hr/>
+            <tr><td align="left"><font point-size="10">
+consume(kind: TokenKind, text: String)<br ALIGN="LEFT"/>finalize()<br ALIGN="LEFT"/>
+            </font></td></tr>
+        </table>
+    > margin=0 shape=none]
+    TrailingAmp [label = <
+        <table CELLBORDER="0" CELLPADDING="5" style="rounded">
+            <tr><td><b>TrailingAmp</b></td></tr>
+            <hr/>
+            <tr><td align="left"><font point-size="10">
+consume(kind: TokenKind, text: String)<br ALIGN="LEFT"/>finalize()<br ALIGN="LEFT"/>
+            </font></td></tr>
+        </table>
+    > margin=0 shape=none]
+    Done [label = <
+        <table CELLBORDER="0" CELLPADDING="5" style="rounded">
+            <tr><td><b>Done</b></td></tr>
+            <hr/>
+            <tr><td align="left"><font point-size="10">
+is_complete()<br ALIGN="LEFT"/>
+            </font></td></tr>
+        </table>
+    > margin=0 shape=none]
+    Error [label = <
+        <table CELLBORDER="0" CELLPADDING="5" style="rounded">
+            <tr><td><b>Error</b></td></tr>
+            <hr/>
+            <tr><td align="left"><font point-size="10">
+is_complete()<br ALIGN="LEFT"/>
+            </font></td></tr>
+        </table>
+    > margin=0 shape=none]
+
+    ReadingCommand -> ExpectingTarget [label=" consume "]
+    ReadingCommand -> ExpectingTarget [label=" consume "]
+    ReadingCommand -> ExpectingTarget [label=" consume "]
+    ReadingCommand -> Error [label=" consume "]
+    ReadingCommand -> TrailingAmp [label=" consume "]
+    ReadingCommand -> Done [label=" finalize "]
+    ReadingCommand -> Error [label=" finalize "]
+    ReadingCommand -> Done [label=" finalize "]
+    ExpectingTarget -> ReadingCommand [label=" consume "]
+    ExpectingTarget -> Error [label=" consume "]
+    ExpectingTarget -> Error [label=" finalize "]
+    TrailingAmp -> Error [label=" consume "]
+    TrailingAmp -> Done [label=" finalize "]
+}

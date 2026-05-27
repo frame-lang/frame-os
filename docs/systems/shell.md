@@ -9,7 +9,7 @@
 | Source file | [`../../frame/shell.frs`](../../frame/shell.frs) |
 | State diagram | [`shell.svg`](shell.svg) |
 | Instances at runtime | Exactly one per process |
-| Status | Documented (H0–H3) |
+| Status | Documented (H0–H3, M1 pipes/redirection) |
 
 ## State diagram
 
@@ -35,12 +35,13 @@ The shell is waiting for user input. The first prompt is printed by the state's 
 
 ### `$Parsing`
 
-Transient. Drives `Parser` synchronously to tokenize `domain.current_line`, classifies the resulting tokens into a `Builtin`, and transitions to one of three destinations.
+Transient. Runs two FSMs in sequence on `domain.current_line`: `Parser` (chars → typed tokens) then `Pipeline` (tokens → a `Vec<Command>` pipeline + background flag, owning the `|` `<` `>` `>>` `&` grammar — M1). It then classifies the single-command case into a `Builtin` and transitions to one of several destinations.
 
 **Transitions out:**
-- `$>()` → `$Prompting` — when `Parser` reaches `$Failed` (e.g. unterminated quote); the parse-error message is printed
-- `$>()` → `$RunningBuiltin` — when parse succeeded and the classified `Builtin` is a known variant (`Cd`, `Pwd`, `Ls`, `Cat`, `Echo`, `History`, `Help`, `Empty`)
-- `$>()` → `$RunningExternal` — when parse succeeded and the classified `Builtin` is `Unknown(cmd, args)`. H2 added this branch; H1 had `Unknown` go to `$RunningBuiltin` where `execute()` printed a "unknown command" message
+- `$>()` → `$Prompting` — when `Parser` reaches `$Failed` (unterminated quote) or `Pipeline` reports a syntax error; the message is printed. Also when the line parsed to no commands (a lone `&`) or to a backgrounded/redirected external that runs inline.
+- `$>()` → `$RunningBuiltin` — single command, classified as a known builtin (`Cd`, `Pwd`, `Ls`, `Cat`, `Echo`, `History`, `Help`, job-control builtins, `Empty`). Any `> f` / `>> f` redirection is carried along and applied in `$RunningBuiltin`.
+- `$>()` → `$RunningPipeline` — the line parsed to **two or more** `|`-joined commands (M1). Runs foreground.
+- `$>()` → `$RunningForeground` — single external command, no redirection (goes through `JobControl` so job control / Ctrl-C work). A single external command *with* redirection runs inline via `exec.rs` and returns to `$Prompting` instead.
 
 **Events handled (no transition):**
 - `line(input)` — defensively declared, unreachable in practice
@@ -60,6 +61,13 @@ Transient. Executes the classified `Builtin` (mutating `domain.cwd` if `cd`, rea
 - `interrupt()` → `$Prompting` — defensive
 - `eof()` → `$Prompting` — defensive
 - `is_done()` → returns `false`
+
+### `$RunningPipeline` (new at M1)
+
+Transient. Runs a multi-stage pipeline of external commands (`a | b | c`) in the foreground via `exec::run_foreground_pipeline`, which spawns each stage with OS pipes wiring stdout→stdin between stages (and the first/last stage's `< file` / `> file`), then waits for all stages. The `Pipeline` FSM already validated the structure; this state only runs it. Builtins are not piped (parity with `ish`).
+
+**Transitions out:**
+- `$>()` → `$Prompting` — always, after the pipeline completes
 
 ### `$RunningExternal` (new at H2)
 
@@ -259,3 +267,4 @@ Filesystem paths from the user are resolved through a single `resolve(path, &cwd
 - **2026-05-19** — H2: added `$RunningExternal` state and `eof()` event. `$Parsing.$>` now routes `Builtin::Unknown` to `$RunningExternal` (was: through `$RunningBuiltin`'s execute() as a print-only "unknown command" message). `$RunningExternal.$>` calls the new `run_external` action which spawns the child via `std::process::Command`, installs `SIG_IGN` for SIGINT so the shell survives Ctrl-C while the child receives the signal naturally, waits, restores the prior SIGINT disposition, and surfaces non-zero exit codes. `interrupt()` semantics change: `$Prompting.interrupt()` is now a no-op (was: → $Exiting); `$RunningExternal.interrupt()` calls `kill_child` and → $Prompting. The new `eof()` event handles Ctrl-D / EOF (was: collapsed into `interrupt()`). 9 new Level-6 E2E tests in `shell/tests/external_e2e.rs` (Unix-only, marked `#![cfg(unix)]` because they invoke POSIX absolute-path binaries). `libc` added as a Unix-only dependency. Total test count: 94.
 - **2026-05-19** — H3 Step 3: replaced `$RunningExternal` with `$RunningForeground` and routed external command execution through `JobControl`. Removed H2's `run_external` / `kill_child` actions and `current_child_pid` domain field (subsumed by JobControl). `$Parsing.$>` now detects trailing `&` (background launch via `JobControl.spawn_background` → `Job.spawn_detached`, which redirects child stdio to /dev/null and uses `process_group(0)` so the orphaned job doesn't hold pipes open or receive terminal Ctrl-C). `$Prompting.$>` calls `job_control.tick()` to reap done background jobs before printing the prompt. Added `last_foreground_id` and `job_control` domain fields. New native module `shell/src/signals.rs` installs a SIGTSTP handler at startup that sets a global atomic flag; JobControl's polling loop reads the flag and stops the foreground job when Ctrl-Z is delivered — no Shell-level event needed. `signal-hook` added as a Unix-only dependency. 3 new background-launch E2E tests. Total test count: 133.
 - **2026-05-19** — H3 Step 4: added five new job-control builtins (`jobs`, `fg`, `bg`, `wait`, `kill`). `Builtin` enum extended with the five variants. `classify()` recognizes the five new command names. `execute()` signature grew to `(builtin, &mut cwd, &history, &mut job_control)` so builtins can mutate the job table. `Fg` has its own dispatch path in `$Parsing.$>` because it needs to transition Shell to `$RunningForeground` (not `$RunningBuiltin`) to wait on the resumed job; the other four route through `execute()` normally. `help` builtin updated to list the new commands plus the `&` background-launch syntax. 18 new Level-6 E2E tests in `shell/tests/jobs_e2e.rs` (Unix-only) covering each builtin's happy path and usage-error paths. 6 new builtin-classify unit tests. Total test count: 151.
+- **2026-05-27** — M1 (H↔B parity): pipes + redirection. `$Parsing.$>` now runs the new `Pipeline` FSM after `Parser` (Parser tags `|` `<` `>` `>>` `&` as typed tokens; Pipeline folds them into a `Vec<Command>` + background flag, owning the grammar — replacing the old native trailing-`&` string check). Added the `$RunningPipeline` state (foreground multi-stage external pipelines via OS pipes) and the native `shell/src/exec.rs` mechanism module (foreground pipeline, single-command redirection, detached background-with-redirection, and a Unix fd-redirect guard so builtin `> f` / `>> f` writes the file). New domain fields `current_pipeline`, `current_redir_out`, `current_append`. The `Pipeline` FSM is shared source destined for `ish` reuse at M3/M4. Behavior split: pipelines are foreground-only and external-only (parity with `ish`); a single external with redirection runs inline; `cmd &` (no redirection) still goes through `JobControl`. State graph now has 6 states. 16 new `Pipeline` behavioral tests + 7 new `Parser` typed-token tests + a `pipeline_state_graph` snapshot; new E2E pipe/redirection tests. See [`pipeline.md`](pipeline.md) and [`../plans/hb_parity.md`](../plans/hb_parity.md).

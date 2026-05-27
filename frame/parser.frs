@@ -64,7 +64,64 @@
 // scanning states with explicit transitions and the diagram is
 // directly readable as the scanner's mode graph.
 
+// Typed tokens (M1, H↔B parity). The scanner now tags operators. Because
+// operator-vs-word is a *scanner-mode* decision — a bare `|` is the pipe
+// operator, but a quoted `"|"` is a literal word — recognizing operators
+// belongs in the Parser FSM (only it knows quote mode). A completed UNQUOTED
+// word is classified (`classify_word`); a quoted string is always a `Word`.
+//
+//   `a | b`       → [Word("a"), Pipe,    Word("b")]
+//   `cmd > f`     → [Word("cmd"), RedirOut, Word("f")]
+//   `echo "|"`    → [Word("echo"), Word("|")]   ← quoted, stays a Word
+//
+// Two query surfaces over the same `Vec<Token>`:
+//   - typed_tokens(): Vec<Token>  — the new structured view, consumed by the
+//     Pipeline FSM (which builds the command pipeline + redirection).
+//   - tokens(): Vec<String>       — the legacy flat view. Reconstructs each
+//     token's literal text (`token_literal`), so existing consumers (the
+//     bare-metal `ish`) see byte-identical output and are unaffected until
+//     they migrate to the Pipeline FSM (M3/M4).
+
 @@[target("rust")]
+
+// Operator-aware token. Defined in the native prolog so it is emitted once
+// (top level of the generated file) and shared by every crate that compiles
+// parser.frs (hosted `shell` + bare-metal `user`).
+#[derive(Clone, Debug, PartialEq)]
+pub enum Token {
+    Word(String),
+    Pipe,        // |
+    RedirIn,     // <
+    RedirOut,    // >
+    RedirAppend, // >>
+    Amp,         // &  (trailing background marker)
+}
+
+// Classify a completed UNQUOTED word: an exact operator string becomes that
+// operator, anything else is a Word. (Operators must be their own
+// whitespace-separated token — `a|b` is one Word, matching `ish`'s parser.)
+fn classify_word(s: &str) -> Token {
+    match s {
+        "|" => Token::Pipe,
+        "<" => Token::RedirIn,
+        ">" => Token::RedirOut,
+        ">>" => Token::RedirAppend,
+        "&" => Token::Amp,
+        _ => Token::Word(s.to_string()),
+    }
+}
+
+// Reconstruct a token's literal source text, for the legacy tokens() view.
+fn token_literal(t: &Token) -> String {
+    match t {
+        Token::Word(s) => s.clone(),
+        Token::Pipe => "|".to_string(),
+        Token::RedirIn => "<".to_string(),
+        Token::RedirOut => ">".to_string(),
+        Token::RedirAppend => ">>".to_string(),
+        Token::Amp => "&".to_string(),
+    }
+}
 
 @@system Parser {
     interface:
@@ -76,7 +133,11 @@
         // $InQuotedString.finalize() sets it on transition to $Failed.
         // So no state needs to override these queries; the default fires
         // everywhere.
-        tokens(): Vec<String> = self.tokens.clone()
+        //
+        // tokens() reconstructs literal text (legacy flat view); typed_tokens()
+        // hands out the structured Vec<Token> for the Pipeline FSM.
+        tokens(): Vec<String> = self.tokens.iter().map(token_literal).collect()
+        typed_tokens(): Vec<Token> = self.tokens.clone()
         error(): String = self.error_msg.clone()
         is_complete(): bool = false
 
@@ -102,7 +163,7 @@
         $InWord {
             consume(c: char) {
                 if c.is_whitespace() {
-                    self.tokens.push(self.current.clone());
+                    self.tokens.push(classify_word(&self.current));
                     self.current.clear();
                     -> $ReadingWord
                 } else {
@@ -113,7 +174,7 @@
             }
 
             finalize() {
-                self.tokens.push(self.current.clone());
+                self.tokens.push(classify_word(&self.current));
                 self.current.clear();
                 -> $Done
             }
@@ -122,7 +183,10 @@
         $InQuotedString {
             consume(c: char) {
                 if c == self.open_quote {
-                    self.tokens.push(self.current.clone());
+                    // A quoted token is ALWAYS a literal Word — never an
+                    // operator (that's why operator detection lives here, in
+                    // the scanner: only it knows the char came from a quote).
+                    self.tokens.push(Token::Word(self.current.clone()));
                     self.current.clear();
                     self.open_quote = '\0';
                     -> $ReadingWord
@@ -156,9 +220,10 @@
         }
 
     domain:
-        // Tokens accumulated so far. Consumer reads via tokens() after
+        // Tokens accumulated so far. Consumer reads via tokens() (legacy
+        // literal view) or typed_tokens() (structured view) after
         // is_complete() returns true.
-        tokens: Vec<String> = Vec::new()
+        tokens: Vec<Token> = Vec::new()
 
         // The token being built up character by character.
         current: String = String::new()
