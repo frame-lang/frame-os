@@ -233,4 +233,32 @@
   - **M2 — process-backend seam.** `Job`'s spawn/reap/signal mechanism moved behind a `ProcessBackend` trait (hosted `StdProcessBackend` = std::process + libc::kill), `Job` holding a `Box<dyn ProcessBackend>` from a per-crate `default_backend()`. Pure mechanism refactor — **the `Job` state-graph snapshot is byte-stable** — preparing (not wiring) a ring-3 syscall backend. Same FSM-owns-logic / native-owns-mechanism seam as virtio_blk's read/write backend.
   - **M3a — `Pipeline` reaches bare metal.** `ish` (ring 3) now drives its parsing through the shared `Parser → Pipeline` FSMs — the *same* `frame/pipeline.frs` the hosted shell compiles — retiring its hand-written `parse_redirs` + `|`-split. The M1 grammar FSM compiled unchanged for `x86_64-unknown-none`; `console-test` exercises FSM-parsed redirection (`echo > / >> / wc <`) and pipes (`echo … | wc`) end-to-end on the live kernel. `Parser` **and** `Pipeline` are now single sources running on both targets; `ish` still owns execution (fork/exec/dup2/pipe).
   - **M3b.1 — the `ShellEnv` seam (the hard, risky refactor — done cleanly).** To reuse the *whole* `Shell` control-flow FSM in ring 3, its domain's std-only types (`cwd: PathBuf`, `job_control: JobControl`, `current_builtin: Builtin`) had to go — they can't compile no_std. So every target-specific operation (prompt/goodbye/tick, classify→`CommandKind`, run_builtin, run_foreground/background, fg, run_pipeline, wait_foreground, println) moved behind a `ShellEnv` trait declared in the shell.frs prolog; the FSM now holds `Box<dyn ShellEnv> = default_env()` and is **environment-agnostic**. Hosted `StdShellEnv` wraps the existing classify/execute/exec + JobControl + cwd, preserving behavior **exactly** — the 6-state graph snapshot is byte-stable and all 200+ hosted tests pass. This was the chosen "fat FSM, thin env" shape (keep the rich states + routing in the FSM; abstract only the bodies), so the *same* Shell state machine — not a stripped-down variant — is what M3b.2/.3 will compile for ring 3.
-  - **Method note:** each milestone was lowest-risk-first and left both builds green; the one architectural fork per milestone (pipe/redirection modeling; M3 staging; the M3b seam shape) was surfaced and decided explicitly rather than assumed, because two of them reshape working code. Remaining: M3b.2 (ring-3 `IshShellEnv` + compile `shell.frs` for `x86_64-unknown-none`) and M3b.3 (drive ish's loop through the `Shell` FSM; `console-test` green, now Shell-FSM-driven) — then M4 consolidates job control and retires ish's hand-written dispatch.
+  - **M3b.2/.3 — the Shell FSM reaches bare metal (M3 COMPLETE).** `shell.frs`
+    compiles for `x86_64-unknown-none` (the generated FSM machinery was already
+    no_std-clean — only *my* handler bodies had pulled in std, and the seam
+    removed them). ish includes it in a local `shell_fsm` module (not the shared
+    frame_systems, so other user bins needn't supply a `ShellEnv`) and provides
+    `IshShellEnv` over syscalls. The one real impedance mismatch — the hosted
+    shell *splits* spawn ($Parsing) from wait ($RunningForeground), but ish's
+    `run_external` does fork+exec+**wait** synchronously — was resolved honestly,
+    not papered over: `spawn_foreground`/`fg` fork-or-resume + stash the pending
+    pid, and `wait_foreground` does the blocking `waitpid` + stop/exit reporting.
+    A no-op `wait_foreground` would have been the cheat; the faithful split keeps
+    `$RunningForeground` meaning what it says. ish's `_start` now drives the
+    shared `Shell` FSM (hand-written `run_line`/`fg_job` retired); **`console-test`
+    is green end-to-end, Shell-FSM-driven** — the full S1–S10 interactive session
+    (builtins, redirection, pipes, background jobs, signals, job-control
+    suspend/resume, on-device tcc) coordinated by the *same* `frame/shell.frs`
+    that runs the hosted shell. **The Frame thesis at its strongest: one Shell +
+    Parser + Pipeline source, a full interactive shell on Linux *and* bare-metal
+    ring 3.**
+  - **Method note:** each milestone was lowest-risk-first and left both builds
+    green; the one architectural fork per milestone (pipe/redirection modeling;
+    M3 staging; the M3b seam shape) was surfaced and decided explicitly rather
+    than assumed, because they reshape working code. M3b.1 (the risky hosted
+    refactor) and M3b.2 (does the stack even compile no_std?) were landed as
+    separate validated checkpoints *before* the behavior-changing M3b.3 loop
+    flip — so the irreversible step ran last, on proven ground. Remaining: **M4**
+    — consolidate job control (unify `IshJobs` with `JobControl`/`Job` over a
+    syscall process backend) and retire any remaining bespoke ring-3 paths;
+    closes B4-6.

@@ -35,7 +35,10 @@ use core::panic::PanicInfo;
 mod frame_systems;
 mod mem;
 
-use frame_systems::{IshJobs, Parser, Pipeline, Token, TokenKind};
+// Parser/Pipeline/Token/TokenKind are used inside the shell_fsm module (which
+// imports them from frame_systems directly); ish root only needs IshJobs (the
+// job-table type its execution helpers + IshShellEnv use).
+use frame_systems::IshJobs;
 
 #[inline(always)]
 unsafe fn syscall3(num: u64, a0: u64, a1: u64, a2: u64) -> u64 {
@@ -416,53 +419,12 @@ fn resolve_job_id(arg: Option<&str>, jobs: &mut IshJobs, stopped_only: bool) -> 
     best
 }
 
-/// `fg [id]`: bring a tracked job to the foreground — resume it if stopped
-/// (SIGCONT), then block until it finishes or stops again. On exit it's dropped;
-/// on another Ctrl-Z it stays a stopped job. The FSM tracks the
-/// $Idle→$Foreground→$Idle window around the wait.
-fn fg_job(arg: Option<&str>, jobs: &mut IshJobs) {
-    let id = resolve_job_id(arg, jobs, false);
-    let mut pid = 0u64;
-    let mut was_stopped = false;
-    let mut cmd = String::new();
-    for e in &jobs.snapshot() {
-        if e.id == id && !e.done {
-            pid = e.pid;
-            was_stopped = e.stopped;
-            cmd = e.cmd.clone();
-            break;
-        }
-    }
-    if pid == 0 {
-        print(b"fg: no such job\n");
-        return;
-    }
-    // bash echoes the command being foregrounded.
-    print(cmd.as_bytes());
-    write_char(b'\n');
-    if was_stopped {
-        kill(pid, SIGCONT); // resume the stopped job before waiting on it
-        jobs.mark_running(id);
-    }
-    jobs.launch_fg();
-    set_foreground(pid);
-    let st = waitpid(pid);
-    set_foreground(0);
-    jobs.fg_done();
-    if st & WSTOPPED != 0 {
-        // Stopped again (Ctrl-Z during the foreground run): keep it as a job.
-        jobs.mark_stopped(id);
-        let mut l = Vec::new();
-        l.push(b'[');
-        push_u64(&mut l, id as u64);
-        l.extend_from_slice(b"]+ Stopped   ");
-        l.extend_from_slice(cmd.as_bytes());
-        l.push(b'\n');
-        emit(&l);
-    } else {
-        jobs.remove(id);
-    }
-}
+// (fg_job was retired at M3b.3 — its resume-then-wait logic is now split across
+// IshShellEnv::fg (find job + resume + set_foreground) and
+// IshShellEnv::wait_foreground (the blocking waitpid + stop/exit reporting),
+// mapping ish's synchronous model onto the Shell FSM's spawn/wait phases.
+// `fg <id>` now takes a plain numeric id, like the hosted shell; bg/kill keep
+// the `%N` job-spec form via resolve_job_id.)
 
 /// `bg [id]`: resume a stopped job in the background (SIGCONT) and leave it
 /// running there. It's harvested at a later prompt when it exits.
@@ -592,123 +554,11 @@ fn list_jobs(jobs: &mut IshJobs) {
     }
 }
 
-/// Tokenize one line with the Frame `Parser` FSM and dispatch the first token.
-fn run_line(line: &str, jobs: &mut IshJobs) {
-    // Tokenize with the shared Parser FSM (tags | < > >> & as typed tokens).
-    let mut p = Parser::__create();
-    for c in line.chars() {
-        p.consume(c);
-    }
-    p.finalize();
-    if !p.error().is_empty() {
-        print(b"ish: ");
-        print(p.error().as_bytes());
-        write_char(b'\n');
-        return;
-    }
-
-    // Fold the typed tokens into a command pipeline with the shared Pipeline
-    // FSM — the SAME frame/pipeline.frs the hosted shell uses (M3a). This is
-    // where ish's hand-written `&` / `|` / redirection parsing used to live
-    // (parse_redirs + a manual pipe split); the FSM owns the grammar now, on
-    // bare metal exactly as on the host. ish still owns the *execution*
-    // (fork/exec/dup2/pipe via syscalls).
-    let mut pl = Pipeline::__create();
-    for tok in p.typed_tokens() {
-        let (kind, text) = match tok {
-            Token::Word(w) => (TokenKind::Word, w),
-            Token::Pipe => (TokenKind::Pipe, String::new()),
-            Token::RedirIn => (TokenKind::RedirIn, String::new()),
-            Token::RedirOut => (TokenKind::RedirOut, String::new()),
-            Token::RedirAppend => (TokenKind::RedirAppend, String::new()),
-            Token::Amp => (TokenKind::Amp, String::new()),
-        };
-        pl.consume(kind, text);
-    }
-    pl.finalize();
-    if !pl.error().is_empty() {
-        print(b"ish: ");
-        print(pl.error().as_bytes());
-        write_char(b'\n');
-        return;
-    }
-
-    let commands = pl.commands();
-    if commands.is_empty() {
-        return; // empty line, or a lone `&`
-    }
-    let background = pl.is_background();
-
-    // Pipeline (S6): a single `|` connects two external commands, foreground.
-    // ish wires exactly two stages; the Pipeline FSM parses N, so reject 3+
-    // explicitly rather than silently mishandle (the old hand-split was 2-stage
-    // too). A trailing `&` on a pipeline is ignored, as before.
-    if commands.len() >= 2 {
-        if commands.len() > 2 {
-            print(b"ish: only 2-stage pipelines are supported\n");
-            return;
-        }
-        run_pipeline(&commands[0].words, &commands[1].words);
-        return;
-    }
-
-    // Single command. Pull its words + redirection out of the parsed Command.
-    let cmd = &commands[0];
-    if cmd.words.is_empty() {
-        return;
-    }
-    let toks = cmd.words.clone();
-    let redir_in: Option<String> = cmd.redir_in.clone();
-    let redir_out: Option<(String, bool)> = cmd.redir_out.clone().map(|f| (f, cmd.append));
-    // The command line as typed (sans `&`/redirs), for job-control reporting.
-    let cmd_str = toks.join(" ");
-    match toks[0].as_str() {
-        "exit" => exit(0),
-        "help" => {
-            print(b"ish builtins: help, exit, cd [dir], pwd, clear, cat <path>..., jobs, fg [id], bg [id], kill %<job>|<pid>\n");
-            print(b"on disk in /bin: ls, echo, rm, cp, touch, wc, head, tail, grep, date, mkdir, rmdir, mv, ps, ...\n");
-            print(b"redirection (external cmds): cmd > file, cmd >> file, cmd < file\n");
-            print(b"pipes: cmd1 | cmd2 (connect cmd1's stdout to cmd2's stdin)\n");
-            print(b"background: cmd &   (jobs/fg/bg manage; Ctrl-Z stops the foreground job, Ctrl-C interrupts)\n");
-        }
-        // jobs / fg are builtins: they read+drive *this shell's* IshJobs FSM,
-        // which lives in the shell process (forking would lose it).
-        "jobs" => list_jobs(jobs),
-        "fg" => fg_job(toks.get(1).map(|s| s.as_str()), jobs),
-        "bg" => bg_job(toks.get(1).map(|s| s.as_str()), jobs),
-        "kill" => kill_cmd(&toks, jobs),
-        // cd must be a builtin: it changes *this shell's* cwd (per-process in the
-        // kernel). No arg → go to root.
-        "cd" => {
-            let target = if toks.len() > 1 {
-                toks[1].as_str()
-            } else {
-                "/"
-            };
-            if chdir(target.as_bytes()) == u64::MAX {
-                print(b"cd: no such directory: ");
-                print(target.as_bytes());
-                write_char(b'\n');
-            }
-        }
-        "pwd" => {
-            let mut buf = [0u8; 256];
-            let n = getcwd(&mut buf);
-            if n != u64::MAX {
-                print(&buf[..n as usize]);
-                write_char(b'\n');
-            }
-        }
-        // clear: ANSI clear-screen + cursor-home. A builtin (no point forking).
-        "clear" => print(b"\x1b[2J\x1b[H"),
-        "cat" => {
-            for path in &toks[1..] {
-                cat(path);
-            }
-        }
-        _ => run_external(&toks, &redir_in, &redir_out, background, &cmd_str, jobs),
-    }
-}
+// (run_line — ish's hand-written Parser→Pipeline→dispatch loop — was retired at
+// M3b.3. The control flow it encoded is now the shared frame/shell.frs FSM
+// (shell_fsm below), and its per-command dispatch lives in IshShellEnv. ish's
+// execution helpers above (run_external, run_pipeline, cat, the job builtins)
+// are unchanged; IshShellEnv calls them.)
 
 // ── Shell control-flow FSM reuse (M3b) ─────────────────────────────────────
 //
@@ -723,7 +573,6 @@ fn run_line(line: &str, jobs: &mut IshJobs) {
 // x86_64-unknown-none + IshShellEnv is complete); M3b.3 rewires `_start` to
 // drive the FSM. Until then the module is unused — hence #[allow(dead_code)] —
 // and `_start` keeps the proven hand-written `run_line` loop.
-#[allow(dead_code, unused_imports)]
 mod shell_fsm {
     // Names the generated shell.rs references (its `mod _shell_framec` picks
     // these up via `use super::*`), mirroring frame_systems.rs's re-exports.
@@ -996,22 +845,29 @@ mod shell_fsm {
 pub extern "C" fn _start() -> ! {
     mem::init();
     print(b"\nFrame OS interactive shell (ish). Type 'help'.\n");
-    // The job-control FSM lives for the whole shell session, in the shell
-    // process. It's the ish-resident JobControl (S10): $Idle at the prompt,
-    // $Foreground while waiting on a job, with the background-job table in its
-    // domain. fork() would lose it, so `jobs`/`fg`/`&` are all builtins.
-    let mut jobs = IshJobs::__create();
+    // M3b.3: the REPL is now driven by the SAME frame/shell.frs control-flow FSM
+    // the hosted shell runs — compiled for ring 3 (shell_fsm). The FSM owns the
+    // loop's structure: $Prompting.$> reaps background jobs (IshShellEnv::tick)
+    // + prints the prompt, $Parsing tokenizes (Parser) + parses (Pipeline) +
+    // classifies + dispatches through IshShellEnv (builtins / externals /
+    // pipelines / fg-bg / wait), and `exit`/`quit` reach the terminal $Exiting.
+    // Shell::__create() runs the first $Prompting enter (the first prompt)
+    // before we read input. ish keeps owning execution (fork/exec/dup2/pipe via
+    // syscalls) inside IshShellEnv — FSM-owns-logic / native-owns-mechanism.
+    let mut shell = shell_fsm::Shell::__create();
     let mut buf = [0u8; 256];
     loop {
-        // Harvest any background jobs that finished since the last prompt and
-        // report them, before drawing the prompt (bash-style).
-        harvest(&mut jobs);
-        print(b"frameos$ ");
         let n = read_line(&mut buf);
-        if let Ok(line) = core::str::from_utf8(&buf[..n]) {
-            run_line(line, &mut jobs);
+        match core::str::from_utf8(&buf[..n]) {
+            Ok(line) => shell.line(line),
+            Err(_) => shell.line(""),
+        }
+        // `exit` / `quit` drove the FSM to $Exiting.
+        if shell.is_done() {
+            break;
         }
     }
+    exit(0);
 }
 
 #[panic_handler]

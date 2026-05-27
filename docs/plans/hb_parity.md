@@ -97,12 +97,24 @@ Sequenced lowest-risk-first; every milestone leaves both builds green.
       JobControl + cwd, preserving behavior exactly — **state graph byte-stable,
       all 200+ hosted tests green**, clippy/fmt/diagrams clean. The FSM is now
       environment-agnostic and ready to compile for ring 3.
-    - **M3b.2 — ring-3 `IshShellEnv` + compile shell.frs for `x86_64-unknown-none`
-      (next).** Implement `ShellEnv` with ish's native syscalls (print/classify/
-      run_builtin/run_external/run_pipeline/fork/exec/wait + IshJobs).
-    - **M3b.3 — drive ish's loop through the `Shell` FSM; `console-test` green,
-      now Shell-FSM-driven.** Keep ish's hand-written dispatch until the FSM path
-      passes.
+    - **M3b.2 — ring-3 `IshShellEnv` + compile shell.frs for `x86_64-unknown-none`.
+      ✅ DONE 2026-05-27.** `shell.frs` compiles for ring 3 (included in an
+      ish-only `shell_fsm` module, not the shared frame_systems). `IshShellEnv`
+      implements `ShellEnv` over ish's syscalls; the synchronous fork+wait splits
+      faithfully across `spawn_foreground`/`fg` (start + stash) and
+      `wait_foreground` (block + report).
+    - **M3b.3 — drive ish's loop through the `Shell` FSM. ✅ DONE 2026-05-27.**
+      `_start` now creates `shell_fsm::Shell` and feeds it lines; the FSM prints
+      the prompt, parses (Parser+Pipeline), and dispatches via `IshShellEnv`;
+      `is_done()` ends the loop. Retired ish's hand-written `run_line` + `fg_job`.
+      **`console-test` green end-to-end, now Shell-FSM-driven** — full S1–S10
+      (builtins, redirection, pipes, background jobs, signals, job-control
+      suspend/resume, on-device tcc). clippy + fmt clean.
+
+  **M3 COMPLETE.** The *same* `frame/shell.frs` control-flow FSM (plus `Parser`
+  and `Pipeline`) now drives a full interactive shell on **Linux and bare-metal
+  ring 3** — the headline H↔B parity result. Only M4 (consolidate job control,
+  retire any remaining bespoke paths) remains.
 
 - **M4 — Consolidate + retire `ish`'s hand-written dispatch.** Switch `ish` fully to
   the shared `Shell` + `JobControl` FSMs over the syscall backend; retire the
