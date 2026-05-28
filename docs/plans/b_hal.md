@@ -89,8 +89,20 @@ at once.
   `serial::*` call sites are unchanged (only `init_uart`/`write_byte`/`rx_byte`/
   `enable_rx_interrupt` were genuinely arch-specific). Validated: default +
   interactive build, clippy/fmt clean, **49/49 qemu-test smoke, console-test
-  PASS**. The remaining concerns (Cpu / Clock / Fpu / Mmu / Irq / Timer / PerCpu
-  / Context / SyscallEntry) fan out behind the same proven pattern.
+  PASS**. *Progress (2026-05-27):* second seam landed — **`Cpu`** (the broad
+  one: maskable-IRQ enable/disable, halt, IF state). `kernel/src/arch/x86_64/
+  cpu.rs` holds the `sti`/`cli`/`hlt`/RFLAGS mechanism (`#[inline]`); the
+  IRQ-safe `SpinLock` (spin.rs, the hot path) calls `hal::cpu()` directly, and
+  the `interrupts::{enable,disable,wait_for_interrupt,wait_for_interrupt_enabled,
+  without_interrupts}` wrappers become the arch-agnostic facade over the seam so
+  their many callers (main.rs, pcsched.rs idle loops, every Frame-dispatch
+  critical section) are unchanged. PAUSE is *not* a HAL primitive —
+  `core::hint::spin_loop()` already abstracts it. The `global_asm!` ISR stubs and
+  the QEMU-exit `out 0xf4` are deliberately left for B-HAL.2 (IRQ path / Boot).
+  Validated: both builds, clippy/fmt clean, **49/49 qemu-test smoke (all `smp_*`
+  cross-core locking paths), console-test PASS**. The remaining concerns (Clock /
+  Fpu / Mmu / Irq / Timer / PerCpu / Context / SyscallEntry) fan out behind the
+  same pattern.
 - **B-HAL.2 — Isolate boot + the IDT/IRQ path.** The hardest seam: factor the
   Limine handoff + IDT setup + the timer/syscall ISR entry behind `Boot` + `Irq` +
   `SyscallEntry` so the arch-agnostic kernel init is one sequence calling HAL

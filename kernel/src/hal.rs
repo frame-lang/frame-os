@@ -57,3 +57,37 @@ pub trait Console {
 pub fn console() -> &'static imp::ConsoleDevice {
     imp::console()
 }
+
+/// CPU control primitives: maskable-interrupt enable/disable, the
+/// interrupt-enable state, and halt.
+///
+/// x86_64 implements these over `sti` / `cli` / `hlt` and RFLAGS.IF; a future
+/// AArch64 port implements them over `msr daifclr/daifset`, `wfi`, and DAIF.I.
+/// The methods are the hot path of the IRQ-safe spinlock, so the arch impl
+/// marks them `#[inline]`. (The PAUSE spin-loop hint is *not* here — it's
+/// already portable via `core::hint::spin_loop()`.)
+pub trait Cpu {
+    /// Enable maskable interrupts.
+    fn enable_irqs(&self);
+
+    /// Disable maskable interrupts.
+    fn disable_irqs(&self);
+
+    /// Whether maskable interrupts are currently enabled on this core.
+    fn irqs_enabled(&self) -> bool;
+
+    /// Halt until the next interrupt (no busy-spin). With interrupts enabled
+    /// this wakes on the next IRQ.
+    fn halt(&self);
+
+    /// Enable interrupts and halt as one step, with no wake-losing window —
+    /// used to yield to the scheduler from an interrupts-off context.
+    fn enable_irqs_and_halt(&self);
+}
+
+/// The CPU control surface for this build's target architecture (build-time
+/// selected, concrete type — no vtable). Callers bring the methods into scope
+/// with `use crate::hal::Cpu`.
+pub fn cpu() -> &'static imp::CpuDevice {
+    imp::cpu()
+}

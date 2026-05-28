@@ -284,9 +284,9 @@ fn exit_current() -> ! {
     });
     PC_EXITED[cpu].fetch_add(1, Ordering::Relaxed);
     // A dead worker must park with IF=1 so the next LAPIC tick switches away.
-    unsafe { asm!("sti", options(nomem, nostack)) };
+    interrupts::enable();
     loop {
-        unsafe { asm!("hlt", options(nomem, nostack)) };
+        interrupts::wait_for_interrupt();
     }
 }
 
@@ -348,13 +348,13 @@ pub fn ap_run(cpu: usize) {
     // admits posted during spawn move the Scheduler to `$Active` before the first
     // `is_idle()` (which would otherwise be vacuously true at start).
     PC_ACTIVE[cpu].store(true, Ordering::Relaxed);
-    unsafe { asm!("sti", options(nomem, nostack)) };
+    interrupts::enable();
     loop {
         drain_mailbox(cpu);
         if sched(cpu).is_idle() {
             break;
         }
-        unsafe { asm!("hlt", options(nomem, nostack)) };
+        interrupts::wait_for_interrupt();
     }
     PC_ACTIVE[cpu].store(false, Ordering::Relaxed);
 

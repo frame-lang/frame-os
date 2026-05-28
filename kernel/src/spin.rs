@@ -23,6 +23,7 @@
 // while holding a ranked lock (rank 0 is "no constraint"). New nesting locks get a
 // rank here and use `with_rank`.
 
+use crate::hal::Cpu;
 use crate::percpu::MAX_CPUS;
 use core::cell::UnsafeCell;
 use core::ops::{Deref, DerefMut};
@@ -70,8 +71,8 @@ impl<T> SpinLock<T> {
     /// Acquire the lock, returning a guard. Interrupts are disabled on this core
     /// until the guard is dropped (and restored to their prior state then).
     pub fn lock(&self) -> SpinGuard<'_, T> {
-        let irq_was_enabled = interrupts_enabled();
-        unsafe { core::arch::asm!("cli", options(nomem, nostack)) };
+        let irq_was_enabled = crate::hal::cpu().irqs_enabled();
+        crate::hal::cpu().disable_irqs();
 
         // Lock-order check (R5a). With interrupts now off, this core can't be
         // preempted mid-check. A ranked lock must rank strictly above every rank
@@ -138,16 +139,7 @@ impl<T> Drop for SpinGuard<'_, T> {
         }
         self.lock.locked.store(false, Ordering::Release);
         if self.irq_was_enabled {
-            unsafe { core::arch::asm!("sti", options(nomem, nostack)) };
+            crate::hal::cpu().enable_irqs();
         }
     }
-}
-
-/// Whether the interrupt flag (RFLAGS.IF, bit 9) is currently set on this core.
-fn interrupts_enabled() -> bool {
-    let flags: u64;
-    unsafe {
-        core::arch::asm!("pushfq; pop {}", out(reg) flags, options(nomem, preserves_flags));
-    }
-    flags & (1 << 9) != 0
 }

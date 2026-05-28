@@ -175,7 +175,7 @@ unsafe extern "C" fn ap_entry(cpu: &limine::mp::Cpu) -> ! {
     // one-shot). Run until the timer has fired TARGET_TICKS times.
     interrupts::load_idt_on_ap();
     lapic::init_this_cpu();
-    unsafe { core::arch::asm!("sti", options(nomem, nostack)) };
+    interrupts::enable();
     let mut work = 0u64;
     while percpu::this_cpu_ticks() < TARGET_TICKS {
         work += 1;
@@ -204,7 +204,7 @@ unsafe extern "C" fn ap_entry(cpu: &limine::mp::Cpu) -> ! {
     // BSP's TLB-shootdown IPI (and its own timer). `hlt` with IF=1 wakes on each
     // interrupt and loops back — the AP's resting state for the rest of the boot.
     loop {
-        unsafe { core::arch::asm!("hlt", options(nomem, nostack)) };
+        interrupts::wait_for_interrupt();
     }
 }
 
@@ -775,9 +775,7 @@ fn halt_forever() -> ! {
         );
     }
     loop {
-        unsafe {
-            core::arch::asm!("hlt", options(nomem, nostack, preserves_flags));
-        }
+        interrupts::wait_for_interrupt();
     }
 }
 

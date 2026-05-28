@@ -18,6 +18,7 @@
 use core::arch::{asm, global_asm};
 use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
+use crate::hal::Cpu;
 use crate::serial;
 
 /// Master-PIC vector offset; IRQ0 (PIT timer) lands here.
@@ -424,7 +425,7 @@ extern "C" fn double_fault_handler() -> ! {
     crate::serial::write_u32_decimal(crate::percpu::this_cpu_index());
     crate::serial::writeln(" — halting");
     loop {
-        unsafe { asm!("hlt", options(nomem, nostack)) };
+        crate::hal::cpu().halt();
     }
 }
 
@@ -604,36 +605,32 @@ pub fn test_breakpoint() {
     }
 }
 
-/// Enable maskable interrupts (`sti`).
+// The interrupt-control primitives below are the arch-agnostic named wrappers
+// over the HAL CPU seam (`hal::Cpu`); the actual sti/cli/hlt mechanism lives in
+// `arch/<isa>/cpu.rs`. They keep their long-standing names so their many
+// callers are unchanged (B-HAL.1 Cpu seam).
+
+/// Enable maskable interrupts.
 pub fn enable() {
-    unsafe {
-        asm!("sti", options(nomem, nostack));
-    }
+    crate::hal::cpu().enable_irqs();
 }
 
-/// Disable maskable interrupts (`cli`).
+/// Disable maskable interrupts.
 pub fn disable() {
-    unsafe {
-        asm!("cli", options(nomem, nostack));
-    }
+    crate::hal::cpu().disable_irqs();
 }
 
-/// Halt until the next interrupt (`hlt`). With interrupts enabled this
-/// wakes on the next timer IRQ — used to wait for ticks without busy-spin.
+/// Halt until the next interrupt. With interrupts enabled this wakes on the
+/// next timer IRQ — used to wait for ticks without busy-spin.
 pub fn wait_for_interrupt() {
-    unsafe {
-        asm!("hlt", options(nomem, nostack));
-    }
+    crate::hal::cpu().halt();
 }
 
-/// Enable interrupts and halt as one step (`sti; hlt`). Used by a blocking
-/// task (B3 Step 5d `wait`) to yield to the scheduler from an interrupts-off
-/// (syscall) context: `sti` takes effect after the next instruction, so the
-/// pair atomically enables-then-halts with no wake-losing window.
+/// Enable interrupts and halt as one step. Used by a blocking task (B3 Step 5d
+/// `wait`) to yield to the scheduler from an interrupts-off (syscall) context:
+/// the enable-then-halt pair leaves no wake-losing window.
 pub fn wait_for_interrupt_enabled() {
-    unsafe {
-        asm!("sti; hlt", options(nomem, nostack));
-    }
+    crate::hal::cpu().enable_irqs_and_halt();
 }
 
 /// Run `f` with interrupts disabled, restoring the previous interrupt-enable
@@ -642,17 +639,12 @@ pub fn wait_for_interrupt_enabled() {
 /// `Scheduler`), every dispatch must run in such a critical section or a
 /// timer preemption mid-dispatch would corrupt it.
 pub fn without_interrupts<R>(f: impl FnOnce() -> R) -> R {
-    let flags: u64;
-    unsafe {
-        asm!("pushfq", "pop {}", out(reg) flags, options(preserves_flags));
-        asm!("cli", options(nomem, nostack));
-    }
+    let was_enabled = crate::hal::cpu().irqs_enabled();
+    crate::hal::cpu().disable_irqs();
     let r = f();
-    // Bit 9 of RFLAGS is IF (interrupt-enable). Only re-enable if it was set.
-    if flags & (1 << 9) != 0 {
-        unsafe {
-            asm!("sti", options(nomem, nostack));
-        }
+    // Only re-enable if interrupts were enabled on entry.
+    if was_enabled {
+        crate::hal::cpu().enable_irqs();
     }
     r
 }

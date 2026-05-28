@@ -14,9 +14,13 @@
 // (Cpu / Mmu / Irq / Timer / Clock / PerCpu / Fpu / Context / Boot /
 // SyscallEntry) is added here as each seam is extracted.
 
+pub mod cpu;
 pub mod serial;
 
 /// The console device type the `hal::console()` accessor returns on x86_64.
 pub type ConsoleDevice = serial::Uart;
+/// The CPU control surface type the `hal::cpu()` accessor returns on x86_64.
+pub type CpuDevice = cpu::X86Cpu;
 
+pub use cpu::cpu;
 pub use serial::console;
