@@ -110,9 +110,22 @@ at once.
   (the `time()` syscall; the scheduler's save/restore; `init_this_cpu`) are
   unchanged. Validated: both builds, clippy/fmt clean, 49/49 qemu-test smoke,
   console-test PASS (tcc exercises FPU + RTC; the job-control suite exercises FPU
-  context-switch save/restore). The remaining B-HAL.1 concerns (Mmu / PerCpu /
-  Irq / Timer / Context) fan out behind the same pattern; the IRQ/boot-path ones
-  (Irq, the IDT/ISR stubs, SyscallEntry, Boot) are B-HAL.2.
+  context-switch save/restore). *Progress (2026-05-28):* the load-bearing
+  **`Mmu`** seam landed — the *full* paging API behind `hal::Mmu` (current/map/
+  map_in/unmap/translate/new/fork/free/switch address space), not just the CPU
+  primitives. All of paging.rs moved to `arch/x86_64/paging.rs` (the 4-level
+  PML4 walk + CR3/invlpg) and the top-level module was retired; 8 caller files
+  (vm, lapic, xhci, elf, sched, usermode, main) route through `hal::mmu()`. The
+  key design call: an arch-neutral **`MapFlags`** (`WRITABLE`/`USER`/`DEVICE`)
+  that the x86 impl translates to PTE bits — so lapic/xhci's raw MMIO cache bits
+  (`PCD|PWT`) become `MapFlags::DEVICE` and no caller names an x86 page-table
+  bit. The internal table walk keeps raw PTE bits (private `*_raw` helpers); only
+  the trait boundary is neutral. Validated: both builds, clippy/fmt clean,
+  **49/49 qemu-test smoke** (paging/page-fault/address-space/fork/exec/wait-reap/
+  fpu-preempt/tlb-shootdown), **console-test PASS** (full fork/exec/exit
+  lifecycle + xHCI/LAPIC MMIO + on-device tcc). The remaining B-HAL.1 concerns
+  (PerCpu / Context) fan out behind the same pattern; the IRQ/boot-path ones
+  (Irq, the IDT/ISR stubs, Timer, SyscallEntry, Boot) are B-HAL.2.
 - **B-HAL.2 — Isolate boot + the IDT/IRQ path.** The hardest seam: factor the
   Limine handoff + IDT setup + the timer/syscall ISR entry behind `Boot` + `Irq` +
   `SyscallEntry` so the arch-agnostic kernel init is one sequence calling HAL

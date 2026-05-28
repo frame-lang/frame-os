@@ -25,7 +25,8 @@ use core::arch::asm;
 use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use crate::frame_systems::{IoScheduler, Scheduler};
-use crate::{fpu, gdt, interrupts, paging, serial};
+use crate::hal::{mmu, Mmu};
+use crate::{fpu, gdt, interrupts, serial};
 
 const MAX_THREADS: usize = 8;
 const STACK_SIZE: usize = 16 * 1024;
@@ -311,7 +312,7 @@ extern "C" fn schedule(current_rsp: u64) -> u64 {
         let kernel_pml4 = (&raw const KERNEL_PML4).read();
         let target = if np != 0 { np } else { kernel_pml4 };
         if target != 0 && target != (&raw const LAST_PML4).read() {
-            paging::switch(target);
+            mmu().switch_address_space(target);
             (&raw mut LAST_PML4).write(target);
         }
         if np != 0 {
@@ -392,7 +393,7 @@ fn init_boot() {
         (&raw mut CURRENT).write(0);
         (*tcbs().add(0)).state = RunState::Runnable; // boot is always available
         fpu_area(0).write(fpu::clean()); // boot context starts with a clean FPU
-        let kpml4 = paging::current_pml4();
+        let kpml4 = mmu().current_address_space();
         (&raw mut KERNEL_PML4).write(kpml4);
         (&raw mut LAST_PML4).write(kpml4);
     }
@@ -1002,7 +1003,7 @@ pub unsafe fn exec_into(new_pml4: u64) {
     let c = fpu::clean();
     fpu_area(cur).write(c);
     fpu::restore(fpu_area(cur));
-    paging::switch(new_pml4);
+    mmu().switch_address_space(new_pml4);
     (&raw mut LAST_PML4).write(new_pml4);
 }
 

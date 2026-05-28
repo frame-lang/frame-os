@@ -149,3 +149,115 @@ pub trait Fpu {
 pub fn fpu() -> &'static imp::FpuDevice {
     imp::fpu()
 }
+
+/// Arch-neutral page mapping attributes. Each arch's `Mmu` translates these to
+/// its own page-table bits (x86_64: WRITABLE→bit1, USER→bit2, DEVICE→PCD|PWT;
+/// AArch64: AP/UXN/the device memory-attribute index). `PRESENT`/valid is
+/// implied by the act of mapping, so it isn't a flag here.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct MapFlags(u8);
+
+impl MapFlags {
+    /// The page is writable.
+    pub const WRITABLE: MapFlags = MapFlags(1 << 0);
+    /// The page is user-accessible (ring 3).
+    pub const USER: MapFlags = MapFlags(1 << 1);
+    /// Device / MMIO memory: uncached (x86_64: PCD|PWT). Use for memory-mapped
+    /// registers, which must not be cached.
+    pub const DEVICE: MapFlags = MapFlags(1 << 2);
+
+    /// Whether all bits of `other` are set in `self`.
+    pub const fn contains(self, other: MapFlags) -> bool {
+        self.0 & other.0 == other.0
+    }
+
+    /// The union of two flag sets — `const` for use in `const` MMIO attributes
+    /// (where the `|` operator's trait method isn't callable).
+    pub const fn union(self, other: MapFlags) -> MapFlags {
+        MapFlags(self.0 | other.0)
+    }
+}
+
+impl core::ops::BitOr for MapFlags {
+    type Output = MapFlags;
+    fn bitor(self, rhs: MapFlags) -> MapFlags {
+        self.union(rhs)
+    }
+}
+
+impl core::ops::BitOrAssign for MapFlags {
+    fn bitor_assign(&mut self, rhs: MapFlags) {
+        self.0 |= rhs.0;
+    }
+}
+
+/// The memory-management unit: virtual→physical mapping, address-space
+/// lifecycle, and TLB maintenance.
+///
+/// x86_64 implements this over 4-level PML4 page tables + CR3 + `invlpg`; a
+/// future AArch64 port over its translation tables + TTBR0/1 + `tlbi`. An
+/// address space is identified by an opaque `u64` handle (x86_64: the PML4
+/// physical address; AArch64: a TTBR value). The page-table *format* and bit
+/// layout are the arch impl's concern; callers pass arch-neutral [`MapFlags`].
+pub trait Mmu {
+    /// Physical handle of the active address space (its root table).
+    fn current_address_space(&self) -> u64;
+
+    /// Map `virt` → `phys` with `flags` in the address space `space`. The
+    /// present/valid bit is added automatically. 4 KiB pages only.
+    ///
+    /// # Safety
+    /// Mutates the given address space; `space` and `phys` must be valid frames.
+    unsafe fn map_in(&self, space: u64, virt: u64, phys: u64, flags: MapFlags);
+
+    /// Map `virt` → `phys` with `flags` in the active address space.
+    ///
+    /// # Safety
+    /// As [`Mmu::map_in`], on the active space.
+    unsafe fn map(&self, virt: u64, phys: u64, flags: MapFlags);
+
+    /// Remove the mapping for `virt` in the active space (flushes its TLB entry).
+    ///
+    /// # Safety
+    /// Changes the active address space.
+    unsafe fn unmap(&self, virt: u64);
+
+    /// Translate `virt` to its physical address in the active space, or `None`.
+    fn translate(&self, virt: u64) -> Option<u64>;
+
+    /// Build a fresh address space: empty user half, kernel half shared with
+    /// the current space. Returns its handle.
+    ///
+    /// # Safety
+    /// Allocates a frame; safe to switch to while the shared kernel half is
+    /// valid.
+    unsafe fn new_address_space(&self) -> u64;
+
+    /// Build a child address space that eager-copies `parent`'s user space
+    /// (kernel half shared). Returns the child handle.
+    ///
+    /// # Safety
+    /// `parent` must be the active space. Allocates frames.
+    unsafe fn fork_address_space(&self, parent: u64) -> u64;
+
+    /// Free an address space's user half (leaf frames + user page tables + the
+    /// root). The shared kernel half is left intact.
+    ///
+    /// # Safety
+    /// `space` must not be the active address space, and must have a private
+    /// user half (from `new_address_space`/`fork_address_space`).
+    unsafe fn free_address_space(&self, space: u64);
+
+    /// Switch the active address space (loads its root table; flushes the TLB).
+    ///
+    /// # Safety
+    /// `space` must map the currently-executing code, the stack, and the HHDM.
+    unsafe fn switch_address_space(&self, space: u64);
+}
+
+/// The MMU for this build's target architecture (build-time selected, concrete
+/// type — no vtable). Callers bring the methods into scope with
+/// `use crate::hal::Mmu`.
+pub fn mmu() -> &'static imp::MmuDevice {
+    imp::mmu()
+}

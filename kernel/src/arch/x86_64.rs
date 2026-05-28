@@ -16,6 +16,7 @@
 
 pub mod cpu;
 pub mod fpu;
+pub mod paging;
 pub mod rtc;
 pub mod serial;
 
@@ -27,8 +28,11 @@ pub type CpuDevice = cpu::X86Cpu;
 pub type ClockDevice = rtc::CmosRtc;
 /// The FPU control surface type the `hal::fpu()` accessor returns on x86_64.
 pub type FpuDevice = fpu::X86Fpu;
+/// The MMU type the `hal::mmu()` accessor returns on x86_64.
+pub type MmuDevice = paging::X86Mmu;
 
 pub use cpu::cpu;
 pub use fpu::{fpu, FpuState};
+pub use paging::mmu;
 pub use rtc::clock;
 pub use serial::console;

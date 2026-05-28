@@ -460,7 +460,7 @@ static SHOOTDOWN_ACKS: AtomicUsize = AtomicUsize::new(0);
 /// VA, resets the ack count, and sends the shootdown IPI to all-but-self. The
 /// caller then polls `shootdown_acks()` until it equals the number of other
 /// cores (the barrier) before reusing the page. The initiator must flush its own
-/// TLB separately (e.g. via `paging::unmap`, which `invlpg`s).
+/// TLB separately (e.g. via `Mmu::unmap`, which `invlpg`s).
 pub fn shootdown(va: u64) {
     SHOOTDOWN_VA.store(va, Ordering::SeqCst);
     SHOOTDOWN_ACKS.store(0, Ordering::SeqCst);

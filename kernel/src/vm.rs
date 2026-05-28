@@ -12,7 +12,8 @@
 // `PageFaultHandler` driven synchronously is safe (no lock, no queue).
 
 use crate::frame_systems::PageFaultHandler;
-use crate::{frames, paging, serial};
+use crate::hal::{mmu, MapFlags, Mmu};
+use crate::{frames, serial};
 
 const MAX_LAZY: usize = 8;
 
@@ -74,7 +75,7 @@ pub fn lazy_map(addr: u64) -> bool {
     match frames::alloc_frame() {
         Some(frame) => {
             unsafe {
-                paging::map(page, frame, paging::WRITABLE);
+                mmu().map(page, frame, MapFlags::WRITABLE);
             }
             true
         }

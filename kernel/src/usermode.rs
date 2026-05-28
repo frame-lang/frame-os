@@ -51,7 +51,8 @@ use alloc::boxed::Box;
 use alloc::vec::Vec;
 
 use crate::frame_systems::{ElfLoader, ProcessTable, SyscallDispatcher};
-use crate::{frames, paging, sched, serial};
+use crate::hal::{mmu, MapFlags, Mmu};
+use crate::{frames, sched, serial};
 
 // The syscall dispatcher HSM (B3 Step 2). Driven synchronously from the
 // syscall entry; single instance, single-core.
@@ -741,7 +742,7 @@ fn do_brk(new_end: u64) -> u64 {
     }
     // Round the requested break up to a whole page.
     let target = (new_end + PAGE - 1) & !(PAGE - 1);
-    let pml4 = paging::current_pml4();
+    let pml4 = mmu().current_address_space();
     if target > cur {
         // Grow: map a fresh zeroed frame for each page in [cur, target).
         let mut va = cur;
@@ -750,8 +751,8 @@ fn do_brk(new_end: u64) -> u64 {
                 // Out of memory: roll back the pages we just mapped and refuse.
                 let mut undo = cur;
                 while undo < va {
-                    if let Some(phys) = paging::translate(undo) {
-                        unsafe { paging::unmap(undo) };
+                    if let Some(phys) = mmu().translate(undo) {
+                        unsafe { mmu().unmap(undo) };
                         frames::free_frame(phys);
                     }
                     undo += PAGE;
@@ -760,7 +761,7 @@ fn do_brk(new_end: u64) -> u64 {
             };
             unsafe {
                 core::ptr::write_bytes(frames::phys_to_virt(frame), 0, PAGE as usize);
-                paging::map_in(pml4, va, frame, paging::USER | paging::WRITABLE);
+                mmu().map_in(pml4, va, frame, MapFlags::USER | MapFlags::WRITABLE);
             }
             va += PAGE;
         }
@@ -768,8 +769,8 @@ fn do_brk(new_end: u64) -> u64 {
         // Shrink: unmap + free each page in [target, cur).
         let mut va = target;
         while va < cur {
-            if let Some(phys) = paging::translate(va) {
-                unsafe { paging::unmap(va) };
+            if let Some(phys) = mmu().translate(va) {
+                unsafe { mmu().unmap(va) };
                 frames::free_frame(phys);
             }
             va += PAGE;
@@ -1188,7 +1189,7 @@ fn sys_rename(a0: u64, a1: u64) -> u64 {
 /// its `Process` slot + address space, and log it. Shared by the wait paths.
 fn reap_child(me: u32, child_pid: u32, child_pml4: u64) -> i32 {
     let status = proc_table().reap_pid(child_pid); // $Zombie → $Reaped, slot freed
-    unsafe { paging::free_address_space(child_pml4) }; // teardown
+    unsafe { mmu().free_address_space(child_pml4) }; // teardown
     serial::write_str("[wait] pid ");
     serial::write_u32_decimal(me);
     serial::write_str(" reaped child pid ");
@@ -1491,7 +1492,7 @@ unsafe fn build_initial_stack(top: u64, argv: &[u8], argc: usize) -> u64 {
 /// concurrent process's syscall may have overwritten the global, so using it
 /// here would install the new image into the wrong process's frame.
 fn exec_image_args(frame: *mut TrapFrame, elf: &'static [u8], argv: &[u8], argc: usize) -> u64 {
-    let new_pml4 = unsafe { paging::new_address_space() };
+    let new_pml4 = unsafe { mmu().new_address_space() };
     crate::elf::prepare(elf, new_pml4);
     let mut loader = ElfLoader::__create();
     if loader.is_failed() {
@@ -1523,7 +1524,7 @@ fn exec_image_args(frame: *mut TrapFrame, elf: &'static [u8], argv: &[u8], argc:
 /// is the caller's own trap frame (see `exec_image_args` for why it's passed in
 /// rather than read from the global).
 fn exec_image(frame: *mut TrapFrame, elf: &'static [u8]) -> u64 {
-    let new_pml4 = unsafe { paging::new_address_space() };
+    let new_pml4 = unsafe { mmu().new_address_space() };
     crate::elf::prepare(elf, new_pml4);
     let mut loader = ElfLoader::__create();
     if loader.is_failed() {
@@ -1575,7 +1576,7 @@ fn do_fork() -> u64 {
         let p = (&raw const CURRENT_TRAP_FRAME).read();
         *p
     };
-    let child_pml4 = unsafe { paging::fork_address_space(paging::current_pml4()) };
+    let child_pml4 = unsafe { mmu().fork_address_space(mmu().current_address_space()) };
     let child_pid = proc_table().spawn(); // child Process: $Created → $Ready
     let parent_pid = sched::current_pid();
     let mut child_frame = parent_frame;
@@ -1624,7 +1625,7 @@ fn write_exit_code(code: i32) {
 /// timer. The boot context idles in `run_until_idle` until the process exits.
 fn run_one(elf: &'static [u8], label: &str) {
     // A fresh address space (kernel higher-half mirrored in) for this process.
-    let pml4 = unsafe { paging::new_address_space() };
+    let pml4 = unsafe { mmu().new_address_space() };
     crate::elf::prepare(elf, pml4);
     let mut loader = ElfLoader::__create();
     if loader.is_failed() {

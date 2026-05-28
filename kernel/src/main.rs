@@ -53,7 +53,6 @@ mod ksched;
 mod lapic;
 mod lockorder;
 mod net;
-mod paging;
 mod pci;
 mod pcsched;
 mod percpu;
@@ -84,6 +83,10 @@ mod vm;
 mod xhci;
 
 use frame_systems::Kernel;
+// The MMU is exercised only by the default build's paging/vm/TLB smoke blocks;
+// the interactive build replaces that boot tail with the shell.
+#[cfg(not(feature = "interactive"))]
+use hal::{mmu, MapFlags, Mmu};
 
 // ---------------------------------------------------------------------------
 // Limine boot protocol declarations
@@ -373,9 +376,9 @@ unsafe extern "C" fn kmain() -> ! {
                 const SHOOT_VA: u64 = 0x0000_7000_0000_0000;
                 if let Some(frame) = frames::alloc_frame() {
                     unsafe {
-                        paging::map(SHOOT_VA, frame, paging::WRITABLE);
+                        mmu().map(SHOOT_VA, frame, MapFlags::WRITABLE);
                         (SHOOT_VA as *mut u64).write_volatile(0xDEAD_BEEF);
-                        paging::unmap(SHOOT_VA); // flushes the BSP's own TLB entry
+                        mmu().unmap(SHOOT_VA); // flushes the BSP's own TLB entry
                     }
                     interrupts::shootdown(SHOOT_VA); // IPI the other cores to flush theirs
                     let mut spins = 0u64;
@@ -548,7 +551,7 @@ unsafe extern "C" fn kmain() -> ! {
             const PATTERN: u64 = 0xDEAD_BEEF_CAFE_F00D;
             let frame = frames::alloc_frame().expect("frame alloc");
             unsafe {
-                paging::map(TEST_VA, frame, paging::WRITABLE);
+                mmu().map(TEST_VA, frame, MapFlags::WRITABLE);
                 let p = TEST_VA as *mut u64;
                 p.write_volatile(PATTERN);
                 let via_va = p.read_volatile();
@@ -557,13 +560,13 @@ unsafe extern "C" fn kmain() -> ! {
                     serial::writeln("[paging] map + write + read-back: ok");
                 }
             }
-            if paging::translate(TEST_VA) == Some(frame) {
+            if mmu().translate(TEST_VA) == Some(frame) {
                 serial::writeln("[paging] translate matches frame: ok");
             }
             unsafe {
-                paging::unmap(TEST_VA);
+                mmu().unmap(TEST_VA);
             }
-            if paging::translate(TEST_VA).is_none() {
+            if mmu().translate(TEST_VA).is_none() {
                 serial::writeln("[paging] unmap clears mapping: ok");
             }
             frames::free_frame(frame);
@@ -578,23 +581,23 @@ unsafe extern "C" fn kmain() -> ! {
         {
             const AS_VA: u64 = 0x0000_3000_0000_0000;
             const AS_PATTERN: u64 = 0x0bad_c0de_1337_d00d;
-            let saved = paging::current_pml4();
+            let saved = mmu().current_address_space();
             let frame = frames::alloc_frame().expect("frame alloc");
             unsafe {
                 // Seed the frame via the HHDM (address-space independent).
                 (frames::phys_to_virt(frame) as *mut u64).write_volatile(AS_PATTERN);
-                let new_as = paging::new_address_space();
-                paging::map_in(new_as, AS_VA, frame, paging::WRITABLE);
-                paging::switch(new_as);
+                let new_as = mmu().new_address_space();
+                mmu().map_in(new_as, AS_VA, frame, MapFlags::WRITABLE);
+                mmu().switch_address_space(new_as);
                 let got = (AS_VA as *const u64).read_volatile();
-                paging::switch(saved); // back to the original space
+                mmu().switch_address_space(saved); // back to the original space
                 if got == AS_PATTERN {
                     serial::writeln("[vm] address-space switch sees its mapping: ok");
                 }
             }
             // AS_VA was mapped only in the new space; the original has no such
             // mapping → per-address-space isolation.
-            if paging::translate(AS_VA).is_none() {
+            if mmu().translate(AS_VA).is_none() {
                 serial::writeln("[vm] mapping isolated to its address space: ok");
             }
             frames::free_frame(frame);

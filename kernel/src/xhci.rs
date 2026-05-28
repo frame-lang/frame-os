@@ -20,13 +20,13 @@
 // All register access is volatile.
 
 use crate::frame_systems::{HubPort, UsbEnumeration, UsbMsd, UsbTransfer};
-use crate::{frames, interrupts, paging, pci, serial};
+use crate::hal::{mmu, MapFlags, Mmu};
+use crate::{frames, interrupts, pci, serial};
 use core::ptr::{read_volatile, write_volatile};
 
-/// MMIO mapping flags: writable + cache-disable (PCD, bit 4) + write-through
-/// (PWT, bit 3). Device registers must not be cached. (`paging::map` adds
-/// PRESENT.)
-const MMIO_FLAGS: u64 = paging::WRITABLE | (1 << 4) | (1 << 3);
+/// MMIO mapping flags: writable + device (uncached) memory. Device registers
+/// must not be cached. (`Mmu::map` adds the present bit.)
+const MMIO_FLAGS: MapFlags = MapFlags::WRITABLE.union(MapFlags::DEVICE);
 /// Pages to map for the register window. qemu-xhci's BAR is ~16 KiB; 64 KiB is a
 /// safe cover for capability + operational + runtime + doorbell + port regs.
 const MMIO_PAGES: u64 = 16;
@@ -273,7 +273,7 @@ pub fn init() -> bool {
     let base = frames::phys_to_virt(bar_phys);
     for i in 0..MMIO_PAGES {
         let off = i * frames::FRAME_SIZE;
-        unsafe { paging::map(base as u64 + off, bar_phys + off, MMIO_FLAGS) };
+        unsafe { mmu().map(base as u64 + off, bar_phys + off, MMIO_FLAGS) };
     }
 
     let caplength = unsafe { read_volatile(base.add(CAP_CAPLENGTH)) } as usize;

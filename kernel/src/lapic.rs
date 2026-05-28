@@ -12,7 +12,8 @@
 // page is mapped uncached (like the xHCI BAR), in the kernel address space the
 // APs share.
 
-use crate::{frames, paging};
+use crate::frames;
+use crate::hal::{mmu, MapFlags, Mmu};
 use core::ptr::{read_volatile, write_volatile};
 
 const LAPIC_PHYS: u64 = 0xFEE0_0000;
@@ -39,15 +40,15 @@ const TIMER_INITIAL_COUNT: u32 = 1_000_000;
 
 static mut LAPIC_BASE: u64 = 0; // mapped virtual address (0 until `map`)
 
-/// MMIO mapping flags: writable + cache-disable (PCD) + write-through (PWT).
-const MMIO_FLAGS: u64 = paging::WRITABLE | (1 << 4) | (1 << 3);
+/// MMIO mapping flags: writable + device (uncached) memory.
+const MMIO_FLAGS: MapFlags = MapFlags::WRITABLE.union(MapFlags::DEVICE);
 
 /// Map the LAPIC register page into the (shared) kernel address space. Called
 /// once by the BSP before the APs touch their LAPICs.
 pub fn map() {
     let va = frames::phys_to_virt(LAPIC_PHYS) as u64;
     unsafe {
-        paging::map(va, LAPIC_PHYS, MMIO_FLAGS);
+        mmu().map(va, LAPIC_PHYS, MMIO_FLAGS);
         (&raw mut LAPIC_BASE).write(va);
     }
 }

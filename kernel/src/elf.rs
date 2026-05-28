@@ -18,7 +18,8 @@
 //   phdr:    p_type@0(u32) p_flags@4(u32) p_offset@8(u64) p_vaddr@16(u64)
 //            p_filesz@32(u64) p_memsz@40(u64)
 
-use crate::{frames, paging};
+use crate::frames;
+use crate::hal::{mmu, MapFlags, Mmu};
 
 const PAGE: u64 = 4096;
 const USER_STACK_VA: u64 = 0x0000_0000_2000_0000; // proven-free user VA
@@ -33,7 +34,7 @@ const USER_STACK_PAGES: u64 = 32;
 // Pages we can roll back on a *failed* load (the $Failed funnel calls
 // `cleanup`). Sized to cover the largest program we load (tcc: ~104 PT_LOAD
 // pages) plus its stack, so a partial load is fully reclaimed. The *success*
-// path doesn't depend on this — `paging::free_address_space` walks the page
+// path doesn't depend on this — `Mmu::free_address_space` walks the page
 // tables on exit/reap and frees everything regardless.
 const MAX_TRACKED: usize = 512;
 
@@ -172,9 +173,9 @@ pub fn map_segments(hdr: ElfHeader) -> bool {
         if p_type != 1 {
             continue; // not PT_LOAD
         }
-        let mut flags = paging::USER;
+        let mut flags = MapFlags::USER;
         if p_flags & 2 != 0 {
-            flags |= paging::WRITABLE; // PF_W
+            flags |= MapFlags::WRITABLE; // PF_W
         }
         if !map_one_segment(p_offset, p_vaddr, p_filesz, p_memsz, flags) {
             return false;
@@ -183,7 +184,13 @@ pub fn map_segments(hdr: ElfHeader) -> bool {
     true
 }
 
-fn map_one_segment(p_offset: u64, p_vaddr: u64, p_filesz: u64, p_memsz: u64, flags: u64) -> bool {
+fn map_one_segment(
+    p_offset: u64,
+    p_vaddr: u64,
+    p_filesz: u64,
+    p_memsz: u64,
+    flags: MapFlags,
+) -> bool {
     let seg_end = p_vaddr + p_memsz;
     // Align the *page* down, but keep the segment's sub-page offset: ELF only
     // guarantees `p_offset ≡ p_vaddr (mod PAGE)`, NOT that p_vaddr is page
@@ -217,7 +224,7 @@ fn map_one_segment(p_offset: u64, p_vaddr: u64, p_filesz: u64, p_memsz: u64, fla
                     return false; // file offsets out of range — corrupt
                 }
             }
-            paging::map_in(elf().pml4, va, frame, flags);
+            mmu().map_in(elf().pml4, va, frame, flags);
         }
         track(va, frame);
         va += PAGE;
@@ -238,7 +245,7 @@ pub fn build_stack() -> bool {
         };
         unsafe {
             core::ptr::write_bytes(frames::phys_to_virt(frame), 0, PAGE as usize);
-            paging::map_in(e.pml4, va, frame, paging::USER | paging::WRITABLE);
+            mmu().map_in(e.pml4, va, frame, MapFlags::USER | MapFlags::WRITABLE);
         }
         track(va, frame);
     }
@@ -261,7 +268,7 @@ pub fn build_stack() -> bool {
             crate::usermode::SIGTRAMP_CODE.len(),
         );
         // USER only (no WRITABLE): read+execute. The code must not be writable.
-        paging::map_in(e.pml4, crate::usermode::SIGTRAMP_VA, tramp, paging::USER);
+        mmu().map_in(e.pml4, crate::usermode::SIGTRAMP_VA, tramp, MapFlags::USER);
     }
     track(crate::usermode::SIGTRAMP_VA, tramp);
     true
@@ -284,7 +291,7 @@ pub fn cleanup() {
     for i in 0..e.mapped_n {
         let (va, frame) = e.mapped[i];
         unsafe {
-            paging::unmap(va);
+            mmu().unmap(va);
         }
         frames::free_frame(frame);
     }

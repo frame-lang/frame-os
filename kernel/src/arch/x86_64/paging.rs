@@ -1,35 +1,55 @@
-// kernel/src/paging.rs
+// kernel/src/arch/x86_64/paging.rs
 //
-// 4-level x86_64 paging (B2 Step 2). Pure native — page-table manipulation.
+// The x86_64 implementation of `hal::Mmu`: 4-level paging (B2 Step 2),
+// relocated behind the HAL seam (B-HAL.1).
 //
 // We extend the page tables Limine already set up (read CR3 for the active
 // PML4) rather than building our own from scratch — far lower triple-fault
-// risk. Tables are reached through Limine's HHDM: a table at physical
-// address P is read/written at virtual `P + hhdm_offset` (see frames.rs).
+// risk. Tables are reached through Limine's HHDM: a table at physical address P
+// is read/written at virtual `P + hhdm_offset` (see frames.rs).
 //
 // A virtual address splits into four 9-bit table indices + a 12-bit offset:
 //   [47:39] PML4  [38:30] PDPT  [29:21] PD  [20:12] PT  [11:0] offset
 //
-// `map` walks PML4→PDPT→PD→PT, allocating + zeroing intermediate tables on
-// demand, and writes the leaf PTE. `translate` walks read-only. `unmap`
-// clears the leaf PTE. Single-threaded at B2 (init + the page-fault path,
-// IF=0); a lock joins when a preemptible context maps (B3).
+// The CPU-instruction primitives are CR3 read/write (address-space handle +
+// switch) and `invlpg` (per-page TLB flush) — the x86 counterparts of AArch64's
+// TTBR0/1 + `tlbi`. Everything else is page-table memory manipulation in the
+// x86 format; the arch-neutral `hal::MapFlags` are translated to x86 PTE bits
+// by `flags_to_pte` here, so callers never name an x86 bit.
 
 use core::arch::asm;
 
 use crate::frames;
+use crate::hal::{MapFlags, Mmu};
 
-/// PTE flag: the entry is present (maps something).
-pub const PRESENT: u64 = 1 << 0;
-/// PTE flag: writable.
-pub const WRITABLE: u64 = 1 << 1;
-/// PTE flag: user-accessible (ring 3). Required on the leaf *and* every
-/// intermediate table on the walk for a ring-3 access to succeed.
-pub const USER: u64 = 1 << 2;
+// x86_64 page-table entry bits (private to this arch impl).
+const PRESENT: u64 = 1 << 0;
+const WRITABLE: u64 = 1 << 1;
+/// User-accessible (ring 3). Required on the leaf *and* every intermediate
+/// table on the walk for a ring-3 access to succeed.
+const USER: u64 = 1 << 2;
+const PWT: u64 = 1 << 3; // page write-through
+const PCD: u64 = 1 << 4; // page cache disable (uncached — for MMIO)
 
-/// Mask selecting the physical frame address out of a page-table entry or
-/// CR3 (bits 12..52).
+/// Mask selecting the physical frame address out of a page-table entry or CR3
+/// (bits 12..52).
 const ADDR_MASK: u64 = 0x000F_FFFF_FFFF_F000;
+
+/// Translate arch-neutral [`MapFlags`] to the x86 PTE attribute bits (PRESENT
+/// is added by `map_in_raw`, so it is not produced here).
+fn flags_to_pte(flags: MapFlags) -> u64 {
+    let mut bits = 0u64;
+    if flags.contains(MapFlags::WRITABLE) {
+        bits |= WRITABLE;
+    }
+    if flags.contains(MapFlags::USER) {
+        bits |= USER;
+    }
+    if flags.contains(MapFlags::DEVICE) {
+        bits |= PCD | PWT; // uncached MMIO
+    }
+    bits
+}
 
 fn read_cr3() -> u64 {
     let v: u64;
@@ -52,9 +72,9 @@ fn entry_ptr(table_phys: u64, index: u64) -> *mut u64 {
     unsafe { table.add(index as usize) }
 }
 
-/// Return the physical address of the next-level table under `table_phys`
-/// at `index`, allocating + zeroing a fresh one (and installing it
-/// present+writable) if not present.
+/// Return the physical address of the next-level table under `table_phys` at
+/// `index`, allocating + zeroing a fresh one (and installing it present+
+/// writable+user) if not present.
 ///
 /// # Safety
 /// `table_phys` must be a valid page-table frame.
@@ -90,17 +110,17 @@ fn indices(virt: u64) -> (u64, u64, u64, u64) {
 }
 
 /// Physical address of the active PML4 (the current address space handle).
-pub fn current_pml4() -> u64 {
+fn current_pml4() -> u64 {
     read_cr3() & ADDR_MASK
 }
 
-/// Map `virt` → `phys` with `flags` in the address space rooted at
-/// `pml4` (a PML4 physical address). PRESENT is added automatically.
+/// Map `virt` → `phys` with raw x86 PTE `flags` in the space rooted at `pml4`.
+/// PRESENT is added automatically.
 ///
 /// # Safety
 /// Mutates the given address space. `pml4` must be a valid PML4 frame and
 /// `phys` a valid frame. 4 KiB pages only.
-pub unsafe fn map_in(pml4: u64, virt: u64, phys: u64, flags: u64) {
+unsafe fn map_in_raw(pml4: u64, virt: u64, phys: u64, flags: u64) {
     let (i4, i3, i2, i1) = indices(virt);
     let pdpt = next_table(pml4, i4);
     let pd = next_table(pdpt, i3);
@@ -112,23 +132,15 @@ pub unsafe fn map_in(pml4: u64, virt: u64, phys: u64, flags: u64) {
     }
 }
 
-/// Map `virt` → `phys` with `flags` in the active address space.
-///
-/// # Safety
-/// As `map_in`, on the active space.
-pub unsafe fn map(virt: u64, phys: u64, flags: u64) {
-    map_in(current_pml4(), virt, phys, flags);
-}
-
 /// Build a fresh address space: a new PML4 whose lower half (user space) is
-/// empty and whose higher half (kernel + HHDM, indices 256..512) mirrors
-/// the current PML4 — so the kernel stays mapped after a `switch`. Returns
-/// the new PML4's physical address.
+/// empty and whose higher half (kernel + HHDM, indices 256..512) mirrors the
+/// current PML4 — so the kernel stays mapped after a `switch`. Returns the new
+/// PML4's physical address.
 ///
 /// # Safety
-/// Allocates a frame; the result is only safe to `switch` to while the
-/// kernel higher-half it copied remains valid (always, at B2).
-pub unsafe fn new_address_space() -> u64 {
+/// Allocates a frame; the result is only safe to switch to while the kernel
+/// higher-half it copied remains valid.
+unsafe fn new_space() -> u64 {
     let frame = frames::alloc_frame().expect("out of frames for new address space");
     let new_pml4 = frames::phys_to_virt(frame) as *mut u64;
     let cur_pml4 = frames::phys_to_virt(current_pml4()) as *const u64;
@@ -147,14 +159,12 @@ pub unsafe fn new_address_space() -> u64 {
 /// Build a child address space that eager-copies `parent_pml4`'s *user* space:
 /// the kernel higher-half is mirrored (shared), and every present user page
 /// (PML4 indices 0..256) is duplicated into a fresh frame with the same
-/// contents + flags. Returns the child PML4 physical address. Used by `fork`.
-/// (Eager copy now; copy-on-write is a later optimization.)
+/// contents + flags. Returns the child PML4 physical address.
 ///
 /// # Safety
-/// `parent_pml4` must be the active address space (so `new_address_space`'s
-/// higher-half mirror is the parent's kernel mapping). Allocates frames.
-pub unsafe fn fork_address_space(parent_pml4: u64) -> u64 {
-    let child = new_address_space(); // higher-half mirrored from the parent
+/// `parent_pml4` must be the active address space. Allocates frames.
+unsafe fn fork_space(parent_pml4: u64) -> u64 {
+    let child = new_space(); // higher-half mirrored from the parent
     let parent = frames::phys_to_virt(parent_pml4) as *const u64;
     for i4 in 0..256u64 {
         let e4 = *parent.add(i4 as usize);
@@ -188,7 +198,7 @@ pub unsafe fn fork_address_space(parent_pml4: u64) -> u64 {
                         frames::phys_to_virt(dst_phys),
                         4096,
                     );
-                    map_in(child, va, dst_phys, e1 & (WRITABLE | USER));
+                    map_in_raw(child, va, dst_phys, e1 & (WRITABLE | USER));
                 }
             }
         }
@@ -196,15 +206,13 @@ pub unsafe fn fork_address_space(parent_pml4: u64) -> u64 {
     child
 }
 
-/// Free an address space's *user* half (B3 Step 5d teardown): every user leaf
-/// frame, the user page-table frames (PT/PD/PDPT under PML4 indices 0..256),
-/// and the PML4 frame itself. The shared kernel higher-half (256..512) is left
-/// untouched. Call only on a space no longer active (CR3 points elsewhere).
+/// Free an address space's *user* half: every user leaf frame, the user
+/// page-table frames (PT/PD/PDPT under PML4 indices 0..256), and the PML4 frame
+/// itself. The shared kernel higher-half (256..512) is left untouched.
 ///
 /// # Safety
-/// `pml4` must be a PML4 not currently loaded in CR3, with a private user half
-/// (as produced by `new_address_space` / `fork_address_space`).
-pub unsafe fn free_address_space(pml4: u64) {
+/// `pml4` must be a PML4 not currently loaded in CR3, with a private user half.
+unsafe fn free_space(pml4: u64) {
     let p4 = frames::phys_to_virt(pml4) as *const u64;
     for i4 in 0..256u64 {
         let e4 = *p4.add(i4 as usize);
@@ -247,16 +255,16 @@ pub unsafe fn free_address_space(pml4: u64) {
 /// # Safety
 /// `pml4_phys` must root an address space that maps the currently-executing
 /// code, the stack, and the HHDM — else the next instruction faults.
-pub unsafe fn switch(pml4_phys: u64) {
+unsafe fn switch_to(pml4_phys: u64) {
     asm!("mov cr3, {}", in(reg) pml4_phys, options(nostack, preserves_flags));
 }
 
-/// Remove the mapping for `virt` (clears the leaf PTE). Intermediate tables
-/// are left in place.
+/// Remove the mapping for `virt` (clears the leaf PTE). Intermediate tables are
+/// left in place.
 ///
 /// # Safety
 /// Changes the active address space.
-pub unsafe fn unmap(virt: u64) {
+unsafe fn unmap_raw(virt: u64) {
     let (i4, i3, i2, i1) = indices(virt);
     let pml4 = read_cr3() & ADDR_MASK;
     let e4 = entry_ptr(pml4, i4);
@@ -277,7 +285,7 @@ pub unsafe fn unmap(virt: u64) {
 }
 
 /// Translate a virtual address to its physical address, or None if unmapped.
-pub fn translate(virt: u64) -> Option<u64> {
+fn translate_raw(virt: u64) -> Option<u64> {
     let (i4, i3, i2, i1) = indices(virt);
     let pml4 = read_cr3() & ADDR_MASK;
     unsafe {
@@ -298,5 +306,53 @@ pub fn translate(virt: u64) -> Option<u64> {
             return None;
         }
         Some((e1 & ADDR_MASK) | (virt & 0xFFF))
+    }
+}
+
+/// The x86_64 MMU. A zero-sized handle — the HAL's `Mmu` device.
+pub struct X86Mmu;
+
+static MMU: X86Mmu = X86Mmu;
+
+/// The x86_64 MMU (4-level paging over the active CR3).
+pub fn mmu() -> &'static X86Mmu {
+    &MMU
+}
+
+impl Mmu for X86Mmu {
+    fn current_address_space(&self) -> u64 {
+        current_pml4()
+    }
+
+    unsafe fn map_in(&self, space: u64, virt: u64, phys: u64, flags: MapFlags) {
+        unsafe { map_in_raw(space, virt, phys, flags_to_pte(flags)) };
+    }
+
+    unsafe fn map(&self, virt: u64, phys: u64, flags: MapFlags) {
+        unsafe { map_in_raw(current_pml4(), virt, phys, flags_to_pte(flags)) };
+    }
+
+    unsafe fn unmap(&self, virt: u64) {
+        unsafe { unmap_raw(virt) };
+    }
+
+    fn translate(&self, virt: u64) -> Option<u64> {
+        translate_raw(virt)
+    }
+
+    unsafe fn new_address_space(&self) -> u64 {
+        unsafe { new_space() }
+    }
+
+    unsafe fn fork_address_space(&self, parent: u64) -> u64 {
+        unsafe { fork_space(parent) }
+    }
+
+    unsafe fn free_address_space(&self, space: u64) {
+        unsafe { free_space(space) };
+    }
+
+    unsafe fn switch_address_space(&self, space: u64) {
+        unsafe { switch_to(space) };
     }
 }
