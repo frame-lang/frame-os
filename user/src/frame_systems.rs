@@ -32,27 +32,7 @@ include!(concat!(env!("OUT_DIR"), "/parser.rs"));
 // compiles — one FSM source, both targets.
 include!(concat!(env!("OUT_DIR"), "/pipeline.rs"));
 
-// One background-job table entry for the IshJobs FSM (S10). The FSM declares its
-// domain field as `Vec<JobEntry>`; Frame treats `JobEntry` as an opaque type and
-// passes it through verbatim, so it must resolve in the generated module's scope.
-// The generated `mod _ishjobs_framec { use super::*; }` wrapper picks this up via
-// its glob import (same mechanism as String/Vec/Box above). Clone is required
-// because snapshot() hands ish a clone of the table to iterate.
-#[derive(Clone)]
-pub struct JobEntry {
-    /// POSIX-job-spec id (1, 2, 3, ...), assigned by the FSM on launch_bg.
-    pub id: u32,
-    /// The child's process id, as returned by fork().
-    pub pid: u64,
-    /// The command line as typed (for `jobs` / "Done" reporting).
-    pub cmd: String,
-    /// Set once the child has been reaped via the non-blocking sweep.
-    pub done: bool,
-    /// Set while the job is job-control stopped (SIGTSTP/SIGSTOP); cleared on
-    /// resume (bg/fg). Mutually exclusive with `done` in practice.
-    pub stopped: bool,
-    /// The child's exit code, valid once `done` is true.
-    pub code: i32,
-}
-
-include!(concat!(env!("OUT_DIR"), "/ish_jobs.rs"));
+// (IshJobs + its JobEntry were retired at M4.3b — ish's job table is now the
+// shared JobControl FSM, compiled in ish.rs's job_fsm module over the
+// SyscallProcessBackend. frame_systems is left with the parser+pipeline systems
+// shared across ish + frameshell.)

@@ -1612,10 +1612,10 @@ fn run_console_test() -> Result<()> {
         wait_for_output(&buf, "    1     0 ", 90)?; // the shell row: pid 1, ppid 0 (STAT varies)
 
         // S10 job control: `echo bgjob &` forks the echo child and returns to the
-        // prompt *without* waiting — ish records it in the IshJobs FSM (job id 1)
+        // prompt *without* waiting — ish records it in the JobControl FSM (job id 1)
         // and echoes `[1] <pid>` bash-style. The child runs + exits while the shell
         // is idle; the next command's pre-prompt harvest sweep (non-blocking
-        // reap-any via syscall #28 → IshJobs.mark_done) reaps it and prints the
+        // reap-any via syscall #28 → JobControl reap) reaps it and prints the
         // async `[1]+ Done   echo bgjob` report. `fg 99` exercises the no-such-job
         // error path. All asserted strings are shell output, not typed input
         // (the typed command carries the trailing `&`; the Done line drops it).
@@ -1644,7 +1644,7 @@ fn run_console_test() -> Result<()> {
 
         // S10 signals: `spin &` backgrounds a long-lived process (job id 2 — job 1
         // was the harvested echo above; next_id is monotonic). `kill %2` resolves
-        // the job spec to spin's pid through the IshJobs FSM snapshot and sends
+        // the job spec to spin's pid through the JobControl FSM snapshot and sends
         // SIGTERM (#29); the kernel delivers it at spin's next syscall boundary,
         // whose default action terminates it (do_exit). The follow-up `pwd`'s
         // pre-prompt harvest then reaps + reports the killed job. `spin: alive` is
@@ -1665,7 +1665,7 @@ fn run_console_test() -> Result<()> {
             .write_all(b"pwd\n")
             .context("write pwd (trigger harvest after kill)")?;
         stdin.flush().ok();
-        wait_for_output(&buf, "Done   spin", 90)?; // killed job reaped + reported by the IshJobs FSM
+        wait_for_output(&buf, "Done   spin", 90)?; // killed job reaped + reported by the JobControl FSM
 
         // S10 2b signal handlers: sigtest installs a SIGTERM handler (sigaction
         // #30). `kill %3` (job 3 — echo/spin were 1/2 and are gone) sends SIGTERM;

@@ -35,10 +35,9 @@ use core::panic::PanicInfo;
 mod frame_systems;
 mod mem;
 
-// Parser/Pipeline/Token/TokenKind are used inside the shell_fsm module (which
-// imports them from frame_systems directly); ish root only needs IshJobs (the
-// job-table type its execution helpers + IshShellEnv use).
-use frame_systems::IshJobs;
+// All the shared Frame systems ish uses (Parser, Pipeline, Shell, Job,
+// JobControl) are pulled in inside the shell_fsm / job_fsm modules; ish root
+// imports none of them directly any more (IshJobs was retired at M4.3b).
 
 #[inline(always)]
 unsafe fn syscall3(num: u64, a0: u64, a1: u64, a2: u64) -> u64 {
@@ -116,15 +115,6 @@ fn fork() -> u64 {
 }
 fn waitpid(pid: u64) -> u64 {
     unsafe { syscall3(4, pid, 0, 0) }
-}
-/// reap_nohang (#28): non-blocking reap of *any* exited child (POSIX
-/// `waitpid(-1, WNOHANG)`). Returns `(pid << 32) | (status as u32)`, or 0 if no
-/// child has exited yet (pid 0 is never a real child, so 0 is an unambiguous
-/// "nothing to harvest"). The shell loops on this at the prompt to collect
-/// finished `&` background jobs without blocking. Unlike `waitpid`, this never
-/// stalls the prompt waiting on a still-running job.
-fn reap_nohang() -> u64 {
-    unsafe { syscall3(28, 0, 0, 0) }
 }
 /// Per-pid non-blocking reap: `reap_nohang` with a specific target (the kernel's
 /// sys_reap_nohang reaps exactly `pid` when target != 0). Returns
@@ -242,13 +232,19 @@ fn build_argv(toks: &[String]) -> (Vec<u8>, u64) {
     (argv, toks.len() as u64)
 }
 
-fn run_external(
+/// Run an external command with I/O redirection, WITHOUT the job table (M4).
+/// Used for redirected commands + pipeline stages, which bypass JobControl on
+/// both targets (the hosted side runs these via exec.rs, not JobControl). The
+/// child applies `< > >>` then execs from disk; for a foreground command the
+/// parent registers it as the terminal foreground job and waits. (Plain,
+/// non-redirected fg/bg commands go through the shared JobControl/Job FSM now —
+/// see IshShellEnv.) A backgrounded redirected command is not tracked (rare;
+/// not exercised by console-test).
+fn run_external_untracked(
     toks: &[String],
     redir_in: &Option<String>,
     redir_out: &Option<(String, bool)>,
     background: bool,
-    cmd_str: &str,
-    jobs: &mut IshJobs,
 ) {
     let cmd = toks[0].as_str();
     let (argv, argc) = build_argv(toks);
@@ -285,45 +281,14 @@ fn run_external(
         print(cmd.as_bytes());
         write_char(b'\n');
         exit(127);
-    } else if background {
-        // Backgrounded (`cmd &`): record the child in the IshJobs FSM and return
-        // to the prompt *without* waiting. The FSM assigns a job id; echo the
-        // `[id] pid` line bash-style. The child is harvested later by the
-        // non-blocking reap sweep that runs before each prompt (see harvest()).
-        jobs.launch_bg(child, String::from(cmd_str));
-        let mut l = Vec::new();
-        l.push(b'[');
-        push_u64(&mut l, jobs.last_id() as u64);
-        l.extend_from_slice(b"] ");
-        push_u64(&mut l, child);
-        l.push(b'\n');
-        emit(&l);
-    } else {
-        // Foreground: drive the FSM into $Foreground for the duration, register
-        // the child as the foreground job (so Ctrl-C/Ctrl-Z reach it), and wait
-        // for *this* child specifically. Waiting on the exact pid (not `wait`-any)
-        // keeps the shell from racing ahead of the command it just launched. The
-        // FSM's $Foreground state encodes this window: the shell is blocked here
-        // and won't touch the job table until fg_done().
-        jobs.launch_fg();
-        set_foreground(child);
-        let st = waitpid(child);
-        set_foreground(0);
-        jobs.fg_done();
-        if st & WSTOPPED != 0 {
-            // Ctrl-Z (or SIGSTOP) suspended the job rather than ending it. It
-            // becomes a tracked stopped background job, bash-style, so `jobs` /
-            // `bg` / `fg` can manage it.
-            jobs.launch_stopped(child, String::from(cmd_str));
-            let mut l = Vec::new();
-            l.push(b'[');
-            push_u64(&mut l, jobs.last_id() as u64);
-            l.extend_from_slice(b"]+ Stopped   ");
-            l.extend_from_slice(cmd_str.as_bytes());
-            l.push(b'\n');
-            emit(&l);
-        }
     }
+    if !background {
+        // Foreground: this child owns the terminal while it runs, then we wait.
+        set_foreground(child);
+        let _ = waitpid(child);
+        set_foreground(0);
+    }
+    // Background redirected command: don't wait (untracked).
 }
 
 /// Run `left | right`: connect left's stdout to right's stdin through a pipe
@@ -376,90 +341,11 @@ fn run_pipeline(left: &[String], right: &[String]) {
 // them with the shared Parser -> Pipeline FSM; the grammar is owned by
 // frame/pipeline.frs now, the same source the hosted shell compiles.)
 
-/// Harvest finished background (`&`) jobs without blocking. Called once before
-/// every prompt: loop the non-blocking reap syscall to collect every child that
-/// has exited since the last prompt, tell the IshJobs FSM (mark_done), then print
-/// a bash-style `[id]+ Done   cmd` line for each and drop the entry. Reaping at
-/// the prompt — and only at the prompt — is exactly what the FSM's $Idle state
-/// represents; while a foreground job runs we're parked in waitpid ($Foreground)
-/// and never get here.
-fn harvest(jobs: &mut IshJobs) {
-    loop {
-        let v = reap_nohang();
-        if v == 0 {
-            break;
-        }
-        let pid = v >> 32;
-        let code = (v & 0xffff_ffff) as u32 as i32;
-        jobs.mark_done(pid, code);
-    }
-    // Report + remove every entry now flagged done. snapshot() is a clone, so
-    // calling jobs.remove() inside the loop doesn't disturb the iteration.
-    for e in jobs.snapshot() {
-        if e.done {
-            let mut l = Vec::new();
-            l.push(b'[');
-            push_u64(&mut l, e.id as u64);
-            l.extend_from_slice(b"]+ Done   ");
-            l.extend_from_slice(e.cmd.as_bytes());
-            l.push(b'\n');
-            emit(&l);
-            jobs.remove(e.id);
-        }
-    }
-}
-
-/// Resolve a job-spec argument (`%N`, bare `N`, or None=most-recent) to a job id.
-/// `stopped_only` picks the highest *stopped* job when no argument is given
-/// (bash's `bg`); otherwise the highest non-done job (bash's `fg`). 0 = none.
-fn resolve_job_id(arg: Option<&str>, jobs: &mut IshJobs, stopped_only: bool) -> u32 {
-    if let Some(s) = arg {
-        let spec = s.strip_prefix('%').unwrap_or(s);
-        return parse_u32(spec).unwrap_or(0);
-    }
-    let mut best = 0u32;
-    for e in &jobs.snapshot() {
-        if !e.done && (!stopped_only || e.stopped) && e.id > best {
-            best = e.id;
-        }
-    }
-    best
-}
-
-// (fg_job was retired at M3b.3 — its resume-then-wait logic is now split across
-// IshShellEnv::fg (find job + resume + set_foreground) and
-// IshShellEnv::wait_foreground (the blocking waitpid + stop/exit reporting),
-// mapping ish's synchronous model onto the Shell FSM's spawn/wait phases.
-// `fg <id>` now takes a plain numeric id, like the hosted shell; bg/kill keep
-// the `%N` job-spec form via resolve_job_id.)
-
-/// `bg [id]`: resume a stopped job in the background (SIGCONT) and leave it
-/// running there. It's harvested at a later prompt when it exits.
-fn bg_job(arg: Option<&str>, jobs: &mut IshJobs) {
-    let id = resolve_job_id(arg, jobs, true);
-    let mut pid = 0u64;
-    let mut cmd = String::new();
-    for e in &jobs.snapshot() {
-        if e.id == id && !e.done {
-            pid = e.pid;
-            cmd = e.cmd.clone();
-            break;
-        }
-    }
-    if pid == 0 {
-        print(b"bg: no such job\n");
-        return;
-    }
-    kill(pid, SIGCONT);
-    jobs.mark_running(id);
-    let mut l = Vec::new();
-    l.push(b'[');
-    push_u64(&mut l, id as u64);
-    l.extend_from_slice(b"] ");
-    l.extend_from_slice(cmd.as_bytes());
-    l.extend_from_slice(b" &\n");
-    emit(&l);
-}
+// (M4.3b retired the IshJobs-backed job functions — harvest, resolve_job_id,
+// fg_job, bg_job, kill_cmd, list_jobs. The job table is now the shared
+// JobControl FSM; IshShellEnv presents ish's bash-style job output over its
+// snapshot + drives spawn/wait/fg/bg/kill through it. parse_signal stays —
+// IshShellEnv's kill builtin uses it.)
 
 /// Map a signal spec (name without the `-`, or a number) to its number.
 /// Supports the job-control + terminate set the shell uses.
@@ -472,92 +358,6 @@ fn parse_signal(s: &str) -> Option<u64> {
         "STOP" | "19" => Some(19),
         "TSTP" | "20" => Some(20),
         _ => parse_u32(s).map(|n| n as u64),
-    }
-}
-
-/// `kill [-SIG] %<job>|<pid>`: send a signal (default SIGTERM). `-SIG` is a name
-/// (`-STOP`, `-CONT`, `-KILL`, ...) or number (`-9`). A `%N` target is a job spec
-/// resolved to a pid through the IshJobs FSM snapshot; otherwise it's a raw pid.
-fn kill_cmd(toks: &[String], jobs: &mut IshJobs) {
-    let mut idx = 1;
-    let mut sig = 15u64; // SIGTERM default
-    if idx < toks.len() && toks[idx].starts_with('-') {
-        match parse_signal(&toks[idx][1..]) {
-            Some(s) => sig = s,
-            None => {
-                print(b"kill: bad signal: ");
-                print(toks[idx].as_bytes());
-                write_char(b'\n');
-                return;
-            }
-        }
-        idx += 1;
-    }
-    let arg = match toks.get(idx) {
-        Some(a) => a.as_str(),
-        None => {
-            print(b"kill: usage: kill [-SIG] %<job> | <pid>\n");
-            return;
-        }
-    };
-    let pid = if let Some(spec) = arg.strip_prefix('%') {
-        // Job spec: resolve %N → pid via the FSM's table.
-        let id = match parse_u32(spec) {
-            Some(n) => n,
-            None => {
-                print(b"kill: bad job spec\n");
-                return;
-            }
-        };
-        let mut p = 0u64;
-        for e in &jobs.snapshot() {
-            if e.id == id && !e.done {
-                p = e.pid;
-                break;
-            }
-        }
-        if p == 0 {
-            print(b"kill: no such job\n");
-            return;
-        }
-        p
-    } else {
-        // Raw pid.
-        match parse_u32(arg) {
-            Some(n) => n as u64,
-            None => {
-                print(b"kill: not a pid: ");
-                print(arg.as_bytes());
-                write_char(b'\n');
-                return;
-            }
-        }
-    };
-    if kill(pid, sig) == u64::MAX {
-        print(b"kill: no such process\n");
-    }
-}
-
-/// `jobs`: list tracked background jobs (id, state, pid, command). Each row is
-/// emitted in one write() so an async kernel log can't split it.
-fn list_jobs(jobs: &mut IshJobs) {
-    for e in jobs.snapshot() {
-        let mut l = Vec::new();
-        l.push(b'[');
-        push_u64(&mut l, e.id as u64);
-        l.extend_from_slice(b"] ");
-        if e.done {
-            l.extend_from_slice(b"Done    ");
-        } else if e.stopped {
-            l.extend_from_slice(b"Stopped ");
-        } else {
-            l.extend_from_slice(b"Running ");
-        }
-        push_u64(&mut l, e.pid);
-        l.push(b' ');
-        l.extend_from_slice(e.cmd.as_bytes());
-        l.push(b'\n');
-        emit(&l);
     }
 }
 
@@ -746,42 +546,56 @@ mod shell_fsm {
     pub use alloc::string::{String, ToString};
     pub use alloc::vec::Vec;
 
-    // ish's native syscalls / builtins / job table — the mechanism IshShellEnv
-    // drives (the same code the hand-written run_line used).
-    use super::harvest;
+    // ish syscalls + the shared JobControl/Job FSMs (job_fsm, over the
+    // SyscallProcessBackend). M4.3b retired the ish-specific IshJobs + the old
+    // run_external; the job TABLE is now the shared JobControl — the SAME FSM the
+    // hosted shell uses. Redirected commands + pipelines stay native
+    // (run_external_untracked / run_pipeline), same as the hosted side.
+    use super::job_fsm::JobControl;
     use super::{
-        bg_job, build_argv, cat, chdir, emit, exec_argv, exit, fork, getcwd, kill, kill_cmd,
-        list_jobs, print, push_u64, run_external, run_pipeline, set_foreground, waitpid,
-        write_char, IshJobs, SIGCONT, WSTOPPED,
+        cat, chdir, emit, getcwd, kill, parse_signal, parse_u32, print, push_u64,
+        run_external_untracked, run_pipeline, write_char,
     };
 
     include!(concat!(env!("OUT_DIR"), "/shell.rs"));
 
-    // The foreground command awaiting a wait_foreground(). ish executes
-    // synchronously (fork then waitpid), so the Shell FSM's spawn/wait split
-    // maps to: spawn_foreground/fg start the child (or resume a job) and stash
-    // it here; wait_foreground (in $RunningForeground) does the blocking
-    // waitpid + reports stop/exit — a faithful split, not a no-op wait.
-    enum FgPending {
-        /// A freshly fork+exec'd external. On stop → becomes a tracked job.
-        Fresh { pid: u64, cmd: String },
-        /// A resumed `fg <id>` job. On stop → re-mark stopped; on exit → remove.
-        Resumed { pid: u64, id: u32, cmd: String },
-    }
-
-    /// Ring-3 environment for the shared Shell FSM: ish's syscalls + the IshJobs
-    /// job table behind the ShellEnv seam.
+    /// Ring-3 environment for the shared Shell FSM. The job TABLE is now the
+    /// shared `JobControl` FSM (over the SyscallProcessBackend) — the SAME FSM
+    /// the hosted shell uses, replacing the ish-specific IshJobs (M4). ish keeps
+    /// its own *presentation* (the bash-style report lines the console-test
+    /// asserts) layered over JobControl's snapshot, and its native exec for
+    /// redirected commands + pipelines (which bypass JobControl on both targets).
     pub struct IshShellEnv {
-        jobs: IshJobs,
-        fg_pending: Option<FgPending>,
+        jobs: JobControl,
     }
 
     impl IshShellEnv {
         fn new() -> Self {
             Self {
-                jobs: IshJobs::__create(),
-                fg_pending: None,
+                jobs: JobControl::__create(),
             }
+        }
+
+        /// pid of a live (non-done) job by id, via JobControl's snapshot; 0 if
+        /// none. Used to resolve `%N` job specs for kill/bg.
+        fn live_pid(&mut self, id: u32) -> u32 {
+            for s in self.jobs.jobs() {
+                if s.id == id && s.state != "Done" && !s.state.starts_with("Failed") {
+                    return s.pid;
+                }
+            }
+            0
+        }
+
+        /// Report + remove a `JobSummary`-shaped row as a bash-style line.
+        fn emit_job_line(prefix: &[u8], id: u32, mid: &[u8], cmd: &str, suffix: &[u8]) {
+            let mut l = Vec::new();
+            l.extend_from_slice(prefix);
+            push_u64(&mut l, id as u64);
+            l.extend_from_slice(mid);
+            l.extend_from_slice(cmd.as_bytes());
+            l.extend_from_slice(suffix);
+            emit(&l);
         }
     }
 
@@ -804,7 +618,16 @@ mod shell_fsm {
         }
 
         fn tick(&mut self) {
-            harvest(&mut self.jobs);
+            // Reap finished background jobs (JobControl polls each via the
+            // SyscallProcessBackend's per-pid reap), then report + remove the
+            // ones now done — ish's bash-style "[id]+ Done   cmd" at the prompt.
+            self.jobs.tick();
+            for s in self.jobs.jobs() {
+                if s.state == "Done" || s.state.starts_with("Failed") {
+                    Self::emit_job_line(b"[", s.id, b"]+ Done   ", &s.cmd, b"\n");
+                    self.jobs.remove(s.id);
+                }
+            }
         }
 
         fn classify(&self, words: &[String]) -> CommandKind {
@@ -836,9 +659,108 @@ mod shell_fsm {
                     print(b"pipes: cmd1 | cmd2 (connect cmd1's stdout to cmd2's stdin)\n");
                     print(b"background: cmd &   (jobs/fg/bg manage; Ctrl-Z stops the foreground job, Ctrl-C interrupts)\n");
                 }
-                "jobs" => list_jobs(&mut self.jobs),
-                "bg" => bg_job(words.get(1).map(|s| s.as_str()), &mut self.jobs),
-                "kill" => kill_cmd(words, &mut self.jobs),
+                "jobs" => {
+                    // ish's "[id] State pid cmd" listing, over JobControl's snapshot.
+                    for s in self.jobs.jobs() {
+                        let mut l = Vec::new();
+                        l.push(b'[');
+                        push_u64(&mut l, s.id as u64);
+                        l.extend_from_slice(b"] ");
+                        if s.state == "Stopped" {
+                            l.extend_from_slice(b"Stopped ");
+                        } else if s.state == "Done" || s.state.starts_with("Failed") {
+                            l.extend_from_slice(b"Done    ");
+                        } else {
+                            l.extend_from_slice(b"Running ");
+                        }
+                        push_u64(&mut l, s.pid as u64);
+                        l.push(b' ');
+                        l.extend_from_slice(s.cmd.as_bytes());
+                        l.push(b'\n');
+                        emit(&l);
+                    }
+                }
+                "bg" => {
+                    // Resolve %N (or default to the highest stopped job), SIGCONT
+                    // it into the background, echo "[id] cmd &".
+                    let id = if let Some(a) = words.get(1) {
+                        let spec = a.strip_prefix('%').unwrap_or(a);
+                        parse_u32(spec).unwrap_or(0)
+                    } else {
+                        let mut best = 0u32;
+                        for s in self.jobs.jobs() {
+                            if s.state == "Stopped" && s.id > best {
+                                best = s.id;
+                            }
+                        }
+                        best
+                    };
+                    let mut cmd = String::new();
+                    for s in self.jobs.jobs() {
+                        if s.id == id && s.state != "Done" {
+                            cmd = s.cmd.clone();
+                            break;
+                        }
+                    }
+                    if self.live_pid(id) == 0 {
+                        print(b"bg: no such job\n");
+                        return;
+                    }
+                    self.jobs.bg(id);
+                    Self::emit_job_line(b"[", id, b"] ", &cmd, b" &\n");
+                }
+                "kill" => {
+                    // [-SIG] %<job>|<pid>; default SIGTERM. %N → pid via snapshot.
+                    let mut idx = 1;
+                    let mut sig = 15u64;
+                    if idx < words.len() && words[idx].starts_with('-') {
+                        match parse_signal(&words[idx][1..]) {
+                            Some(s) => sig = s,
+                            None => {
+                                print(b"kill: bad signal: ");
+                                print(words[idx].as_bytes());
+                                write_char(b'\n');
+                                return;
+                            }
+                        }
+                        idx += 1;
+                    }
+                    let arg = match words.get(idx) {
+                        Some(a) => a.as_str(),
+                        None => {
+                            print(b"kill: usage: kill [-SIG] %<job> | <pid>\n");
+                            return;
+                        }
+                    };
+                    let pid = if let Some(spec) = arg.strip_prefix('%') {
+                        let id = match parse_u32(spec) {
+                            Some(n) => n,
+                            None => {
+                                print(b"kill: bad job spec\n");
+                                return;
+                            }
+                        };
+                        let p = self.live_pid(id);
+                        if p == 0 {
+                            print(b"kill: no such job\n");
+                            return;
+                        }
+                        p as u64
+                    } else {
+                        match parse_u32(arg) {
+                            Some(n) => n as u64,
+                            None => {
+                                print(b"kill: not a pid: ");
+                                print(arg.as_bytes());
+                                write_char(b'\n');
+                                return;
+                            }
+                        }
+                    };
+                    if kill(pid, sig) == u64::MAX {
+                        print(b"kill: no such process\n");
+                    }
+                }
                 "cd" => {
                     let target = if words.len() > 1 {
                         words[1].as_str()
@@ -872,79 +794,55 @@ mod shell_fsm {
         }
 
         fn run_foreground_redirected(&mut self, cmd: &Command) {
+            // Redirected commands bypass JobControl (same as the hosted side);
+            // run synchronously, native.
             let redir_in = cmd.redir_in.clone();
             let redir_out = cmd.redir_out.clone().map(|f| (f, cmd.append));
-            let cmd_str = cmd.words.join(" ");
-            run_external(
-                &cmd.words,
-                &redir_in,
-                &redir_out,
-                false,
-                &cmd_str,
-                &mut self.jobs,
-            );
+            run_external_untracked(&cmd.words, &redir_in, &redir_out, false);
         }
 
         fn spawn_background(&mut self, cmd: &Command) {
-            let redir_in = cmd.redir_in.clone();
-            let redir_out = cmd.redir_out.clone().map(|f| (f, cmd.append));
-            let cmd_str = cmd.words.join(" ");
-            run_external(
-                &cmd.words,
-                &redir_in,
-                &redir_out,
-                true,
-                &cmd_str,
-                &mut self.jobs,
-            );
-        }
-
-        fn spawn_foreground(&mut self, words: &[String]) {
-            // Fork+exec now; block in wait_foreground (the $RunningForeground
-            // state). No redirection on this path (that's run_foreground_redirected).
-            let cmd_str = words.join(" ");
-            let (argv, argc) = build_argv(words);
-            let child = fork();
-            if child == 0 {
-                exec_argv(&argv, argc);
-                print(b"ish: command not found: ");
-                print(words[0].as_bytes());
-                write_char(b'\n');
-                exit(127);
+            let has_redir = cmd.redir_in.is_some() || cmd.redir_out.is_some();
+            if has_redir {
+                // Redirected background: native + untracked (rare; not in
+                // console-test). Matches the hosted spawn_background_redirected.
+                let redir_in = cmd.redir_in.clone();
+                let redir_out = cmd.redir_out.clone().map(|f| (f, cmd.append));
+                run_external_untracked(&cmd.words, &redir_in, &redir_out, true);
+                return;
             }
-            self.jobs.launch_fg();
-            set_foreground(child);
-            self.fg_pending = Some(FgPending::Fresh {
-                pid: child,
-                cmd: cmd_str,
-            });
-        }
-
-        fn fg(&mut self, id: u32) -> bool {
-            let mut pid = 0u64;
-            let mut was_stopped = false;
-            let mut cmd = String::new();
-            for e in &self.jobs.snapshot() {
-                if e.id == id && !e.done {
-                    pid = e.pid;
-                    was_stopped = e.stopped;
-                    cmd = e.cmd.clone();
+            let c = cmd.words[0].clone();
+            let a = cmd.words[1..].to_vec();
+            self.jobs.spawn_background(c, a);
+            // Echo "[id] pid" (bash-style). The new bg job's id is next_id - 1.
+            let id = self.jobs.next_job_id().saturating_sub(1);
+            let mut pid = 0u32;
+            for s in self.jobs.jobs() {
+                if s.id == id {
+                    pid = s.pid;
                     break;
                 }
             }
-            if pid == 0 {
-                return false;
-            }
-            // Echo the command being foregrounded (bash-style).
-            self.println(&cmd);
-            if was_stopped {
-                kill(pid, SIGCONT);
-                self.jobs.mark_running(id);
-            }
-            self.jobs.launch_fg();
-            set_foreground(pid);
-            self.fg_pending = Some(FgPending::Resumed { pid, id, cmd });
-            true
+            let mut l = Vec::new();
+            l.push(b'[');
+            push_u64(&mut l, id as u64);
+            l.extend_from_slice(b"] ");
+            push_u64(&mut l, pid as u64);
+            l.push(b'\n');
+            emit(&l);
+        }
+
+        fn spawn_foreground(&mut self, words: &[String]) {
+            // A plain foreground external is now a real Job (via JobControl over
+            // the SyscallProcessBackend) — the shared FSM, with a tentative id.
+            let c = words[0].clone();
+            let a = words[1..].to_vec();
+            self.jobs.spawn_foreground(c, a);
+        }
+
+        fn fg(&mut self, id: u32) -> bool {
+            self.jobs.fg(id);
+            self.jobs.is_running_foreground()
         }
 
         fn run_pipeline(&mut self, commands: &[Command]) {
@@ -957,44 +855,28 @@ mod shell_fsm {
         }
 
         fn wait_foreground(&mut self) {
-            let pending = match self.fg_pending.take() {
-                Some(p) => p,
-                None => return,
-            };
-            match pending {
-                FgPending::Fresh { pid, cmd } => {
-                    let st = waitpid(pid);
-                    set_foreground(0);
-                    self.jobs.fg_done();
-                    if st & WSTOPPED != 0 {
-                        // Ctrl-Z'd: becomes a tracked stopped job (bash-style).
-                        self.jobs.launch_stopped(pid, cmd.clone());
-                        let mut l = Vec::new();
-                        l.push(b'[');
-                        push_u64(&mut l, self.jobs.last_id() as u64);
-                        l.extend_from_slice(b"]+ Stopped   ");
-                        l.extend_from_slice(cmd.as_bytes());
-                        l.push(b'\n');
-                        emit(&l);
+            // Block on the foreground Job (JobControl → Job.await_rest →
+            // SyscallProcessBackend's blocking waitpid). Then present ish's
+            // result: a Ctrl-Z'd job becomes a tracked stopped job ("[id]+
+            // Stopped   cmd"); a completed one is removed (no Done notice for a
+            // foreground command — only background jobs get one, via tick()).
+            let fid = self.jobs.foreground_id();
+            self.jobs.wait_foreground();
+            let mut stopped = false;
+            let mut cmd = String::new();
+            for s in self.jobs.jobs() {
+                if s.id == fid {
+                    if s.state == "Stopped" {
+                        stopped = true;
+                        cmd = s.cmd.clone();
                     }
+                    break;
                 }
-                FgPending::Resumed { pid, id, cmd } => {
-                    let st = waitpid(pid);
-                    set_foreground(0);
-                    self.jobs.fg_done();
-                    if st & WSTOPPED != 0 {
-                        self.jobs.mark_stopped(id);
-                        let mut l = Vec::new();
-                        l.push(b'[');
-                        push_u64(&mut l, id as u64);
-                        l.extend_from_slice(b"]+ Stopped   ");
-                        l.extend_from_slice(cmd.as_bytes());
-                        l.push(b'\n');
-                        emit(&l);
-                    } else {
-                        self.jobs.remove(id);
-                    }
-                }
+            }
+            if stopped {
+                Self::emit_job_line(b"[", fid, b"]+ Stopped   ", &cmd, b"\n");
+            } else {
+                self.jobs.remove(fid);
             }
         }
     }

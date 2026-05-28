@@ -34,11 +34,9 @@ const FRAME_SYSTEMS: &[(&str, &str)] = &[
     // local shell_fsm module.
     ("job", "job.frs"),
     ("job_control", "job_control.frs"),
-    // IshJobs (S10): the interactive shell's job-control FSM ($Idle/$Foreground
-    // + background-job table), the ish-resident adaptation of the hosted-shell
-    // job_control.frs. Built for x86_64-unknown-none; src/frame_systems.rs
-    // include!s it. Tracks pids ish forks rather than spawning them itself.
-    ("ish_jobs", "ish_jobs.frs"),
+    // (ish_jobs.frs retired at M4.3b — ish now drives the shared JobControl/Job
+    // FSMs above, over the SyscallProcessBackend, instead of the ish-specific
+    // IshJobs job table.)
     // BuildDriver (B11-3e): the on-device toolchain pipeline FSM, driven by the
     // `build` bin. Generated to OUT_DIR; `src/build_frame.rs` include!s it.
     ("builddriver", "builddriver.frs"),

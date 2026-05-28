@@ -116,12 +116,36 @@ Sequenced lowest-risk-first; every milestone leaves both builds green.
   ring 3** — the headline H↔B parity result. Only M4 (consolidate job control,
   retire any remaining bespoke paths) remains.
 
-- **M4 — Consolidate + retire `ish`'s hand-written dispatch.** Switch `ish` fully to
-  the shared `Shell` + `JobControl` FSMs over the syscall backend; retire the
-  bespoke flat dispatch and (if unified) `IshJobs`. **Closes B4-6.** Validate: both
-  targets at S1–S10 parity, driven by the *same* FSMs. Update diagrams + docs +
-  `frame_assessment.md` — the headline "this exact FSM runs a shell on Linux and
-  bare metal" result.
+- **M4 — Consolidate + retire `ish`'s hand-written job control. ✅ DONE 2026-05-27.
+  Closes B4-6. PROGRAM COMPLETE.** `ish`'s job table is now the shared
+  `JobControl` + `Job` FSMs over a `SyscallProcessBackend` (fork/exec/waitpid/
+  kill) — the *same* FSMs the hosted shell uses; the ish-specific `IshJobs` is
+  retired (its `.frs` deleted). Two genuine model differences were reconciled
+  cleanly rather than forced:
+  - **M4.1** — the foreground-**wait strategy** moved into the `ProcessBackend`
+    seam (`wait_foreground() -> FgOutcome`): hosted polls + watches the SIGTSTP
+    flag; ring-3 blocks in `waitpid` while the kernel routes terminal signals.
+    `JobControl`/`Job` lost their `std::thread::sleep` + `crate::signals` and
+    went no_std-clean.
+  - **M4.2** — `Job` + `JobControl` + `SyscallProcessBackend` compile for ring 3.
+  - **M4.3b-i** — `JobControl`'s **job-id model** made bash-correct: a foreground
+    job gets a *tentative* id (committed on Ctrl-Z, freed on exit), so
+    background/stopped ids stay contiguous regardless of intervening foreground
+    commands — the enabler for routing ring-3 fg externals through the shared
+    `Job` FSM without their ids drifting.
+  - **M4.3b-ii** — `IshShellEnv` rewritten onto `JobControl`: plain fg/bg externals
+    are real `Job` instances; `tick`/`bg`/`kill %N`/`jobs`/the `[id] pid` launch
+    echo present ish's bash-style output over `JobControl`'s snapshot; redirected
+    commands + pipelines stay native (bypass `JobControl` on both targets).
+  - Validated: full host suite green; **`console-test` green end-to-end** with the
+    rewired job control (bg launch, harvest "Done", `kill -STOP/-CONT/-INT/-6 %N`,
+    `bg %5`, Ctrl-Z→`[5] Stopped`), now JobControl/Job-FSM-driven on bare metal;
+    clippy (host + kernel both configs + user) + fmt + check-diagrams clean.
+
+  **The H↔B parity program is complete:** the *same* `Shell` + `Parser` +
+  `Pipeline` + `Job` + `JobControl` Frame source now drives a full interactive
+  shell — builtins, pipes, redirection, background jobs, signals, job-control
+  suspend/resume — on **Linux *and* bare-metal ring 3**.
 
 ## Risks / open design decisions
 - **Pipes/redirection modeling (M1). ✅ DECIDED 2026-05-27.** `Parser` emits typed

@@ -1243,7 +1243,7 @@ fn do_wait_loop(target: u32) -> u64 {
     // lost and their entries would linger as "Running" forever (S10 fix). Dead
     // background children stay zombies until the shell's prompt-time harvest
     // (`reap_nohang`) collects them — which is the path that notifies the
-    // IshJobs FSM. Zombies can't pile up unboundedly: the shell harvests every
+    // shell's job-control FSM. Zombies can't pile up unboundedly: the shell harvests every
     // bg child before each prompt, and any parent that forks children waits on
     // each one it spawns.
     if target == 0 {
@@ -1268,7 +1268,7 @@ fn do_wait_loop(target: u32) -> u64 {
 /// in `perform_syscall` — `reap_child` only frees frames + the table slot, no
 /// disk I/O. The interactive shell loops on this at the prompt to harvest
 /// finished `&` background jobs without stalling, then marks them done in its
-/// IshJobs FSM.
+/// JobControl FSM.
 fn sys_reap_nohang(target: u64) -> u64 {
     let me = sched::current_pid();
     let t = target as u32;
