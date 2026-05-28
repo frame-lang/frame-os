@@ -63,11 +63,17 @@
                 // returns immediately. This keeps JobControl's state simple:
                 // every spawn_foreground call moves us to $RunningForeground
                 // and the matching wait_foreground call moves us back.
+                // bash-correct job ids (M4): a foreground job gets a TENTATIVE
+                // id (= next_id) but does NOT consume it — a running foreground
+                // command has no `%N` job spec. The id is *committed* (next_id
+                // bumped) only if the job stops (Ctrl-Z) and so becomes a tracked
+                // job; if it just exits, the id is freed and reused. This keeps
+                // background/stopped job ids contiguous (1, 2, 3, …) regardless
+                // of how many foreground commands ran in between.
                 let mut job = @@Job(self.next_id);
                 job.spawn(cmd, args);
                 self.foreground_id = Some(self.next_id);
                 self.jobs.push(job);
-                self.next_id += 1;
                 -> $RunningForeground
             }
 
@@ -241,6 +247,14 @@
             }
             if let Some(i) = idx {
                 self.jobs[i].await_rest();
+                // bash-correct id commit: the foreground job had a tentative id.
+                // If it stopped (Ctrl-Z), it's now a tracked stopped job — commit
+                // the id so the next job gets a fresh one. If it exited, leave
+                // next_id alone (the id is freed; the shell removes the $Done
+                // entry after reading its exit).
+                if self.jobs[i].state_name() == "Stopped" {
+                    self.next_id += 1;
+                }
             }
         }
 

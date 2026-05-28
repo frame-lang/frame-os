@@ -136,13 +136,19 @@ impl ShellEnv for StdShellEnv {
         self.job_control.wait_foreground();
 
         // Surface non-zero exit codes / spawn failures (preserves H2's
-        // "[exit code: N]" and "command not found" output).
+        // "[exit code: N]" and "command not found" output), and note whether the
+        // foreground job finished (vs stopped).
         let id = self.last_foreground_id;
+        let mut finished = false;
         for s in self.job_control.jobs().iter() {
             if s.id == id {
-                if s.state == "Done" && s.exit_code != 0 {
-                    println!("[exit code: {}]", s.exit_code);
+                if s.state == "Done" {
+                    finished = true;
+                    if s.exit_code != 0 {
+                        println!("[exit code: {}]", s.exit_code);
+                    }
                 } else if s.state.starts_with("Failed") {
+                    finished = true;
                     let parsed: String = s
                         .state
                         .strip_prefix("Failed (")
@@ -157,6 +163,14 @@ impl ShellEnv for StdShellEnv {
                 }
                 break;
             }
+        }
+        // bash-correct ids (M4): a *plain* foreground command carried only a
+        // TENTATIVE id (id == next_id, never committed). If it finished, remove
+        // the $Done entry so the id is freed/reused. A `fg <id>`-resumed job had
+        // an already-committed id (id < next_id) — leave its $Done entry (it
+        // shows in `jobs`, and its id can't collide since next_id moved past it).
+        if finished && id == self.job_control.next_job_id() {
+            self.job_control.remove(id);
         }
     }
 }
