@@ -35,6 +35,7 @@ extern crate alloc;
 use core::panic::PanicInfo;
 
 mod allocator;
+mod arch;
 mod console;
 mod context;
 mod crosscore;
@@ -44,6 +45,7 @@ mod frame_systems;
 mod frames;
 mod fs;
 mod gdt;
+mod hal;
 mod interrupts;
 mod io;
 mod ip_reasm;

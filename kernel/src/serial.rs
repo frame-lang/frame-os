@@ -1,124 +1,56 @@
 // kernel/src/serial.rs
 //
-// COM1 (16550 UART at port 0x3F8) port mechanics.
+// The arch-agnostic console *text* layer — it sits on the `hal::Console` seam
+// (B-HAL.1). The byte-level mechanism (port I/O, the 16550 init sequence, THRE
+// polling) now lives behind the HAL in `arch/<isa>/serial.rs`; this module is
+// the shared layer on top of it: thin forwarders to `hal::console()` plus the
+// formatting helpers (write_str / writeln / write_hex_u64 / write_u32_decimal)
+// that every arch reuses unchanged.
 //
-// This module is the *byte-level* serial layer: raw port I/O, the 16550
-// init sequence, and THRE-polled byte transmission. The lifecycle on top
-// of it — "you must init before writing" — is modeled by the SerialDriver
-// Frame system (frame/serial_driver.frs), whose actions call into here.
+// Keeping the public `serial::*` API here (rather than pushing every caller to
+// `hal::console()`) is deliberate: hundreds of call sites across the kernel
+// print through these functions, and the helpers are genuinely arch-neutral —
+// they belong in a shared layer, not duplicated per arch or forced through a
+// trait. The seam is `hal::Console`; this is the convenience layer over it.
 //
 // Two consumers use this module directly with raw writes, bypassing the
 // SerialDriver state machine, and that's deliberate:
-//   - Early boot ($InitMemory..$InitConsole in the Kernel HSM) prints
-//     before the console driver is up — the "bootstrap console". Real
-//     kernels do the same (Linux earlyprintk).
-//   - The panic handler prints from an emergency context where the
-//     driver may be in any state; it must not depend on driver liveness.
-//
-// The functions expose a *safe* API even though they perform port I/O
-// (unsafe at the instruction level). COM1 register access is sound — no
-// memory-safety consequence — so a safe boundary is correct, and it lets
-// the Frame-generated SerialDriver actions call `serial::*` from safe
-// context.
+//   - Early boot ($InitMemory..$InitConsole in the Kernel HSM) prints before
+//     the console driver is up — the "bootstrap console" (cf. Linux
+//     earlyprintk).
+//   - The panic handler prints from an emergency context where the driver may
+//     be in any state; it must not depend on driver liveness. `hal::console()`
+//     returns a `&'static` zero-sized handle that is always valid, so these
+//     emergency paths never depend on any initialization having run.
 
-// COM1 register offsets from the base port.
-const COM1_BASE: u16 = 0x3F8;
-const COM1_DATA: u16 = COM1_BASE; // DLAB=0: RX/TX buffer; DLAB=1: divisor low
-const COM1_INT_ENABLE: u16 = COM1_BASE + 1; // DLAB=0: interrupt enable; DLAB=1: divisor high
-const COM1_FIFO_CTRL: u16 = COM1_BASE + 2; // FIFO control
-const COM1_LINE_CTRL: u16 = COM1_BASE + 3; // line control (incl. DLAB bit)
-const COM1_MODEM_CTRL: u16 = COM1_BASE + 4; // modem control
-const COM1_LINE_STATUS: u16 = COM1_BASE + 5; // line status (THRE etc.)
+use crate::hal::{self, Console as _};
 
-/// THRE (Transmitter Holding Register Empty) bit in the Line Status
-/// Register. Set when the UART can accept another byte to transmit.
-const LSR_THRE: u8 = 0x20;
-/// Data Ready bit in the Line Status Register: a received byte is waiting (B8).
-const LSR_DATA_READY: u8 = 0x01;
-/// Interrupt Enable Register: received-data-available interrupt (B8).
-#[cfg(feature = "interactive")]
-const IER_RX_AVAIL: u8 = 0x01;
-/// Modem Control Register OUT2: gates the UART's IRQ line to the PIC (B8).
-#[cfg(feature = "interactive")]
-const MCR_OUT2: u8 = 0x08;
-
-/// Write a byte to an x86 I/O port.
-fn outb(port: u16, val: u8) {
-    unsafe {
-        core::arch::asm!(
-            "out dx, al",
-            in("dx") port,
-            in("al") val,
-            options(nomem, nostack, preserves_flags),
-        );
-    }
-}
-
-/// Read a byte from an x86 I/O port.
-fn inb(port: u16) -> u8 {
-    let val: u8;
-    unsafe {
-        core::arch::asm!(
-            "in al, dx",
-            out("al") val,
-            in("dx") port,
-            options(nomem, nostack, preserves_flags),
-        );
-    }
-    val
-}
-
-/// Program the 16550 UART for polled, interrupt-free operation: 115200
-/// baud, 8 data bits, no parity, 1 stop bit, FIFOs enabled. Interrupts
-/// stay disabled (no OUT2) because B0 has no IDT wired for serial — this
-/// is polled-mode TX. Correct for real 16550 hardware; QEMU accepts the
-/// sequence and is lenient about it.
-///
-/// Called by SerialDriver's `init()` action (its $Uninitialized → $Ready
-/// transition). Idempotent in practice, but the SerialDriver state
-/// machine is what guarantees it runs exactly once before any driver
-/// write.
+/// Program the UART (delegates to the active arch console). Called by
+/// SerialDriver's `init()` action.
 pub fn init_uart() {
-    outb(COM1_INT_ENABLE, 0x00); // disable all UART interrupts
-    outb(COM1_LINE_CTRL, 0x80); // DLAB on: next two writes set the divisor
-    outb(COM1_DATA, 0x01); // divisor low  = 1 -> 115200 baud
-    outb(COM1_INT_ENABLE, 0x00); // divisor high = 0
-    outb(COM1_LINE_CTRL, 0x03); // DLAB off: 8 bits, no parity, 1 stop
-    outb(COM1_FIFO_CTRL, 0xC7); // enable + clear FIFOs, 14-byte trigger
-    outb(COM1_MODEM_CTRL, 0x03); // DTR + RTS asserted, OUT2 clear (no IRQ)
+    hal::console().init();
 }
 
-/// Write a single byte to COM1, waiting for the transmit holding register
-/// to be empty first (polled TX). On QEMU the THRE bit is essentially
-/// always set, so the wait is a no-op; on real hardware it paces writes
-/// to the UART's transmit rate.
+/// Write a single byte to the console, polling for transmit-ready first.
 pub fn write_byte(b: u8) {
-    while inb(COM1_LINE_STATUS) & LSR_THRE == 0 {
-        core::hint::spin_loop();
-    }
-    outb(COM1_DATA, b);
+    hal::console().write_byte(b);
 }
 
-/// Read one received byte if the UART has data waiting (polled RX), else `None`
-/// (B8). The RX interrupt handler drains the FIFO by calling this in a loop.
+/// Read one received byte if the console has data waiting (polled RX), else
+/// `None`. The RX interrupt handler drains the FIFO by calling this in a loop.
 pub fn rx_byte() -> Option<u8> {
-    if inb(COM1_LINE_STATUS) & LSR_DATA_READY != 0 {
-        Some(inb(COM1_DATA))
-    } else {
-        None
-    }
+    hal::console().rx_byte()
 }
 
-/// Enable the COM1 received-data-available interrupt (delivered as IRQ4) and
-/// route the UART's IRQ line to the PIC by asserting OUT2 (B8). TX stays polled.
-/// Call after the IDT + PIC are up — this is what makes the console interactive.
+/// Enable the console's received-data-available interrupt and route its IRQ
+/// line to the interrupt controller (B8). Call after the IDT + controller are
+/// up — this is what makes the console interactive.
 #[cfg(feature = "interactive")]
 pub fn enable_rx_interrupt() {
-    outb(COM1_INT_ENABLE, IER_RX_AVAIL);
-    outb(COM1_MODEM_CTRL, 0x03 | MCR_OUT2); // DTR + RTS + OUT2
+    hal::console().enable_rx_interrupt();
 }
 
-/// Write a string to COM1, byte by byte (UTF-8 bytes).
+/// Write a string to the console, byte by byte (UTF-8 bytes).
 pub fn write_str(s: &str) {
     for b in s.bytes() {
         write_byte(b);
