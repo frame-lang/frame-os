@@ -15,12 +15,20 @@
 // SyscallEntry) is added here as each seam is extracted.
 
 pub mod cpu;
+pub mod fpu;
+pub mod rtc;
 pub mod serial;
 
 /// The console device type the `hal::console()` accessor returns on x86_64.
 pub type ConsoleDevice = serial::Uart;
 /// The CPU control surface type the `hal::cpu()` accessor returns on x86_64.
 pub type CpuDevice = cpu::X86Cpu;
+/// The wall-clock device type the `hal::clock()` accessor returns on x86_64.
+pub type ClockDevice = rtc::CmosRtc;
+/// The FPU control surface type the `hal::fpu()` accessor returns on x86_64.
+pub type FpuDevice = fpu::X86Fpu;
 
 pub use cpu::cpu;
+pub use fpu::{fpu, FpuState};
+pub use rtc::clock;
 pub use serial::console;

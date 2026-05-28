@@ -100,9 +100,19 @@ at once.
   `core::hint::spin_loop()` already abstracts it. The `global_asm!` ISR stubs and
   the QEMU-exit `out 0xf4` are deliberately left for B-HAL.2 (IRQ path / Boot).
   Validated: both builds, clippy/fmt clean, **49/49 qemu-test smoke (all `smp_*`
-  cross-core locking paths), console-test PASS**. The remaining concerns (Clock /
-  Fpu / Mmu / Irq / Timer / PerCpu / Context / SyscallEntry) fan out behind the
-  same pattern.
+  cross-core locking paths), console-test PASS**. *Progress (2026-05-28):* the
+  two remaining isolated leaves landed — **`Clock`** (CMOS RTC →
+  `arch/x86_64/rtc.rs`, `epoch_secs()`) and **`Fpu`** (SSE enable + fxsave/
+  fxrstor → `arch/x86_64/fpu.rs`). `Fpu` is the first seam whose *type* is
+  arch-specific: the 512-byte FXSAVE `FpuState` the scheduler embeds per-thread
+  is re-exported as `hal::FpuState`, so sched.rs names it without naming the arch
+  module. Both keep thin top-level facades (`rtc.rs`, `fpu.rs`) so their callers
+  (the `time()` syscall; the scheduler's save/restore; `init_this_cpu`) are
+  unchanged. Validated: both builds, clippy/fmt clean, 49/49 qemu-test smoke,
+  console-test PASS (tcc exercises FPU + RTC; the job-control suite exercises FPU
+  context-switch save/restore). The remaining B-HAL.1 concerns (Mmu / PerCpu /
+  Irq / Timer / Context) fan out behind the same pattern; the IRQ/boot-path ones
+  (Irq, the IDT/ISR stubs, SyscallEntry, Boot) are B-HAL.2.
 - **B-HAL.2 — Isolate boot + the IDT/IRQ path.** The hardest seam: factor the
   Limine handoff + IDT setup + the timer/syscall ISR entry behind `Boot` + `Irq` +
   `SyscallEntry` so the arch-agnostic kernel init is one sequence calling HAL

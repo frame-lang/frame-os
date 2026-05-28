@@ -91,3 +91,61 @@ pub trait Cpu {
 pub fn cpu() -> &'static imp::CpuDevice {
     imp::cpu()
 }
+
+/// Wall-clock time. x86_64 reads the CMOS RTC; a future AArch64 port reads the
+/// RPi firmware mailbox / an RTC chip. The decode of the source format into
+/// epoch seconds is the arch impl's concern, so the trait is just the result.
+pub trait Clock {
+    /// Current wall-clock time as Unix epoch seconds (UTC).
+    fn epoch_secs(&self) -> u64;
+}
+
+/// The wall-clock source for this build's target architecture (build-time
+/// selected, concrete type — no vtable). Callers bring the method into scope
+/// with `use crate::hal::Clock`.
+pub fn clock() -> &'static imp::ClockDevice {
+    imp::clock()
+}
+
+/// The per-thread FPU/SSE save area for this build's target architecture. It's
+/// arch-specific (x86_64: the 512-byte FXSAVE image; AArch64: the NEON/FP `Q`
+/// regs + FPSR/FPCR), and the scheduler embeds one per thread — so the HAL
+/// re-exports the concrete type here rather than the kernel naming an arch
+/// module. `FpuState::zeroed()` is `const` for use in static save-area arrays.
+pub use imp::FpuState;
+
+/// FPU/SSE register-file management: per-core enable + initialize, and
+/// save/restore of the register file across context switches.
+///
+/// x86_64 implements these over CR0/CR4 + `fxsave`/`fxrstor`; a future AArch64
+/// port over the FP/NEON enable bits + the `Q`-register save area.
+pub trait Fpu {
+    /// Enable the FPU/SSE on the calling core and initialize it, capturing the
+    /// clean template for new threads. Call once per core before the scheduler
+    /// runs. Idempotent.
+    fn init(&self);
+
+    /// Save the live FPU/SSE register file into `area`.
+    ///
+    /// # Safety
+    /// `area` must point at a writable, correctly-aligned [`FpuState`].
+    unsafe fn save(&self, area: *mut FpuState);
+
+    /// Restore the live FPU/SSE register file from `area`.
+    ///
+    /// # Safety
+    /// `area` must point at a valid saved image (from [`Fpu::save`] or
+    /// [`Fpu::clean`]).
+    unsafe fn restore(&self, area: *const FpuState);
+
+    /// A copy of the clean (post-init) FPU template — the initial state for a
+    /// freshly spawned thread or an `exec`'d image.
+    fn clean(&self) -> FpuState;
+}
+
+/// The FPU control surface for this build's target architecture (build-time
+/// selected, concrete type — no vtable). Callers bring the methods into scope
+/// with `use crate::hal::Fpu`.
+pub fn fpu() -> &'static imp::FpuDevice {
+    imp::fpu()
+}
