@@ -1,6 +1,14 @@
 # B-HAL — a hardware-abstraction seam under the kernel (port toward AArch64 / Pi)
 
-**Status: PLANNED (2026-05-27).** Goal: pull the kernel's x86-specific *mechanism*
+**Status: B-HAL.1 clean-refactor seams COMPLETE (2026-05-28)** — six no-behavior-change
+seams extracted + validated on x86: `Console`, `Cpu`, `Clock`, `Fpu`, `Mmu`,
+`PerCpu`. `hal.rs` (the traits + build-time accessors) and `arch/x86_64/` (the
+relocated mechanism) are in place; the platform-agnostic kernel calls
+`hal::console()`/`cpu()`/`mmu()`/… Each landed as its own validated commit
+(default + interactive build, clippy/fmt clean, 49/49 qemu-test smoke,
+console-test PASS). The lone remaining concern, `Context` (register frame +
+context-switch asm), is entangled with the IDT/ISR save path and is folded into
+**B-HAL.2** (boot + the IRQ path). Goal: pull the kernel's x86-specific *mechanism*
 behind a small set of arch traits (a HAL) so the platform-agnostic kernel — the
 Frame FSMs + the pure-logic subsystems — sits on top unchanged, and a second
 architecture (AArch64, e.g. Raspberry Pi) can be added by implementing the HAL
@@ -123,9 +131,19 @@ at once.
   the trait boundary is neutral. Validated: both builds, clippy/fmt clean,
   **49/49 qemu-test smoke** (paging/page-fault/address-space/fork/exec/wait-reap/
   fpu-preempt/tlb-shootdown), **console-test PASS** (full fork/exec/exit
-  lifecycle + xHCI/LAPIC MMIO + on-device tcc). The remaining B-HAL.1 concerns
-  (PerCpu / Context) fan out behind the same pattern; the IRQ/boot-path ones
-  (Irq, the IDT/ISR stubs, Timer, SyscallEntry, Boot) are B-HAL.2.
+  lifecycle + xHCI/LAPIC MMIO + on-device tcc). *Progress (2026-05-28):*
+  **`PerCpu`** landed — the per-core base register behind `hal::PerCpu`
+  (`set_base` = wrmsr IA32_GS_BASE; `this_cpu_index` = the `gs:[0]` read).
+  `arch/x86_64/percpu.rs` holds the MSR/GS mechanism; the top-level `percpu.rs`
+  keeps the arch-agnostic per-CPU data blocks + field accessors and forwards the
+  two primitives. One naming note: the `hal::PerCpu` *trait* and the per-core
+  `PerCpu` *struct* share a name, so the trait is imported anonymously
+  (`use crate::hal::PerCpu as _;`). Validated: both builds, clippy/fmt clean,
+  49/49 qemu-test smoke (all `smp_*` paths exercise `this_cpu_index` on 4 cores),
+  console-test PASS. The one remaining B-HAL.1 concern is **`Context`**
+  (context.rs + the pcsched/sched switch asm); it's entangled with the IDT/ISR
+  save path, so it pairs naturally with the IRQ/boot-path cluster (Irq, the
+  IDT/ISR stubs, Timer, SyscallEntry, Boot) in B-HAL.2.
 - **B-HAL.2 — Isolate boot + the IDT/IRQ path.** The hardest seam: factor the
   Limine handoff + IDT setup + the timer/syscall ISR entry behind `Boot` + `Irq` +
   `SyscallEntry` so the arch-agnostic kernel init is one sequence calling HAL

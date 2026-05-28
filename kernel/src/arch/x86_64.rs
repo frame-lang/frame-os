@@ -17,6 +17,7 @@
 pub mod cpu;
 pub mod fpu;
 pub mod paging;
+pub mod percpu;
 pub mod rtc;
 pub mod serial;
 
@@ -30,9 +31,12 @@ pub type ClockDevice = rtc::CmosRtc;
 pub type FpuDevice = fpu::X86Fpu;
 /// The MMU type the `hal::mmu()` accessor returns on x86_64.
 pub type MmuDevice = paging::X86Mmu;
+/// The per-CPU base register type the `hal::per_cpu()` accessor returns on x86_64.
+pub type PerCpuDevice = percpu::X86PerCpu;
 
 pub use cpu::cpu;
 pub use fpu::{fpu, FpuState};
 pub use paging::mmu;
+pub use percpu::per_cpu;
 pub use rtc::clock;
 pub use serial::console;

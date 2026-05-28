@@ -261,3 +261,32 @@ pub trait Mmu {
 pub fn mmu() -> &'static imp::MmuDevice {
     imp::mmu()
 }
+
+/// The per-core base register: the standard "find this core's state in one
+/// access" mechanism. x86_64 points the GS base at this core's per-CPU block
+/// (IA32_GS_BASE MSR); a future AArch64 port uses TPIDR_EL1. The per-CPU data
+/// blocks themselves are arch-agnostic and live in `percpu.rs`, which sits on
+/// this trait.
+///
+/// (The trait is named `PerCpu` but the per-core *data* struct is also called
+/// `PerCpu` in `percpu.rs`; callers import this trait anonymously —
+/// `use crate::hal::PerCpu as _;` — to bring its methods into scope without the
+/// name clashing.)
+pub trait PerCpu {
+    /// Point this core's per-CPU base register at `base`, which must address a
+    /// per-CPU block whose first `u32` field is the core index.
+    ///
+    /// # Safety
+    /// `base` must remain valid for the lifetime of this core.
+    unsafe fn set_base(&self, base: u64);
+
+    /// This core's index — the first `u32` of the per-CPU block, read through
+    /// the base register. Valid only after [`PerCpu::set_base`] on this core.
+    fn this_cpu_index(&self) -> u32;
+}
+
+/// The per-core base register for this build's target architecture (build-time
+/// selected, concrete type — no vtable).
+pub fn per_cpu() -> &'static imp::PerCpuDevice {
+    imp::per_cpu()
+}
