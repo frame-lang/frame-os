@@ -12,6 +12,7 @@
 
 pub mod boot;
 pub mod fdt;
+pub mod mmu;
 pub mod serial;
 
 /// The console device type the `hal::console()` accessor returns on aarch64.

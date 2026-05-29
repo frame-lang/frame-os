@@ -1542,6 +1542,9 @@ fn run_qemu_aarch64() -> Result<()> {
         wait_for_output(&buf, "AArch64 skeleton", 30)?;
         wait_for_output(&buf, "PL011 console up", 30)?;
         wait_for_output(&buf, "RAM base 0x0000000040000000", 30)?;
+        // The console reaching this line means it survived SCTLR_EL1.M=1 — the
+        // identity map + device/normal mappings are correct (B-HAL.3.4).
+        wait_for_output(&buf, "MMU enabled", 30)?;
         Ok(())
     })();
 

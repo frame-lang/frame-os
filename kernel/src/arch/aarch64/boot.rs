@@ -114,6 +114,12 @@ unsafe extern "C" fn kmain(dtb: usize) -> ! {
         serial::writeln("[aarch64] no DTB found (x0=0, no FDT magic in RAM scan)");
     }
 
+    // B-HAL.3.4: enable the MMU (identity map). That this line — and the halt
+    // banner below — still reach the PL011 proves translation is live and the
+    // device/normal mappings are correct (the console runs translated now).
+    unsafe { crate::arch::aarch64::mmu::enable() };
+    serial::writeln("[aarch64] MMU enabled (identity map via TTBR0)");
+
     serial::writeln("[aarch64] halting.");
     crate::halt_forever();
 }

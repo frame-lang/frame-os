@@ -231,9 +231,19 @@ at once.
     0x…40000000` (then kills QEMU — the kernel parks). Runs **on the host** (the
     dev container ships only x86 QEMU). So the aarch64 boot is now regression-
     tested the same way x86's 49/49 is.
-  - **B-HAL.3.4 — MMU bring-up.** AArch64 translation tables + TTBR0/1 behind the
-    existing `hal::Mmu` trait (the `MapFlags` abstraction pays off); enable the
-    MMU, keep printing.
+  - **B-HAL.3.4 — MMU bring-up. DONE (2026-05-29).** `arch/aarch64/mmu.rs`:
+    stand up an identity map (VA==PA) — one L1 table of 1 GiB block descriptors,
+    39-bit VA (T0SZ=25, 4 KiB granule): `[0,1 GiB)` Device-nGnRnE (flash/GIC/
+    PL011), `[1,2 GiB)` Normal-WB cacheable (RAM) — program MAIR/TCR/TTBR0,
+    `tlbi`, then set `SCTLR_EL1.M`. Because the map is identity, the PC, SP,
+    PL011, and DTB keep their addresses across the M=0→1 transition, so the
+    console must keep working immediately after — which the smoke check asserts
+    (`MMU enabled` reaches the PL011 *post*-enable). Scope: this is the MMU
+    *mechanism*; the full `hal::Mmu` trait impl (map/unmap + address-space
+    lifecycle, behind `MapFlags`) needs the frame allocator + a process model and
+    lands with B-HAL.4/.5 — this is the substrate they sit on. Validated:
+    `cargo xtask qemu-aarch64` PASS (now also asserts `MMU enabled`); x86 build +
+    clippy (both arches) + fmt clean.
   - **B-HAL.3.5 — GIC + generic-timer stubs.** Minimal GICv2/3 init + `CNTP_*`
     enough to exist — establishing the `Irq`/`Timer` trait shapes against real
     ARM hardware (the contracts the x86 side is then re-fitted to).
