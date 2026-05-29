@@ -223,6 +223,14 @@ at once.
     128 MiB** (matches the machine); x86 build + clippy (both arches) + fmt clean;
     no faults. (Frame-allocator wiring deferred to pair with the MMU in 3.4; the
     FDT parser is the natural first `@@fsm` target when that's folded in.)
+  - **B-HAL.3 harness — `cargo xtask qemu-aarch64`. DONE (2026-05-29).** The ARM
+    analogue of the x86 `qemu-test` smoke: builds the aarch64 kernel, dumps the
+    `virt` DTB (`-machine virt,dumpdtb=…`), boots `qemu-system-aarch64 -M virt`
+    with the DTB at `0x4400_0000` via `-device loader`, captures serial on a
+    reader thread, and asserts the banner + `PL011 console up` + `RAM base
+    0x…40000000` (then kills QEMU — the kernel parks). Runs **on the host** (the
+    dev container ships only x86 QEMU). So the aarch64 boot is now regression-
+    tested the same way x86's 49/49 is.
   - **B-HAL.3.4 — MMU bring-up.** AArch64 translation tables + TTBR0/1 behind the
     existing `hal::Mmu` trait (the `MapFlags` abstraction pays off); enable the
     MMU, keep printing.

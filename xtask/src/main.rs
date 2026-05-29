@@ -87,6 +87,13 @@ enum SubCmd {
     /// `exit`, and assert the program ran. (`cargo xtask qemu-interactive` is
     /// the human-typeable version of the same kernel.)
     ConsoleTest,
+
+    /// B-HAL.3: build + boot the AArch64 kernel under `qemu-system-aarch64 -M
+    /// virt` and assert the banner + the device-tree memory map appear on the
+    /// PL011 console. The kernel halts (no isa-debug-exit on `virt`), so serial
+    /// is captured via a reader thread and QEMU is killed once the markers show.
+    /// Runs on the host — the dev container ships only x86 QEMU.
+    QemuAarch64,
 }
 
 fn main() -> Result<()> {
@@ -101,6 +108,7 @@ fn main() -> Result<()> {
         SubCmd::QemuTest => run_qemu_test(),
         SubCmd::QemuTap => run_qemu_tap(),
         SubCmd::ConsoleTest => run_console_test(),
+        SubCmd::QemuAarch64 => run_qemu_aarch64(),
     }
 }
 
@@ -1421,6 +1429,133 @@ fn run_qemu_inner(interactive: bool) -> Result<()> {
     if !status.success() && status.code() != Some(33) {
         bail!("qemu exited with status: {status}");
     }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// `cargo xtask qemu-aarch64` — build + boot the AArch64 kernel (B-HAL.3)
+//
+// The ARM counterpart of the x86 smoke: build for aarch64-unknown-none, boot
+// under qemu-system-aarch64 -M virt, and assert the banner + the device-tree
+// memory map reach the PL011 console. The kernel parks in a wfi loop (no
+// isa-debug-exit on `virt`), so we capture serial via a reader thread, wait for
+// the boot markers, then kill QEMU. The DTB isn't delivered for a bare -kernel
+// ELF, so we dump the machine's DTB and load it at a fixed address; the kernel
+// locates it by RAM scan.
+// ---------------------------------------------------------------------------
+
+fn run_qemu_aarch64() -> Result<()> {
+    use std::io::Read;
+    use std::process::Stdio;
+    use std::sync::{Arc, Mutex};
+
+    let workspace = workspace_root()?;
+
+    // 1. Build the aarch64 kernel.
+    eprintln!("building the aarch64 kernel (aarch64-unknown-none)...");
+    let status = Command::new("cargo")
+        .current_dir(&workspace)
+        .args([
+            "build",
+            "-p",
+            "frame-os-kernel",
+            "--target",
+            "aarch64-unknown-none",
+        ])
+        .status()
+        .context("failed to invoke cargo for the aarch64 kernel build")?;
+    if !status.success() {
+        bail!("aarch64 kernel build failed");
+    }
+    let elf = target_dir(&workspace)
+        .join("aarch64-unknown-none")
+        .join("debug")
+        .join("frame-os-kernel");
+    if !elf.exists() {
+        bail!("aarch64 kernel ELF not found at {}", elf.display());
+    }
+
+    // 2. Dump the `virt` machine's device tree to a fixed file (QEMU's bare
+    //    -kernel ELF path neither passes it in x0 nor auto-loads it).
+    let dtb = target_dir(&workspace).join("virt-aarch64.dtb");
+    let status = Command::new("qemu-system-aarch64")
+        .arg("-M")
+        .arg(format!("virt,dumpdtb={}", dtb.display()))
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .context("failed to dump the virt DTB (is qemu-system-aarch64 installed?)")?;
+    if !status.success() || !dtb.exists() {
+        bail!("failed to dump the virt DTB to {}", dtb.display());
+    }
+
+    // 3. Boot, loading the DTB at a fixed address; capture serial on a thread.
+    const DTB_ADDR: u64 = 0x4400_0000;
+    eprintln!("booting aarch64 kernel under qemu-system-aarch64 -M virt...");
+    let mut child = Command::new("qemu-system-aarch64")
+        .args([
+            "-M",
+            "virt",
+            "-cpu",
+            "cortex-a72",
+            "-m",
+            "128M",
+            "-display",
+            "none",
+            "-serial",
+            "stdio",
+            "-no-reboot",
+        ])
+        .arg("-kernel")
+        .arg(&elf)
+        .arg("-device")
+        .arg(format!(
+            "loader,file={},addr=0x{:x},force-raw=on",
+            dtb.display(),
+            DTB_ADDR
+        ))
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .context("failed to spawn qemu-system-aarch64")?;
+
+    let buf = Arc::new(Mutex::new(Vec::<u8>::new()));
+    {
+        let buf = buf.clone();
+        let mut out = child.stdout.take().expect("piped stdout");
+        std::thread::spawn(move || {
+            let mut chunk = [0u8; 1024];
+            loop {
+                match out.read(&mut chunk) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => buf.lock().unwrap().extend_from_slice(&chunk[..n]),
+                }
+            }
+        });
+    }
+
+    // 4. Wait for the boot markers: banner (one source, two ISAs), PL011 console
+    //    (hal::Console on a second arch), and the device-tree memory map (the
+    //    Boot "memory map" half — proves boot + console + FDT parse all worked).
+    let res = (|| -> Result<()> {
+        wait_for_output(&buf, "AArch64 skeleton", 30)?;
+        wait_for_output(&buf, "PL011 console up", 30)?;
+        wait_for_output(&buf, "RAM base 0x0000000040000000", 30)?;
+        Ok(())
+    })();
+
+    let captured = String::from_utf8_lossy(&buf.lock().unwrap()).to_string();
+    let _ = child.kill();
+    let _ = child.wait();
+
+    res.with_context(|| format!("captured serial:\n---\n{captured}\n---"))?;
+    if captured.contains("KERNEL PANIC") {
+        bail!("qemu-aarch64: kernel panicked:\n{captured}");
+    }
+    eprintln!(
+        "qemu-aarch64: PASS — banner + PL011 console + device-tree memory map (RAM base 0x40000000)"
+    );
     Ok(())
 }
 
