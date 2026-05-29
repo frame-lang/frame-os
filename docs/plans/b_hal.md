@@ -8,7 +8,11 @@ relocated mechanism) are in place; the platform-agnostic kernel calls
 (default + interactive build, clippy/fmt clean, 49/49 qemu-test smoke,
 console-test PASS). The lone remaining concern, `Context` (register frame +
 context-switch asm), is entangled with the IDT/ISR save path and is folded into
-**B-HAL.2** (boot + the IRQ path). Goal: pull the kernel's x86-specific *mechanism*
+**B-HAL.2** (boot + the IRQ path). **B-HAL is paused here by decision (2026-05-29):**
+a close survey found Irq/Timer/Context are interrupt-controller-and-boot *core*,
+not clean leaves, so B-HAL.2+ (incl. the AArch64 substrate) is deferred until a
+second arch exists to design the contracts against (see the B-HAL.2 note below).
+Goal: pull the kernel's x86-specific *mechanism*
 behind a small set of arch traits (a HAL) so the platform-agnostic kernel — the
 Frame FSMs + the pure-logic subsystems — sits on top unchanged, and a second
 architecture (AArch64, e.g. Raspberry Pi) can be added by implementing the HAL
@@ -148,6 +152,25 @@ at once.
   Limine handoff + IDT setup + the timer/syscall ISR entry behind `Boot` + `Irq` +
   `SyscallEntry` so the arch-agnostic kernel init is one sequence calling HAL
   hooks. Still x86-only; still green.
+  *Survey finding + decision (2026-05-29):* a close read of `lapic.rs`/`pic.rs`/
+  `pit.rs` showed `Irq` and `Timer` are **not** clean leaves like the B-HAL.1
+  six — they're part of this interrupt-controller-and-boot core, for three
+  reasons: (1) the LAPIC is one device doing *both* roles, sharing `LAPIC_BASE`
+  + the reg helpers between the timer and eoi/IPI — it moves wholesale or not at
+  all; (2) the EOI granularity (`lapic::eoi` vs `pic::eoi_master`/`eoi_slave`/
+  `eoi_for`) is consumed by the ISR Rust halves in `interrupts.rs`, so a
+  *portable* `Irq` trait (one GIC EOI on ARM) wants the ISR dispatch co-designed,
+  not a 1:1 x86 wrapper; (3) `lapic::TIMER_VECTOR` / `pic::PIC1_OFFSET` are IDT
+  vectors `interrupts.rs` uses to install handlers, tying Irq/Timer to the IDT
+  setup. Extracting them on x86 alone would yield a leaky ~10-method x86-shaped
+  trait — ceremony, not a portable seam. **Decision: pause B-HAL here.** The six
+  clean traits (Console/Cpu/Clock/Fpu/Mmu/PerCpu) are done + pushed; Irq, Timer,
+  `Context`, the IDT/ISR stubs, `SyscallEntry`, and `Boot` are deferred to this
+  milestone, to be tackled **when an AArch64 target exists** (B-HAL.3) so the
+  contracts are designed against real hardware — a GICv2/3, the ARM generic
+  timer, the RPi/device-tree boot — instead of an x86-only guess. The HAL
+  foundation (the `hal.rs` traits + `arch/x86_64/` layout) is the additive seam
+  that makes that work a port, not a fork.
 - **B-HAL.3 — AArch64 skeleton: boot + console + a halt loop.** New
   `arch/aarch64/` + `aarch64-unknown-none` target: device-tree-driven boot, PL011
   console, GIC + generic-timer stubs, MMU bring-up — enough to print the banner
