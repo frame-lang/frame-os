@@ -206,9 +206,23 @@ at once.
     x86 build (default + interactive) + clippy (both arches) + fmt clean;
     **x86 smoke 49/49** (the cfg-split left x86 byte-for-byte unaffected). The
     visible milestone: one kernel source, two ISAs.
-  - **B-HAL.3.3 — Device tree + memory map.** Parse the FDT QEMU passes in `x0`
-    for RAM base/size + the PL011 base; feed `frames.rs`. (The `Boot` "give me a
-    memory map" half; candidate first `@@fsm` later.)
+  - **B-HAL.3.3 — Device tree + memory map. DONE (2026-05-29).**
+    `arch/aarch64/fdt.rs`: a minimal big-endian FDT reader (`valid`/`total_size`/
+    `find`/`memory_region`) that walks the struct block to the `/memory` node's
+    `reg` and returns `(RAM base, size)`. `kmain` takes the DTB pointer (x0,
+    preserved through `_start`) and prints the memory map — the AArch64 half of
+    the `Boot` "give me a memory map" contract (x86 reads Limine's map). **Boot
+    finding:** QEMU's bare `-kernel <ELF>` path on `-M virt` delivers the DTB
+    *neither* in x0 (it's 0) *nor* auto-loaded into RAM — that setup is only done
+    for the Linux Image protocol. So the kernel uses x0 if set (real hardware / a
+    future Image boot) and otherwise **scans the RAM window for the FDT magic**;
+    the run/harness places the DTB at a fixed address via QEMU `-device loader`
+    (`qemu -M virt … -kernel <elf> -device loader,file=virt.dtb,addr=0x4400_0000`,
+    DTB obtained once via `-machine dumpdtb`). Validated under
+    `qemu-system-aarch64 -M virt`: parser reports **RAM base 0x4000_0000, size
+    128 MiB** (matches the machine); x86 build + clippy (both arches) + fmt clean;
+    no faults. (Frame-allocator wiring deferred to pair with the MMU in 3.4; the
+    FDT parser is the natural first `@@fsm` target when that's folded in.)
   - **B-HAL.3.4 — MMU bring-up.** AArch64 translation tables + TTBR0/1 behind the
     existing `hal::Mmu` trait (the `MapFlags` abstraction pays off); enable the
     MMU, keep printing.

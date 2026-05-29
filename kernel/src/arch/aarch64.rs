@@ -11,6 +11,7 @@
 // point `hal.rs`'s currently x86-only accessors gain their aarch64 branch.
 
 pub mod boot;
+pub mod fdt;
 pub mod serial;
 
 /// The console device type the `hal::console()` accessor returns on aarch64.

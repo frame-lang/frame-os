@@ -50,16 +50,70 @@ global_asm!(
     "  b 3b",
 );
 
-/// The AArch64 kernel entry, called by `_start` once SP + BSS are set up.
+/// The AArch64 kernel entry, called by `_start` once SP + BSS are set up. `dtb`
+/// is the flattened-device-tree pointer QEMU passed in x0 (preserved through
+/// `_start`, which clobbers only x9/x10).
 ///
 /// # Safety
 /// Called once at startup; never re-entered. SP and .bss are established by
-/// `_start` immediately before this.
+/// `_start` immediately before this; `dtb` is whatever the firmware passed.
 #[no_mangle]
-unsafe extern "C" fn kmain() -> ! {
-    crate::serial::init_uart(); // enable the PL011 (hal::Console::init)
-    crate::serial::writeln("");
-    crate::serial::writeln("Frame OS kernel — AArch64 skeleton (B-HAL.3)");
-    crate::serial::writeln("[aarch64] PL011 console up via hal::Console; halting.");
+unsafe extern "C" fn kmain(dtb: usize) -> ! {
+    use crate::arch::aarch64::fdt;
+    use crate::serial;
+
+    serial::init_uart(); // enable the PL011 (hal::Console::init)
+    serial::writeln("");
+    serial::writeln("Frame OS kernel — AArch64 skeleton (B-HAL.3)");
+    serial::writeln("[aarch64] PL011 console up via hal::Console");
+
+    serial::write_str("[aarch64] x0/dtb = 0x");
+    serial::write_hex_u64(dtb as u64);
+    serial::writeln("");
+
+    // B-HAL.3.3: locate the device tree. QEMU `virt` passes its address in x0
+    // only for the Linux Image boot protocol; a bare `-kernel <ELF>` entered at
+    // its entry gets neither x0 nor a DTB auto-loaded into RAM. So: use x0 if the
+    // firmware set it (real hardware / a future Image boot), else scan the RAM
+    // window for the FDT magic — the test harness places the DTB at a fixed
+    // address via QEMU `-device loader`. Never dereference a null/garbage pointer.
+    const RAM_BASE: usize = 0x4000_0000;
+    const SCAN_LEN: usize = 128 * 1024 * 1024; // default `virt` RAM size
+    let dtb_ptr: *const u8 = if dtb != 0 && unsafe { fdt::valid(dtb as *const u8) } {
+        dtb as *const u8
+    } else {
+        match unsafe { fdt::find(RAM_BASE, SCAN_LEN) } {
+            Some(p) => {
+                serial::write_str("[aarch64] DTB located by RAM scan @ 0x");
+                serial::write_hex_u64(p as u64);
+                serial::writeln("");
+                p
+            }
+            None => core::ptr::null(),
+        }
+    };
+    if !dtb_ptr.is_null() && unsafe { fdt::valid(dtb_ptr) } {
+        serial::write_str("[aarch64] DTB @ 0x");
+        serial::write_hex_u64(dtb_ptr as u64);
+        serial::write_str(", totalsize 0x");
+        serial::write_hex_u64(unsafe { fdt::total_size(dtb_ptr) } as u64);
+        serial::writeln("");
+        match unsafe { fdt::memory_region(dtb_ptr) } {
+            Some((base, size)) => {
+                serial::write_str("[aarch64] RAM base 0x");
+                serial::write_hex_u64(base);
+                serial::write_str(" size 0x");
+                serial::write_hex_u64(size);
+                serial::write_str(" (");
+                serial::write_u32_decimal((size / (1024 * 1024)) as u32);
+                serial::writeln(" MiB)");
+            }
+            None => serial::writeln("[aarch64] no /memory node in DTB"),
+        }
+    } else {
+        serial::writeln("[aarch64] no DTB found (x0=0, no FDT magic in RAM scan)");
+    }
+
+    serial::writeln("[aarch64] halting.");
     crate::halt_forever();
 }
