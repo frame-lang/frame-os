@@ -189,18 +189,23 @@ at once.
     `[target.'cfg(target_arch = "x86_64")'.dependencies]` dep. Validate: x86
     builds + 49/49 unchanged; the aarch64 build now fails *only* on x86-coupled
     code (the gating list for 3.1).
-  - **B-HAL.3.1 — cfg-split + minimal halt.** Gate every x86-only `mod` + the
-    Limine statics + the x86 `kmain` to `cfg(target_arch = "x86_64")`; add
-    `arch/aarch64/` with a naked `_start` (set SP, clear BSS, `bl kmain`) and a
-    minimal `kmain` that just `wfi`-loops. Validate: **both** targets build;
-    aarch64 ELF boots under `qemu-system-aarch64 -M virt` and halts cleanly; x86
-    49/49.
-  - **B-HAL.3.2 — PL011 `Console` + banner.** Implement the existing
-    `hal::Console` trait over PL011 (`0x0900_0000` on `virt`) in
-    `arch/aarch64/serial.rs`; the aarch64 `kmain` prints the banner through the
-    arch-agnostic `serial.rs` text layer, then halts. **The visible milestone:**
-    the same banner on a second ISA, one `write_byte` of new code. Validate:
-    banner appears on the qemu serial console; add an aarch64 smoke entry.
+  - **B-HAL.3.1 + 3.2 — cfg-split + PL011 `Console` + banner. DONE (2026-05-29).**
+    `main.rs` cfg-split: the 3 arch-agnostic mods (`hal`/`arch`/`serial`) stay
+    unconditional, every other mod + the Limine statics + the SMP statics +
+    `ap_entry` + `kmain` + `halt_forever` gated to `cfg(target_arch = "x86_64")`;
+    `limine` is a target-x86 dep, `extern crate alloc` x86-only, `hal.rs`'s
+    Cpu/Clock/Fpu/Mmu/PerCpu accessors x86-only (aarch64 gains them in B-HAL.4).
+    `arch/aarch64/`: `boot.rs` (`_start` — enable FP/SIMD at EL1 via CPACR_EL1,
+    set SP, clear BSS, `bl kmain`), `serial.rs` (PL011 `hal::Console` impl). The
+    aarch64 `kmain` prints the banner through the *same* `serial.rs` text layer.
+    **Two real bare-metal bugs found + fixed** (as the journal predicted): the
+    `aarch64-unknown-none` target emits NEON, so FP/SIMD must be enabled at EL1
+    (the ARM analogue of x86 SSE-enable; ESR EC=0x7 trap without it); and the
+    PL011 needed enabling in `init()`. Validated: **aarch64 boots under
+    `qemu-system-aarch64 -M virt`, prints the banner via PL011, no faults**;
+    x86 build (default + interactive) + clippy (both arches) + fmt clean;
+    **x86 smoke 49/49** (the cfg-split left x86 byte-for-byte unaffected). The
+    visible milestone: one kernel source, two ISAs.
   - **B-HAL.3.3 — Device tree + memory map.** Parse the FDT QEMU passes in `x0`
     for RAM base/size + the PL011 base; feed `frames.rs`. (The `Boot` "give me a
     memory map" half; candidate first `@@fsm` later.)

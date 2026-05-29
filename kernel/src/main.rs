@@ -29,71 +29,128 @@
 // of it is dead in the default (smoke-tested) build; rather than pepper dozens of
 // `#[cfg]` gates across modules, scope a single dead-code allowance to the feature.
 #![cfg_attr(feature = "interactive", allow(dead_code))]
+// B-HAL.3: the aarch64 skeleton compiles only a minimal slice (hal + arch +
+// serial); the rest of the HAL surface + trait defs are unused there. Scope a
+// dead-code/unused-import allowance to that build rather than cfg-gating every
+// item.
+#![cfg_attr(target_arch = "aarch64", allow(dead_code, unused_imports))]
 
+// `alloc` is used by the Frame-generated systems on the x86 boot path; the
+// aarch64 skeleton doesn't allocate, so no global allocator is linked there.
+#[cfg(target_arch = "x86_64")]
 extern crate alloc;
 
 use core::panic::PanicInfo;
 
-mod allocator;
+// Architecture-agnostic core (compiles for every target).
 mod arch;
-mod console;
-mod context;
-mod crosscore;
-mod elf;
-mod fpu;
-mod frame_systems;
-mod frames;
-mod fs;
-mod gdt;
 mod hal;
+mod serial;
+
+// x86_64-only modules. The AArch64 skeleton (B-HAL.3) compiles only the
+// arch-agnostic core above + arch::aarch64; the rest of the kernel (boot, SMP,
+// scheduler, drivers, user mode, net, fs, …) is still x86 and is gated off until
+// it's ported (B-HAL.4/.5). Each is gated individually — Rust has no block form
+// for free-standing `mod` items.
+#[cfg(target_arch = "x86_64")]
+mod allocator;
+#[cfg(target_arch = "x86_64")]
+mod console;
+#[cfg(target_arch = "x86_64")]
+mod context;
+#[cfg(target_arch = "x86_64")]
+mod crosscore;
+#[cfg(target_arch = "x86_64")]
+mod elf;
+#[cfg(target_arch = "x86_64")]
+mod fpu;
+#[cfg(target_arch = "x86_64")]
+mod frame_systems;
+#[cfg(target_arch = "x86_64")]
+mod frames;
+#[cfg(target_arch = "x86_64")]
+mod fs;
+#[cfg(target_arch = "x86_64")]
+mod gdt;
+#[cfg(target_arch = "x86_64")]
 mod interrupts;
+#[cfg(target_arch = "x86_64")]
 mod io;
+#[cfg(target_arch = "x86_64")]
 mod ip_reasm;
+#[cfg(target_arch = "x86_64")]
 mod ksched;
+#[cfg(target_arch = "x86_64")]
 mod lapic;
+#[cfg(target_arch = "x86_64")]
 mod lockorder;
+#[cfg(target_arch = "x86_64")]
 mod net;
+#[cfg(target_arch = "x86_64")]
 mod pci;
+#[cfg(target_arch = "x86_64")]
 mod pcsched;
+#[cfg(target_arch = "x86_64")]
 mod percpu;
+#[cfg(target_arch = "x86_64")]
 mod pic;
+#[cfg(target_arch = "x86_64")]
 mod pipe;
+#[cfg(target_arch = "x86_64")]
 mod pit;
 // RAM-backed block device for the interactive build (#110 mitigation): serves
 // the fs from a baked-in image in RAM, bypassing QEMU's flaky emulated disk.
-#[cfg(feature = "interactive")]
+#[cfg(all(target_arch = "x86_64", feature = "interactive"))]
 mod ramdisk;
+#[cfg(target_arch = "x86_64")]
 mod reactor;
+#[cfg(target_arch = "x86_64")]
 mod rtc;
+#[cfg(target_arch = "x86_64")]
 mod sched;
+#[cfg(target_arch = "x86_64")]
 mod sched_demo;
-mod serial;
+#[cfg(target_arch = "x86_64")]
 mod spin;
+#[cfg(target_arch = "x86_64")]
 mod tcp;
+#[cfg(target_arch = "x86_64")]
 mod usermode;
+#[cfg(target_arch = "x86_64")]
 mod vfs;
 // The interactive build serves its fs from the RAM disk, so virtio-blk's
 // read/write data path is unused there (its `on_irq` is still wired into the
 // IDT); allow the resulting dead code only in that build. The default + smoke
 // builds use the driver fully and keep full dead-code warnings.
+#[cfg(target_arch = "x86_64")]
 #[cfg_attr(feature = "interactive", allow(dead_code))]
 mod virtio_blk;
+#[cfg(target_arch = "x86_64")]
 mod virtio_net;
+#[cfg(target_arch = "x86_64")]
 mod vm;
+#[cfg(target_arch = "x86_64")]
 mod xhci;
 
+#[cfg(target_arch = "x86_64")]
 use frame_systems::Kernel;
 // The MMU is exercised only by the default build's paging/vm/TLB smoke blocks;
 // the interactive build replaces that boot tail with the shell.
-#[cfg(not(feature = "interactive"))]
+#[cfg(all(target_arch = "x86_64", not(feature = "interactive")))]
 use hal::{mmu, MapFlags, Mmu};
 
 // ---------------------------------------------------------------------------
 // Limine boot protocol declarations
 // ---------------------------------------------------------------------------
 
+// (All of the Limine + SMP boot scaffolding below is x86-only: the Limine
+// requests, the AP-startup stress statics, and the AP/BSP entry sequence are the
+// x86 boot path. The aarch64 skeleton boots via arch::aarch64::boot instead;
+// these items are gated off there until the boot/SMP path is ported, B-HAL.4+.)
+
 // Base revision: tells Limine which version of its boot protocol we
 // support. Revision 3 is the current protocol as of Limine v9+.
+#[cfg(target_arch = "x86_64")]
 #[used]
 #[link_section = ".requests"]
 static BASE_REVISION: limine::BaseRevision = limine::BaseRevision::with_revision(3);
@@ -101,11 +158,13 @@ static BASE_REVISION: limine::BaseRevision = limine::BaseRevision::with_revision
 // Markers that delimit the .requests section. Limine looks between these
 // to find our protocol-info structs. Placing them in dedicated sections
 // keeps the linker from reordering or eliminating them.
+#[cfg(target_arch = "x86_64")]
 #[used]
 #[link_section = ".requests_start_marker"]
 static REQUESTS_START_MARKER: limine::request::RequestsStartMarker =
     limine::request::RequestsStartMarker::new();
 
+#[cfg(target_arch = "x86_64")]
 #[used]
 #[link_section = ".requests_end_marker"]
 static REQUESTS_END_MARKER: limine::request::RequestsEndMarker =
@@ -114,31 +173,40 @@ static REQUESTS_END_MARKER: limine::request::RequestsEndMarker =
 // B7 Step 1 (SMP): ask Limine to start the application processors. Without this
 // request the non-bootstrap cores are left parked by the bootloader. Each AP is
 // launched at `ap_entry` (below) once we write its `goto_address`.
+#[cfg(target_arch = "x86_64")]
 #[used]
 #[link_section = ".requests"]
 static MP_REQUEST: limine::request::MpRequest = limine::request::MpRequest::new();
 
 /// Count of application processors that have reached `ap_entry` and set up their
 /// per-CPU state. The BSP waits on this during SMP bringup.
+#[cfg(target_arch = "x86_64")]
 static AP_ONLINE: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
 // R5b: count of APs that verified they loaded *their own* per-CPU TSS selector.
+#[cfg(target_arch = "x86_64")]
 static AP_TSS_OK: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
 
 // B7 Step 2: a cross-core, lock-protected shared counter. Every core (BSP + APs)
 // hammers it concurrently; if the `SpinLock` is correct, the final total is
 // exactly cores × `HAMMER_ITERS` with no lost updates. `AP_HAMMERED` lets the
 // BSP wait for the APs to finish their share.
+#[cfg(target_arch = "x86_64")]
 static SHARED_COUNTER: spin::SpinLock<u64> = spin::SpinLock::new(0);
+#[cfg(target_arch = "x86_64")]
 static AP_HAMMERED: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+#[cfg(target_arch = "x86_64")]
 const HAMMER_ITERS: u64 = 50_000;
 
 // B7 Step 4: per-CPU preemption. Each AP runs a busy loop preempted by its own
 // LAPIC timer until the timer has fired `TARGET_TICKS` times, then signals done.
+#[cfg(target_arch = "x86_64")]
 static AP_PREEMPTED: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+#[cfg(target_arch = "x86_64")]
 const TARGET_TICKS: u64 = 5;
 
 /// Increment the shared counter `HAMMER_ITERS` times, taking the lock each time —
 /// the cross-core critical-section stress. Run concurrently by every core.
+#[cfg(target_arch = "x86_64")]
 fn hammer_counter() {
     for _ in 0..HAMMER_ITERS {
         *SHARED_COUNTER.lock() += 1;
@@ -149,6 +217,7 @@ fn hammer_counter() {
 /// on a Limine-provided stack) once the BSP writes the CPU's `goto_address`. The
 /// CPU's index was stashed in `extra` by the BSP. B7 Step 1: set up per-CPU state
 /// (GS base), report online, and park — later steps will run the scheduler here.
+#[cfg(target_arch = "x86_64")]
 unsafe extern "C" fn ap_entry(cpu: &limine::mp::Cpu) -> ! {
     use core::sync::atomic::Ordering;
     let index = cpu.extra.load(Ordering::SeqCst) as usize;
@@ -221,6 +290,7 @@ unsafe extern "C" fn ap_entry(cpu: &limine::mp::Cpu) -> ! {
 ///
 /// Called once at kernel startup; never re-entered. The boot environment
 /// (page tables, stack, GDT) is set up by Limine before this runs.
+#[cfg(target_arch = "x86_64")]
 #[no_mangle]
 unsafe extern "C" fn kmain() -> ! {
     // Verify Limine actually understood our base revision.
@@ -761,6 +831,7 @@ unsafe extern "C" fn kmain() -> ! {
 // Halt loop
 // ---------------------------------------------------------------------------
 
+#[cfg(target_arch = "x86_64")]
 fn halt_forever() -> ! {
     // Signal a clean stop to the host. QEMU's `isa-debug-exit` device
     // (wired up by the smoke harness at iobase 0xf4) turns a port write
@@ -779,6 +850,16 @@ fn halt_forever() -> ! {
     }
     loop {
         interrupts::wait_for_interrupt();
+    }
+}
+
+/// AArch64 halt: park in a low-power wait loop. (The QEMU `virt` board has no
+/// `isa-debug-exit` port; the aarch64 smoke harness detects the banner + a
+/// timeout rather than a clean-exit code.)
+#[cfg(target_arch = "aarch64")]
+fn halt_forever() -> ! {
+    loop {
+        unsafe { core::arch::asm!("wfe", options(nomem, nostack)) };
     }
 }
 

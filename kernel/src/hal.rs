@@ -23,6 +23,9 @@
 #[cfg(target_arch = "x86_64")]
 use crate::arch::x86_64 as imp;
 
+#[cfg(target_arch = "aarch64")]
+use crate::arch::aarch64 as imp;
+
 /// The platform console: byte-level I/O over the primary UART.
 ///
 /// x86_64 implements this over the 16550 (COM1); a future AArch64 port
@@ -88,6 +91,8 @@ pub trait Cpu {
 /// The CPU control surface for this build's target architecture (build-time
 /// selected, concrete type — no vtable). Callers bring the methods into scope
 /// with `use crate::hal::Cpu`.
+// (B-HAL.3: aarch64 implements this in B-HAL.4 — x86-only for now.)
+#[cfg(target_arch = "x86_64")]
 pub fn cpu() -> &'static imp::CpuDevice {
     imp::cpu()
 }
@@ -103,6 +108,7 @@ pub trait Clock {
 /// The wall-clock source for this build's target architecture (build-time
 /// selected, concrete type — no vtable). Callers bring the method into scope
 /// with `use crate::hal::Clock`.
+#[cfg(target_arch = "x86_64")]
 pub fn clock() -> &'static imp::ClockDevice {
     imp::clock()
 }
@@ -112,6 +118,7 @@ pub fn clock() -> &'static imp::ClockDevice {
 /// regs + FPSR/FPCR), and the scheduler embeds one per thread — so the HAL
 /// re-exports the concrete type here rather than the kernel naming an arch
 /// module. `FpuState::zeroed()` is `const` for use in static save-area arrays.
+#[cfg(target_arch = "x86_64")]
 pub use imp::FpuState;
 
 /// FPU/SSE register-file management: per-core enable + initialize, and
@@ -119,6 +126,10 @@ pub use imp::FpuState;
 ///
 /// x86_64 implements these over CR0/CR4 + `fxsave`/`fxrstor`; a future AArch64
 /// port over the FP/NEON enable bits + the `Q`-register save area.
+///
+/// (B-HAL.3: gated to x86 for now — it references the arch-specific `FpuState`,
+/// which aarch64 provides in B-HAL.4.)
+#[cfg(target_arch = "x86_64")]
 pub trait Fpu {
     /// Enable the FPU/SSE on the calling core and initialize it, capturing the
     /// clean template for new threads. Call once per core before the scheduler
@@ -146,6 +157,7 @@ pub trait Fpu {
 /// The FPU control surface for this build's target architecture (build-time
 /// selected, concrete type — no vtable). Callers bring the methods into scope
 /// with `use crate::hal::Fpu`.
+#[cfg(target_arch = "x86_64")]
 pub fn fpu() -> &'static imp::FpuDevice {
     imp::fpu()
 }
@@ -258,6 +270,7 @@ pub trait Mmu {
 /// The MMU for this build's target architecture (build-time selected, concrete
 /// type — no vtable). Callers bring the methods into scope with
 /// `use crate::hal::Mmu`.
+#[cfg(target_arch = "x86_64")]
 pub fn mmu() -> &'static imp::MmuDevice {
     imp::mmu()
 }
@@ -287,6 +300,7 @@ pub trait PerCpu {
 
 /// The per-core base register for this build's target architecture (build-time
 /// selected, concrete type — no vtable).
+#[cfg(target_arch = "x86_64")]
 pub fn per_cpu() -> &'static imp::PerCpuDevice {
     imp::per_cpu()
 }
