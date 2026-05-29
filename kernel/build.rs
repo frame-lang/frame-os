@@ -47,7 +47,13 @@ const FRAME_SYSTEMS: &[(&str, &str)] = &[
 
 fn main() -> Result<()> {
     let manifest = PathBuf::from(env_var("CARGO_MANIFEST_DIR")?);
-    let linker_script = manifest.join("linker.ld");
+    // Per-target linker script: x86 uses the Limine higher-half layout; aarch64
+    // uses the QEMU `virt` direct-boot layout (B-HAL.3).
+    let target_arch = env_var("CARGO_CFG_TARGET_ARCH")?;
+    let linker_script = manifest.join(match target_arch.as_str() {
+        "aarch64" => "linker-aarch64.ld",
+        _ => "linker.ld",
+    });
 
     // --- Linker configuration (B0 Step 1) ---------------------------------
     println!("cargo:rerun-if-changed=build.rs");
@@ -118,7 +124,11 @@ fn main() -> Result<()> {
     // --- User program (B3 Step 4) -----------------------------------------
     // Build the freestanding user crate and stage its ELF where usermode.rs
     // can `include_bytes!` it (concat!(env!("OUT_DIR"), "/user_hello.elf")).
-    build_user_program(workspace_root, &out_dir)?;
+    // The user programs are x86 ELFs; `usermode.rs` (which include_bytes!s them)
+    // is x86-only, so the aarch64 skeleton neither builds nor needs them (B-HAL.3).
+    if target_arch == "x86_64" {
+        build_user_program(workspace_root, &out_dir)?;
+    }
 
     Ok(())
 }

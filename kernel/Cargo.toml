@@ -32,7 +32,8 @@ interactive = []
 #
 # (The x86_64-unknown-none target spec already sets panic-strategy = abort
 # by default — we don't need to override it in this crate's profile.)
-limine = "0.5"
+# (limine is x86-only — moved to the [target.'cfg(target_arch = "x86_64")']
+# section below so the crate also compiles for aarch64-unknown-none, B-HAL.3.)
 
 # Global heap allocator for the kernel. The Frame-generated `Kernel` code
 # allocates (String/Vec/Rc for event + compartment plumbing), so we need a
@@ -44,6 +45,12 @@ linked_list_allocator = "0.10"
 # Shared on-disk FS format (B4) — the byte layout, used by both the kernel
 # driver and the host `mkfs` tool so it's defined exactly once. no_std.
 frame-os-shared = { path = "../shared" }
+
+# Limine is the x86 (UEFI) boot protocol; the AArch64 build boots directly via
+# QEMU `-kernel` (no Limine), so it's gated per-target. This is what lets the
+# kernel crate compile for `aarch64-unknown-none` at all (B-HAL.3).
+[target.'cfg(target_arch = "x86_64")'.dependencies]
+limine = "0.5"
 
 [build-dependencies]
 # build.rs invokes framec on frame/kernel.frs and uses anyhow for error

@@ -172,9 +172,44 @@ at once.
   foundation (the `hal.rs` traits + `arch/x86_64/` layout) is the additive seam
   that makes that work a port, not a fork.
 - **B-HAL.3 — AArch64 skeleton: boot + console + a halt loop.** New
-  `arch/aarch64/` + `aarch64-unknown-none` target: device-tree-driven boot, PL011
-  console, GIC + generic-timer stubs, MMU bring-up — enough to print the banner
-  and halt under `qemu-system-aarch64 -M virt`. (The AArch64 B0.)
+  `arch/aarch64/` + `aarch64-unknown-none` target: direct (`-kernel`) boot, PL011
+  console, then (later sub-steps) device-tree memory map, GIC + generic-timer
+  stubs, MMU bring-up — enough to print the banner and halt under
+  `qemu-system-aarch64 -M virt`. (The AArch64 B0.) Approach: **two arch entry
+  points in one crate, converging over B-HAL.4/.5** — x86 keeps its monolithic
+  Limine `kmain`; aarch64 gets its own minimal `_start`/`kmain` that uses the
+  existing HAL traits where they exist. Toolchain confirmed available
+  (2026-05-29): `aarch64-unknown-none` rustup target + host `qemu-system-aarch64`
+  11.0 (the Mac runs the ARM guest directly; the docker image is x86-qemu only).
+  Numbered sub-plan (M1–M4 style; each its own validated commit, x86 stays 49/49):
+  - **B-HAL.3.0 — Build plumbing (x86 no-op).** Add `linker-aarch64.ld` (ELF
+    `littleaarch64`, load at the `virt` base `0x4008_0000`, `ENTRY(_start)`);
+    branch `build.rs` on `CARGO_CFG_TARGET_ARCH` to pick the linker script + skip
+    the x86 user-program staging on aarch64; make `limine` an
+    `[target.'cfg(target_arch = "x86_64")'.dependencies]` dep. Validate: x86
+    builds + 49/49 unchanged; the aarch64 build now fails *only* on x86-coupled
+    code (the gating list for 3.1).
+  - **B-HAL.3.1 — cfg-split + minimal halt.** Gate every x86-only `mod` + the
+    Limine statics + the x86 `kmain` to `cfg(target_arch = "x86_64")`; add
+    `arch/aarch64/` with a naked `_start` (set SP, clear BSS, `bl kmain`) and a
+    minimal `kmain` that just `wfi`-loops. Validate: **both** targets build;
+    aarch64 ELF boots under `qemu-system-aarch64 -M virt` and halts cleanly; x86
+    49/49.
+  - **B-HAL.3.2 — PL011 `Console` + banner.** Implement the existing
+    `hal::Console` trait over PL011 (`0x0900_0000` on `virt`) in
+    `arch/aarch64/serial.rs`; the aarch64 `kmain` prints the banner through the
+    arch-agnostic `serial.rs` text layer, then halts. **The visible milestone:**
+    the same banner on a second ISA, one `write_byte` of new code. Validate:
+    banner appears on the qemu serial console; add an aarch64 smoke entry.
+  - **B-HAL.3.3 — Device tree + memory map.** Parse the FDT QEMU passes in `x0`
+    for RAM base/size + the PL011 base; feed `frames.rs`. (The `Boot` "give me a
+    memory map" half; candidate first `@@fsm` later.)
+  - **B-HAL.3.4 — MMU bring-up.** AArch64 translation tables + TTBR0/1 behind the
+    existing `hal::Mmu` trait (the `MapFlags` abstraction pays off); enable the
+    MMU, keep printing.
+  - **B-HAL.3.5 — GIC + generic-timer stubs.** Minimal GICv2/3 init + `CNTP_*`
+    enough to exist — establishing the `Irq`/`Timer` trait shapes against real
+    ARM hardware (the contracts the x86 side is then re-fitted to).
 - **B-HAL.4 — AArch64 scheduling + ring-0 FSMs.** Context switch + timer
   preemption + per-CPU on ARM, until the `Scheduler`/`Task` FSMs run a kernel
   thread. The same FSMs, now on a second ISA.
