@@ -244,9 +244,21 @@ at once.
     lands with B-HAL.4/.5 — this is the substrate they sit on. Validated:
     `cargo xtask qemu-aarch64` PASS (now also asserts `MMU enabled`); x86 build +
     clippy (both arches) + fmt clean.
-  - **B-HAL.3.5 — GIC + generic-timer stubs.** Minimal GICv2/3 init + `CNTP_*`
-    enough to exist — establishing the `Irq`/`Timer` trait shapes against real
-    ARM hardware (the contracts the x86 side is then re-fitted to).
+  - **B-HAL.3.5 — GIC + generic timer + EL1 vectors. DONE (2026-05-30).** The
+    aarch64 kernel takes real interrupts. `arch/aarch64/gic.rs`: GICv2 (forced
+    via `-machine virt,gic-version=2`) — distributor + CPU-interface enable +
+    `unmask`/`iar`/`eoi`. `arch/aarch64/timer.rs`: ARM generic timer — read
+    `CNTFRQ_EL0`, program `CNTP_TVAL_EL0` + `CNTP_CTL_EL0`. `arch/aarch64/
+    vectors.rs`: a 2 KiB-aligned EL1 vector table (`VBAR_EL1`), 16 slots × 128 B
+    — slot 5 (current EL with SP_ELx, IRQ) branches to an IRQ stub that saves
+    the caller-saved GPRs + FP/LR, calls a Rust handler (reads `GICC_IAR`,
+    reprograms the timer at 10 Hz, bumps `TICK_COUNT`, EOIs), restores, `eret`s.
+    `kmain` installs the vectors, brings up GIC + timer, unmasks `DAIF.I`, spins
+    in `wfi` until the handler has counted 3 ticks, then masks IRQs and reports.
+    Validated: `cargo xtask qemu-aarch64` PASS — full serial shows
+    `generic-timer fired 3 ticks`; x86 build + clippy (both arches) + fmt clean.
+    Establishes the `Irq`/`Timer` trait *shapes* against real ARM hardware — the
+    contracts deferred from B-HAL.2 — for the full impl in B-HAL.4/.5.
 - **B-HAL.4 — AArch64 scheduling + ring-0 FSMs.** Context switch + timer
   preemption + per-CPU on ARM, until the `Scheduler`/`Task` FSMs run a kernel
   thread. The same FSMs, now on a second ISA.

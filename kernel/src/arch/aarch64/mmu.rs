@@ -30,8 +30,9 @@ const ATTRIDX_NORMAL: u64 = 1 << 2; // AttrIndx = MAIR attr1 (Normal WB); attr0 
 const SH_INNER: u64 = 0b11 << 8; // inner shareable (for Normal memory)
 const AF: u64 = 1 << 10; // Access Flag (else first access faults)
 
-// MAIR_EL1 attributes: attr0 = Device-nGnRnE (0x00), attr1 = Normal WB RW-allocate (0xFF).
-const MAIR: u64 = (0xFF << 8) | 0x00;
+// MAIR_EL1 attributes: attr0 = Device-nGnRnE (0x00, implicit), attr1 = Normal WB
+// RW-allocate (0xFF) in byte[1].
+const MAIR: u64 = 0xFF << 8;
 
 /// Build the identity map, program the system registers, and enable the MMU.
 ///

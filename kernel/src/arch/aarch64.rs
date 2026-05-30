@@ -12,8 +12,11 @@
 
 pub mod boot;
 pub mod fdt;
+pub mod gic;
 pub mod mmu;
 pub mod serial;
+pub mod timer;
+pub mod vectors;
 
 /// The console device type the `hal::console()` accessor returns on aarch64.
 pub type ConsoleDevice = serial::Pl011;

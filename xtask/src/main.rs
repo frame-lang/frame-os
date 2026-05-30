@@ -1480,7 +1480,7 @@ fn run_qemu_aarch64() -> Result<()> {
     let dtb = target_dir(&workspace).join("virt-aarch64.dtb");
     let status = Command::new("qemu-system-aarch64")
         .arg("-M")
-        .arg(format!("virt,dumpdtb={}", dtb.display()))
+        .arg(format!("virt,gic-version=2,dumpdtb={}", dtb.display()))
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status()
@@ -1495,7 +1495,7 @@ fn run_qemu_aarch64() -> Result<()> {
     let mut child = Command::new("qemu-system-aarch64")
         .args([
             "-M",
-            "virt",
+            "virt,gic-version=2",
             "-cpu",
             "cortex-a72",
             "-m",
@@ -1545,6 +1545,9 @@ fn run_qemu_aarch64() -> Result<()> {
         // The console reaching this line means it survived SCTLR_EL1.M=1 — the
         // identity map + device/normal mappings are correct (B-HAL.3.4).
         wait_for_output(&buf, "MMU enabled", 30)?;
+        // Taking a real generic-timer IRQ on a second ISA proves the EL1 vector
+        // table + GICv2 init + CNTP_* work end-to-end (B-HAL.3.5).
+        wait_for_output(&buf, "generic-timer fired", 30)?;
         Ok(())
     })();
 

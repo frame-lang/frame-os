@@ -120,6 +120,30 @@ unsafe extern "C" fn kmain(dtb: usize) -> ! {
     unsafe { crate::arch::aarch64::mmu::enable() };
     serial::writeln("[aarch64] MMU enabled (identity map via TTBR0)");
 
+    // B-HAL.3.5: install EL1 vectors, bring up the GIC + the ARM generic timer,
+    // unmask DAIF.I, and spin in `wfi` until the IRQ handler has counted a few
+    // ticks. Taking a real interrupt on a second ISA proves the Irq/Timer trait
+    // shapes against actual hardware (the contracts deferred from B-HAL.2).
+    use crate::arch::aarch64::{gic, timer, vectors};
+    use core::arch::asm;
+    use core::sync::atomic::Ordering;
+    const TARGET_TICKS: u32 = 3;
+    unsafe {
+        vectors::install();
+        gic::init();
+        timer::init(10); // 10 Hz tick
+        gic::unmask(timer::TIMER_IRQ);
+        asm!("msr daifclr, #2", options(nomem, nostack)); // unmask IRQs
+    }
+    serial::writeln("[aarch64] GIC + generic timer up; awaiting ticks");
+    while vectors::TICK_COUNT.load(Ordering::Relaxed) < TARGET_TICKS {
+        unsafe { asm!("wfi", options(nomem, nostack)) };
+    }
+    unsafe { asm!("msr daifset, #2", options(nomem, nostack)) }; // mask IRQs
+    serial::write_str("[aarch64] generic-timer fired ");
+    serial::write_u32_decimal(vectors::TICK_COUNT.load(Ordering::Relaxed));
+    serial::writeln(" ticks");
+
     serial::writeln("[aarch64] halting.");
     crate::halt_forever();
 }
