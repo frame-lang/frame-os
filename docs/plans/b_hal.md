@@ -295,6 +295,25 @@ at once.
     clippy (both arches) + fmt clean. With frames live, the heap (`allocator.rs`,
     B-HAL.4.2) is the next thing in the chain — and with the heap, the Frame
     systems' `Box`/`Vec`/`Rc` machinery compiles for aarch64.
+  - **B-HAL.4.2 — Global allocator (heap) on aarch64. DONE (2026-05-30).** The
+    smallest seam yet, because `allocator.rs` was *already* arch-agnostic — a
+    static 8 MiB BSS buffer behind `linked_list_allocator::LockedHeap`, wrapped
+    in a `CountingHeap: GlobalAlloc` that bumps an atomic per `alloc` (the
+    counter the per-event-allocation measurement uses). The only thing keeping
+    it x86-only was the `mod allocator;` + `extern crate alloc;` gates in
+    `main.rs`. Ungate both, call `crate::allocator::init()` from aarch64 kmain
+    after frames are live, and `Box`/`Vec`/`Rc` work. Demo: a `Box<u32>` +
+    `Vec::with_capacity(8)` + sum, with `alloc_count()` confirming the runtime
+    actually went through `GlobalAlloc::alloc`. Side-effect: the 8 MiB heap is
+    in BSS, so the usable-frame count drops by ~2048 frames (8 MiB) — visible
+    in the smoke (32326 → 30269) and exactly as expected (BSS grew, so the
+    carved region above `__stack_top` shrank). Validated: `cargo xtask
+    qemu-aarch64` PASS — `[heap] Box+Vec round-trip: ok (allocs delta=2)`; x86
+    + aarch64 build + clippy clean; fmt clean. **The big unlock**: with frames +
+    heap on aarch64, the Frame-generated `frame_systems` (which uses
+    `Box<dyn StateContext>`, `Vec<…>`, `Rc<FrameEvent>` etc.) compiles for the
+    second ISA — making B-HAL.4.4 (run the same `Scheduler`/`Task` FSMs on
+    aarch64) a matter of context-switch primitive (.4.3) + boot wiring.
 - **B-HAL.5 — AArch64 user mode + a storage/console device.** `svc` syscall path,
   the `SyscallProcessBackend` over it, a virtio-mmio (QEMU virt) or RPi device, so
   `ish` (already arch-agnostic — its FSMs + syscalls) runs. Then `console-test`

@@ -35,9 +35,10 @@
 // item.
 #![cfg_attr(target_arch = "aarch64", allow(dead_code, unused_imports))]
 
-// `alloc` is used by the Frame-generated systems on the x86 boot path; the
-// aarch64 skeleton doesn't allocate, so no global allocator is linked there.
-#[cfg(target_arch = "x86_64")]
+// `alloc` is used by the Frame-generated systems on every boot path — the
+// global allocator (`kernel::allocator`) is arch-agnostic (B-HAL.4.2), backed
+// by a static heap and `linked_list_allocator`. Each arch's boot calls
+// `allocator::init()` before any allocation.
 extern crate alloc;
 
 use core::panic::PanicInfo;
@@ -52,7 +53,9 @@ mod serial;
 // scheduler, drivers, user mode, net, fs, …) is still x86 and is gated off until
 // it's ported (B-HAL.4/.5). Each is gated individually — Rust has no block form
 // for free-standing `mod` items.
-#[cfg(target_arch = "x86_64")]
+// `allocator` is arch-agnostic — a static heap + linked_list_allocator wrapped
+// in a counting GlobalAlloc. Both ISAs link it; each boot path calls `init()`
+// once before the first allocation. B-HAL.4.2.
 mod allocator;
 #[cfg(target_arch = "x86_64")]
 mod console;

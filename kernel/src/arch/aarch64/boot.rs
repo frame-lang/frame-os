@@ -216,6 +216,31 @@ unsafe extern "C" fn kmain(dtb: usize) -> ! {
         serial::writeln("[aarch64] frame allocator skipped (no /memory in DTB)");
     }
 
+    // B-HAL.4.2: global allocator (heap). Same arch-agnostic
+    // `allocator.rs` the x86 boot uses — a static 8 MiB BSS buffer behind
+    // `linked_list_allocator`, wrapped in a counting `GlobalAlloc`. Calling
+    // `init()` lets `Box`/`Vec`/`Rc` work — the substrate the Frame-generated
+    // systems' event + compartment plumbing needs (B-HAL.4.3+ on aarch64).
+    crate::allocator::init();
+    {
+        use alloc::boxed::Box;
+        use alloc::vec::Vec;
+        let allocs_before = crate::allocator::alloc_count();
+        let b = Box::new(0xCAFE_F00D_u32);
+        let mut v: Vec<u32> = Vec::with_capacity(8);
+        for i in 0..8u32 {
+            v.push(i * i);
+        }
+        let sum: u32 = v.iter().sum();
+        let allocs_delta = crate::allocator::alloc_count() - allocs_before;
+        if *b == 0xCAFE_F00D && sum == 140 && allocs_delta >= 2 {
+            serial::write_str("[heap] Box+Vec round-trip: ok (allocs delta=");
+            serial::write_u32_decimal(allocs_delta as u32);
+            serial::writeln(")");
+        }
+        // Drops `b` + `v` here; counter only tracks allocs, so no read-back.
+    }
+
     serial::writeln("[aarch64] halting.");
     crate::halt_forever();
 }

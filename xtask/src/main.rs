@@ -1559,6 +1559,12 @@ fn run_qemu_aarch64() -> Result<()> {
         // the free count proves the data layer ran unchanged on aarch64.
         wait_for_output(&buf, "[frames] alloc two distinct frames: ok", 30)?;
         wait_for_output(&buf, "[frames] free restores count: ok", 30)?;
+        // B-HAL.4.2: the global allocator (linked_list_allocator behind a
+        // counting GlobalAlloc) is live on aarch64 — `extern crate alloc;`
+        // ungates, `allocator::init()` is called, and a Box+Vec round-trip
+        // succeeds while the alloc counter bumps. The substrate the Frame
+        // systems' Rc/Vec event plumbing needs (B-HAL.4.3+).
+        wait_for_output(&buf, "[heap] Box+Vec round-trip: ok", 30)?;
         Ok(())
     })();
 
@@ -1571,7 +1577,7 @@ fn run_qemu_aarch64() -> Result<()> {
         bail!("qemu-aarch64: kernel panicked:\n{captured}");
     }
     eprintln!(
-        "qemu-aarch64: PASS — banner + PL011 console + device-tree memory map (RAM base 0x40000000) + per-CPU base via TPIDR_EL1 + frame allocator from FDT"
+        "qemu-aarch64: PASS — banner + PL011 console + device-tree memory map (RAM base 0x40000000) + per-CPU base via TPIDR_EL1 + frame allocator from FDT + global heap (Box/Vec)"
     );
     Ok(())
 }
