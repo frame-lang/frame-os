@@ -69,10 +69,15 @@ global_asm!(
     // 8: Lower EL aarch64, Sync — `svc` from EL0 lands here (B-HAL.5.0).
     ".balign 0x80",
     "b svc_stub",
-    // 9..11: Lower EL aarch64 — IRQ/FIQ/SError. Reserved for B-HAL.5.1+.
+    // 9: Lower EL aarch64, IRQ — a hardware IRQ taken while running at EL0
+    // (e.g. generic timer tick). Routed to the *same* irq_stub as same-EL IRQs
+    // (slot 5): the full-frame save format matches, and rust_irq_handler
+    // services the GIC + (when preemption is active) calls schedule(), which
+    // can switch to a different thread regardless of whether the interrupted
+    // thread was at EL1 or EL0 (B-HAL.5.1).
     ".balign 0x80",
-    "1: wfe",
-    "b 1b",
+    "b irq_stub",
+    // 10..11: Lower EL aarch64, FIQ/SError. Reserved for B-HAL.5.2+.
     ".balign 0x80",
     "1: wfe",
     "b 1b",

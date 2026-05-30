@@ -422,6 +422,26 @@ at once.
     for the rest of B-HAL.5: B-HAL.5.1 wires lower-EL IRQ + expands the
     syscall table; B-HAL.5.2 adds aarch64 user ELF loading; B-HAL.5.3+
     bring up virtio-mmio + ish.
+  - **B-HAL.5.1 — Lower-EL IRQ + syscall table on aarch64. DONE
+    (2026-05-30).** Vector slot 9 (Lower EL aarch64 IRQ) now routes to the
+    *same* `irq_stub` used by slot 5: the full-frame save format is
+    identical, so a timer tick taken at EL0 takes the EL0→EL1 transition,
+    saves x0..x30 + ELR_EL1 + SPSR_EL1 onto SP_EL1, runs `rust_irq_handler`,
+    returns the same SP (preemption inactive here), and `eret`s back into
+    the EL0 thread where it left off. With slot 9 wired, `enter_el0` can
+    leave DAIF clear in SPSR — the user routine runs with IRQs enabled (the
+    B-HAL.5.0 demo had to mask them as a kludge). Syscall table grew from 2
+    to 3: write (x8=0), exit (x8=1), and new **`getticks` (x8=2)** returning
+    the kernel's `TICK_COUNT` atomic. The demo's user routine prints HELLO,
+    spins ~1M iterations (long enough under TCG for a tick to land at EL0
+    — `1_000_000 = 0xF4240` needs a `movz` + `movk` pair since it's wider
+    than a single `mov #imm16`), calls getticks, prints `ticks=N\n`, then
+    exits — 23 bytes total round-tripped through SVC. Observed:
+    `HELLO from EL0` → `ticks=4` → `[el0] EL0 + SVC roundtrip: ok (IRQs at
+    EL0 too)`. Validated: `cargo xtask qemu-aarch64` PASS; x86 + aarch64
+    build + clippy clean; fmt clean. EL0 now runs with the full normal
+    PSTATE (no masking kludge) — the substrate B-HAL.5.2's ELF-loaded user
+    programs need.
 
 ## Risks / honest scope
 

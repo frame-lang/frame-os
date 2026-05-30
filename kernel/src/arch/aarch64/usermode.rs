@@ -36,13 +36,17 @@ pub static USER_BYTES_WRITTEN: AtomicU32 = AtomicU32::new(0);
 /// than e.g. faulting back out via a different path).
 pub static USER_EXITED: AtomicBool = AtomicBool::new(false);
 
-// The EL0 entry routine: print "HELLO from EL0\n" byte-by-byte via SVC with
-// x8 = 0 (write byte in x0), then exit via SVC with x8 = 1. This *executes
-// at EL0* — the kernel `enter_el0`s into it. The `b .` at the end is
-// defensive: if the exit syscall somehow returns to user mode (it shouldn't,
-// because it redirects ELR_EL1), park rather than fall off the end.
+// The EL0 entry routine. Prints "HELLO from EL0\n" byte-by-byte via SVC with
+// x8 = 0 (write byte in x0), then *spins long enough for at least one timer
+// tick to fire while at EL0* — proves the lower-EL IRQ vector (slot 9) wires
+// to irq_stub, the full-frame save/restore round-trips an EL0→EL1→EL0
+// transition correctly, and IRQs don't disturb the user routine's logical
+// state. After the spin, reads the post-tick count via `getticks` (x8 = 2),
+// writes a marker line, then exits via SVC with x8 = 1.
 //
-// AAPCS scratch registers x0/x8 only; no FP/LR involvement (we never `ret`).
+// AAPCS scratch registers only — x0/x1/x8 in the body, x19/x20 saved as
+// callee-saved across the spin loop (we never `ret`, so the callee-saved
+// preservation is for readability rather than ABI conformance).
 global_asm!(
     ".section .text",
     ".global aarch64_user_demo_entry",
@@ -78,6 +82,43 @@ global_asm!(
     "  svc #0",
     "  mov x0, #10", // '\n'
     "  svc #0",
+    // Spin ~1M iterations: long enough under TCG (10 Hz timer) for at least
+    // one tick to land at EL0. The IRQ goes through slot 9 → irq_stub (same
+    // one as EL1) → rust_irq_handler → returns the same SP → restore frame
+    // → eret back to EL0, continuing the spin. 1_000_000 = 0xF4240 — too
+    // wide for a single `mov #imm16`, so build it with movz + movk.
+    "  movz x19, #0x4240",
+    "  movk x19, #0xf, lsl #16",
+    "2:",
+    "  subs x19, x19, #1",
+    "  b.ne 2b",
+    // Print "ticks=" then the tick count digit-by-digit. For the demo we
+    // only print a single digit (we expect ~1–4 ticks); 10+ would just stop
+    // at '9'+overflow which is fine for the smoke.
+    "  mov x8, #0",
+    "  mov x0, #'t'",
+    "  svc #0",
+    "  mov x0, #'i'",
+    "  svc #0",
+    "  mov x0, #'c'",
+    "  svc #0",
+    "  mov x0, #'k'",
+    "  svc #0",
+    "  mov x0, #'s'",
+    "  svc #0",
+    "  mov x0, #'='",
+    "  svc #0",
+    "  mov x8, #2", // getticks
+    "  svc #0",     // returns count in x0
+    "  cmp x0, #9",
+    "  b.le 3f",
+    "  mov x0, #9", // cap at single digit
+    "3:",
+    "  add x0, x0, #'0'", // ASCII digit
+    "  mov x8, #0",
+    "  svc #0",
+    "  mov x0, #10", // '\n'
+    "  svc #0",
     "  mov x8, #1", // exit
     "  svc #0",
     "1: b 1b",
@@ -103,13 +144,12 @@ global_asm!(
     "  mov x29, sp",
     "  msr elr_el1, x0",
     "  msr sp_el0, x1",
-    // SPSR_EL1 = EL0t (M=0) with DAIF all masked (D|A|I|F = bits 9..6 set =
-    // 0x3C0). The user demo never relies on interrupts; masking them avoids
-    // letting the previously-armed generic timer fire at EL0 into vector
-    // slot 9 (Lower EL aarch64 IRQ), which is still the wfe-park at B-HAL.5.0.
-    // Wiring slot 9 to irq_stub is straightforward but unnecessary for the
-    // first proof of the EL0+SVC path — added in B-HAL.5.1.
-    "  mov x9, #0x3C0",
+    // SPSR_EL1 = EL0t (M=0) with all DAIF masks clear — EL0 runs with IRQs
+    // (and FIQ/SError/Debug) unmasked. The lower-EL IRQ vector (slot 9) was
+    // wired to irq_stub in B-HAL.5.1, so a tick taken at EL0 goes through
+    // the same full-frame save/restore as a tick taken at EL1 and `eret`s
+    // back into the user routine where it left off.
+    "  mov x9, #0",
     "  msr spsr_el1, x9",
     "  eret",
     ".global el0_return",
@@ -187,6 +227,15 @@ unsafe extern "C" fn rust_svc_handler(frame_sp: u64) -> u64 {
             frame.elr = (&raw const el0_return) as u64;
             frame.spsr = 0x5;
         }
+        // getticks (B-HAL.5.1). Return the kernel's accumulated generic-timer
+        // tick count — the same atomic the IRQ handler bumps. Confirms an IRQ
+        // taken *at EL0* actually went through the EL0→EL1 transition + the
+        // shared rust_irq_handler + back to EL0, since the count rises during
+        // the user routine's spin (the demo expects ≥1).
+        2 => {
+            frame.gprs[0] =
+                crate::arch::aarch64::vectors::TICK_COUNT.load(Ordering::Relaxed) as u64;
+        }
         // Unknown syscall — return -1 in x0 (so the user sees an error if it
         // checks). EL0 resumes; the demo never calls anything else.
         _ => {
@@ -222,8 +271,11 @@ pub fn run_el0_demo() {
     serial::write_u32_decimal(bytes);
     serial::write_str(" byte(s) via SVC; exit syscall=");
     serial::writeln(if exited { "true" } else { "false" });
-    // 15 bytes = "HELLO from EL0\n".
-    if bytes == 15 && exited {
-        serial::writeln("[el0] EL0 + SVC roundtrip: ok");
+    // 23 bytes = "HELLO from EL0\n" (15) + "ticks=" (6) + 1 digit + "\n".
+    // The presence of the tick-digit line proves the lower-EL IRQ vector
+    // (slot 9) wired correctly: a tick fired *at EL0*, the irq_stub saved+
+    // restored the EL0 trap frame, and the user routine kept running.
+    if bytes == 23 && exited {
+        serial::writeln("[el0] EL0 + SVC roundtrip: ok (IRQs at EL0 too)");
     }
 }
