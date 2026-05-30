@@ -338,6 +338,30 @@ at once.
     clippy clean; fmt clean. With this seam, the same scheduler logic can now
     drive kernel threads on both ISAs — B-HAL.4.4 just needs to plug
     `frame_systems::Scheduler` into the aarch64 timer IRQ.
+  - **B-HAL.4.4 — Frame `Scheduler` running on aarch64. DONE (2026-05-30).**
+    *The headline of B-HAL.4.* The same `scheduler.frs` source — compiled once
+    by framec to one `scheduler.rs` — runs on a second ISA, with no
+    arch-specific path inside the generated code. `frame_systems.rs` split
+    into two tiers: `mod pure` (always linked — `Scheduler`, `SerialDriver`,
+    `Process`, `ProcessTable`, `BlockRequest`, `Mount`, `OpenFile`, `Pipe`,
+    `IoScheduler`, `UdpSocket`, `EventCounter` — actions touch only the heap
+    re-exports + the arch-agnostic `serial::*` text layer) and `mod x86_only`
+    (`Kernel`, `PageFaultHandler`, `SyscallDispatcher`, `ElfLoader`,
+    `ArpResolver`, `RxPipeline`, `TcpConnection`, `IpReassembly`, `HubPort`,
+    `UsbEnumeration`, `UsbTransfer`, `UsbMsd` — gated until their native
+    glue subsystems grow aarch64 legs). `mod frame_systems;` ungates in
+    `main.rs`. aarch64 kmain instantiates `Scheduler::__create()` and dispatches
+    `task_ready ×3` + `task_unready ×3`; the FSM transitions $Idle → $Active
+    (runnable: 0→3) → $Idle (3→0) and `is_idle()` confirms it returned home.
+    Validated: `cargo xtask qemu-aarch64` PASS — `[sched] peak runnable=3,
+    active=true`, `[sched] drained runnable=0, idle=true`, `[sched] Frame
+    Scheduler trajectory: ok ($Idle→$Active→$Idle)`; x86 + aarch64 build +
+    clippy clean; fmt clean. **The substrate is whole**: per-CPU + frames +
+    heap + cooperative switch + a Frame system running on top of all of them,
+    all from the same source, on two ISAs. What remains in B-HAL.4 is the
+    *integration* layer — wiring the generic-timer IRQ into a kernel thread
+    that drives the Scheduler (the aarch64 analogue of x86's `sched.rs` /
+    `pcsched.rs`), which is build-out on top of the seams now in place.
 - **B-HAL.5 — AArch64 user mode + a storage/console device.** `svc` syscall path,
   the `SyscallProcessBackend` over it, a virtio-mmio (QEMU virt) or RPi device, so
   `ish` (already arch-agnostic — its FSMs + syscalls) runs. Then `console-test`

@@ -1575,6 +1575,16 @@ fn run_qemu_aarch64() -> Result<()> {
         wait_for_output(&buf, "[switch] starting A/B ping-pong", 30)?;
         wait_for_output(&buf, "ABABABABAB", 30)?;
         wait_for_output(&buf, "[switch] back in main, demo done", 30)?;
+        // B-HAL.4.4: the *same generated `Scheduler` code* the x86 BSP runs
+        // dispatches its full $Idle → $Active → $Idle trajectory on aarch64
+        // — peak runnable=3, drained=0, idle restored. The Frame FSM source
+        // (`scheduler.frs`) compiled once via framec runs unchanged on a
+        // second ISA. The headline claim of B-HAL.4.
+        wait_for_output(
+            &buf,
+            "[sched] Frame Scheduler trajectory: ok ($Idle→$Active→$Idle)",
+            30,
+        )?;
         Ok(())
     })();
 
@@ -1587,7 +1597,7 @@ fn run_qemu_aarch64() -> Result<()> {
         bail!("qemu-aarch64: kernel panicked:\n{captured}");
     }
     eprintln!(
-        "qemu-aarch64: PASS — banner + PL011 console + device-tree memory map (RAM base 0x40000000) + per-CPU base via TPIDR_EL1 + frame allocator from FDT + global heap (Box/Vec) + cooperative context switch (A/B ping-pong)"
+        "qemu-aarch64: PASS — banner + PL011 console + device-tree memory map (RAM base 0x40000000) + per-CPU base via TPIDR_EL1 + frame allocator from FDT + global heap (Box/Vec) + cooperative context switch (A/B ping-pong) + Frame Scheduler ($Idle→$Active→$Idle)"
     );
     Ok(())
 }

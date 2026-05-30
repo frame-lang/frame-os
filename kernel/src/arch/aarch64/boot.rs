@@ -250,6 +250,45 @@ unsafe extern "C" fn kmain(dtb: usize) -> ! {
     // first switch lands at `entry` via `ret` consuming x30.
     aarch64_ctx_pingpong();
 
+    // B-HAL.4.4: drive a Frame `Scheduler` on aarch64. *Same generated code*
+    // the x86 BSP runs in `sched.rs` (`scheduler.frs` → `scheduler.rs`); the
+    // headline claim of the milestone — write the FSM once, run on both ISAs.
+    // Trajectory:
+    //   __create()     → $Idle    (runnable=0)
+    //   task_ready ×3  → $Active  (runnable=3 — peak)
+    //   task_unready×3 → $Idle    (runnable=0 — drained)
+    // The cooperative ping-pong above proves the *switch primitive* works;
+    // this proves the *FSM logic* itself ports — the heap-typed event /
+    // compartment / Rc plumbing framec generates compiles and dispatches.
+    {
+        use crate::frame_systems::Scheduler;
+        let mut sched = Scheduler::__create();
+        let initial_idle = sched.is_idle();
+        sched.task_ready();
+        sched.task_ready();
+        sched.task_ready();
+        let peak = sched.runnable_count();
+        let active_after_ready = !sched.is_idle();
+        sched.task_unready();
+        sched.task_unready();
+        sched.task_unready();
+        let final_idle = sched.is_idle();
+        let final_count = sched.runnable_count();
+        serial::write_str("[sched] init idle=");
+        serial::writeln(if initial_idle { "true" } else { "false" });
+        serial::write_str("[sched] peak runnable=");
+        serial::write_u32_decimal(peak);
+        serial::write_str(", active=");
+        serial::writeln(if active_after_ready { "true" } else { "false" });
+        serial::write_str("[sched] drained runnable=");
+        serial::write_u32_decimal(final_count);
+        serial::write_str(", idle=");
+        serial::writeln(if final_idle { "true" } else { "false" });
+        if initial_idle && peak == 3 && active_after_ready && final_count == 0 && final_idle {
+            serial::writeln("[sched] Frame Scheduler trajectory: ok ($Idle→$Active→$Idle)");
+        }
+    }
+
     serial::writeln("[aarch64] halting.");
     crate::halt_forever();
 }

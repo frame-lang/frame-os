@@ -67,7 +67,9 @@ mod crosscore;
 mod elf;
 #[cfg(target_arch = "x86_64")]
 mod fpu;
-#[cfg(target_arch = "x86_64")]
+// `frame_systems` ships in two tiers (B-HAL.4.4): the pure systems (Scheduler,
+// SerialDriver, Process, …) build on both ISAs; the x86-only ones (Kernel,
+// PageFaultHandler, TcpConnection, xhci FSMs, …) are gated inside the module.
 mod frame_systems;
 // `frames` is arch-agnostic — the bitmap allocator + alloc/free is the same
 // code on both ISAs; each arch's boot path supplies its own usable-region list
