@@ -306,6 +306,13 @@ unsafe extern "C" fn kmain(dtb: usize) -> ! {
     // demo unmasks IRQs and never returns to idle masked).
     crate::arch::aarch64::usermode::run_el0_demo();
 
+    // B-HAL.5.2: load a *separately-built* aarch64 user ELF (from the
+    // `user-aarch64-hello/` standalone crate, baked into the kernel image
+    // by build.rs) and run it at EL0. Proves the kernel's minimal ELF
+    // loader + the same SVC table service a real, externally-compiled user
+    // program. Same `enter_el0` mechanism the inline demo uses.
+    crate::arch::aarch64::usermode::run_elf_demo();
+
     // B-HAL.4.5: timer-driven preemptive scheduling on aarch64. The same
     // pattern x86 uses (`sched.rs` `run()`): spawn two non-yielding workers
     // that print '1'/'2' in busy loops; the generic-timer IRQ preempts mid-

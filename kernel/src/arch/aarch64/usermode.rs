@@ -279,3 +279,129 @@ pub fn run_el0_demo() {
         serial::writeln("[el0] EL0 + SVC roundtrip: ok (IRQs at EL0 too)");
     }
 }
+
+// ---------------------------------------------------------------------------
+// B-HAL.5.2 — load a real ELF from disk-equivalent (baked-in via include_bytes!)
+// and run it at EL0. The first separately-compiled, separately-linked program
+// on aarch64 — same SVC table the inline demo uses.
+// ---------------------------------------------------------------------------
+
+/// The aarch64 user-hello ELF, built by `kernel/build.rs` from the
+/// `user-aarch64-hello/` standalone crate. ~5 KB; lives in the kernel image's
+/// `.rodata`.
+static USER_HELLO_AARCH64_ELF: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/user_hello_aarch64.elf"));
+
+/// Stack for the loaded ELF — separate from the inline-demo `USER_STACK` so the
+/// two demos don't interfere with each other. Lives in RAM and is reached at
+/// EL0 through the L1[2] alias (VA = PA + `EL0_ALIAS_OFFSET`).
+static mut USER_ELF_STACK: [u8; 16 * 1024] = [0; 16 * 1024];
+
+// ELF64 little-endian header offsets we actually use. The full ELF spec is
+// large; we read exactly the fields the demo needs.
+const EI_MAG: &[u8; 4] = b"\x7FELF";
+const ELFCLASS64: u8 = 2;
+const ELFDATA2LSB: u8 = 1;
+const ET_EXEC: u16 = 2;
+const EM_AARCH64: u16 = 183;
+const PT_LOAD: u32 = 1;
+
+/// Read a little-endian primitive out of a byte slice at `off`.
+#[inline]
+fn le_u16(b: &[u8], off: usize) -> u16 {
+    u16::from_le_bytes([b[off], b[off + 1]])
+}
+#[inline]
+fn le_u32(b: &[u8], off: usize) -> u32 {
+    u32::from_le_bytes([b[off], b[off + 1], b[off + 2], b[off + 3]])
+}
+#[inline]
+fn le_u64(b: &[u8], off: usize) -> u64 {
+    let mut v = [0u8; 8];
+    v.copy_from_slice(&b[off..off + 8]);
+    u64::from_le_bytes(v)
+}
+
+/// Load the baked aarch64 user ELF: validate the ELF64 little-endian aarch64
+/// ET_EXEC magic, walk the program headers, copy each `PT_LOAD` segment from
+/// the file image to its `p_vaddr - EL0_ALIAS_OFFSET` PA (so EL0 reaches it
+/// via the alias VA), zero-fill the BSS tail (`p_memsz - p_filesz`), and
+/// return the entry VA (`e_entry`) for the caller to `eret` to.
+///
+/// Minimal: no .rela.dyn handling (program is ET_EXEC with relocation-model=
+/// static, so the linker resolved everything), no per-segment AP permission
+/// changes (the whole alias region is RWX, fine for the demo), no .bss
+/// allocation beyond zeroing in place (segments are pre-placed by the linker).
+fn load_aarch64_elf(elf: &[u8]) -> u64 {
+    use crate::arch::aarch64::mmu::EL0_ALIAS_OFFSET;
+
+    // ELF64 header.
+    assert!(elf.len() >= 64, "ELF too small");
+    assert!(&elf[..4] == EI_MAG, "bad ELF magic");
+    assert!(elf[4] == ELFCLASS64, "not ELF64");
+    assert!(elf[5] == ELFDATA2LSB, "not little-endian");
+    let e_type = le_u16(elf, 16);
+    let e_machine = le_u16(elf, 18);
+    assert!(e_type == ET_EXEC, "not ET_EXEC");
+    assert!(e_machine == EM_AARCH64, "not aarch64");
+    let e_entry = le_u64(elf, 24);
+    let e_phoff = le_u64(elf, 32) as usize;
+    let e_phentsize = le_u16(elf, 54) as usize;
+    let e_phnum = le_u16(elf, 56) as usize;
+    assert!(e_phentsize >= 56, "phentsize too small");
+
+    // Walk program headers; copy each PT_LOAD.
+    for i in 0..e_phnum {
+        let ph = e_phoff + i * e_phentsize;
+        let p_type = le_u32(elf, ph);
+        if p_type != PT_LOAD {
+            continue;
+        }
+        let p_offset = le_u64(elf, ph + 8) as usize;
+        let p_vaddr = le_u64(elf, ph + 16);
+        let p_filesz = le_u64(elf, ph + 32) as usize;
+        let p_memsz = le_u64(elf, ph + 40) as usize;
+        // Destination PA = vaddr - EL0_ALIAS_OFFSET — the kernel reaches the
+        // RAM directly (identity-mapped through L1[1]); EL0 will reach it
+        // through the alias at the original VA.
+        let dst_pa = p_vaddr - EL0_ALIAS_OFFSET;
+        let src = &elf[p_offset..p_offset + p_filesz];
+        unsafe {
+            core::ptr::copy_nonoverlapping(src.as_ptr(), dst_pa as *mut u8, p_filesz);
+            // Zero the BSS tail (p_memsz beyond p_filesz).
+            if p_memsz > p_filesz {
+                core::ptr::write_bytes((dst_pa as *mut u8).add(p_filesz), 0, p_memsz - p_filesz);
+            }
+        }
+    }
+    e_entry
+}
+
+/// Run the loaded aarch64 user ELF (B-HAL.5.2). Parses the baked ELF, lays
+/// out its PT_LOAD segments in the EL0 alias region, sets up an EL0 stack,
+/// erets to the program's entry VA. The program prints "hello from aarch64
+/// ELF\n" via the same SVC table the inline demo uses (write/exit), then
+/// exits cleanly back to the kernel.
+pub fn run_elf_demo() {
+    use crate::arch::aarch64::mmu::EL0_ALIAS_OFFSET;
+    serial::writeln("[el0-elf] loading aarch64 user ELF...");
+    USER_BYTES_WRITTEN.store(0, Ordering::Relaxed);
+    USER_EXITED.store(false, Ordering::Relaxed);
+    let entry = load_aarch64_elf(USER_HELLO_AARCH64_ELF);
+    serial::write_str("[el0-elf] entry VA = 0x");
+    serial::write_hex_u64(entry);
+    serial::writeln("");
+    let stack_pa = unsafe { (&raw mut USER_ELF_STACK).add(1) } as u64 & !0xF;
+    let user_sp = stack_pa + EL0_ALIAS_OFFSET;
+    unsafe { enter_el0(entry, user_sp) };
+    let bytes = USER_BYTES_WRITTEN.load(Ordering::Relaxed);
+    let exited = USER_EXITED.load(Ordering::Relaxed);
+    serial::write_str("[el0-elf] back at EL1 — wrote ");
+    serial::write_u32_decimal(bytes);
+    serial::write_str(" byte(s); exit=");
+    serial::writeln(if exited { "true" } else { "false" });
+    // 23 bytes = "hello from aarch64 ELF\n".
+    if bytes == 23 && exited {
+        serial::writeln("[el0-elf] ELF load + EL0 run: ok");
+    }
+}

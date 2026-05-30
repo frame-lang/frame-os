@@ -16,6 +16,11 @@ exclude = [
     # dependency of `user` (for `x86_64-unknown-none`). Excluded so workspace-wide
     # host commands don't try to build it for the host target.
     "libc",
+    # The aarch64 user-mode demo (B-HAL.5.2): a tiny standalone
+    # `aarch64-unknown-none` binary the kernel's build.rs compiles + bakes in.
+    # Excluded for the same reason as `user/` — it can't build for the host
+    # target.
+    "user-aarch64-hello",
 ]
 
 # `default-members` excludes the kernel from `cargo build` / `cargo test` at the

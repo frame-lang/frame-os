@@ -1599,6 +1599,13 @@ fn run_qemu_aarch64() -> Result<()> {
         // back to the user routine cleanly.
         wait_for_output(&buf, "ticks=", 30)?;
         wait_for_output(&buf, "[el0] EL0 + SVC roundtrip: ok (IRQs at EL0 too)", 30)?;
+        // B-HAL.5.2: a separately-compiled aarch64 user ELF (the
+        // `user-aarch64-hello/` standalone crate, baked into the kernel image
+        // by build.rs) is parsed + loaded by the kernel's minimal ELF reader,
+        // erets to its entry at EL0, runs to completion through the same SVC
+        // table the inline demo uses. The first real user program on aarch64.
+        wait_for_output(&buf, "hello from aarch64 ELF", 30)?;
+        wait_for_output(&buf, "[el0-elf] ELF load + EL0 run: ok", 30)?;
         // B-HAL.4.5: timer-driven preemptive scheduling on aarch64. Two
         // non-yielding workers print '1'/'2' in busy loops; the generic-timer
         // IRQ saves the full interrupt frame, schedule() picks the next
@@ -1624,7 +1631,7 @@ fn run_qemu_aarch64() -> Result<()> {
         bail!("qemu-aarch64: kernel panicked:\n{captured}");
     }
     eprintln!(
-        "qemu-aarch64: PASS — banner + PL011 console + device-tree memory map (RAM base 0x40000000) + per-CPU base via TPIDR_EL1 + frame allocator from FDT + global heap (Box/Vec) + cooperative context switch (A/B ping-pong) + Frame Scheduler ($Idle→$Active→$Idle) + preemptive scheduling (timer IRQ interleaves two threads) + EL0 + SVC roundtrip (HELLO from EL0, IRQs at EL0)"
+        "qemu-aarch64: PASS — banner + PL011 console + device-tree memory map (RAM base 0x40000000) + per-CPU base via TPIDR_EL1 + frame allocator from FDT + global heap (Box/Vec) + cooperative context switch (A/B ping-pong) + Frame Scheduler ($Idle→$Active→$Idle) + preemptive scheduling (timer IRQ interleaves two threads) + EL0 + SVC roundtrip (HELLO from EL0, IRQs at EL0) + separately-compiled user ELF (hello from aarch64 ELF)"
     );
     Ok(())
 }

@@ -1,0 +1,23 @@
+[package]
+name = "frame-os-user-aarch64-hello"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+authors = ["Frame OS Contributors"]
+description = "Frame OS — minimal aarch64 user-mode hello program (B-HAL.5.2)"
+
+# Standalone `aarch64-unknown-none` binary. The kernel's build.rs invokes
+# `cargo build --release` here and bakes the resulting ELF in via
+# `include_bytes!`. Excluded from the workspace (see top-level Cargo.toml)
+# because it can't build for the host target.
+
+[[bin]]
+name = "hello"
+path = "src/main.rs"
+
+[profile.release]
+panic = "abort"
+opt-level = "s"
+lto = true
+codegen-units = 1
+strip = false # keep the ELF small but un-stripped so debuggers / smoke can read symbols

@@ -1,0 +1,24 @@
+# Build config for the aarch64 user-mode demo (B-HAL.5.2).
+#
+# Built for `aarch64-unknown-none` with our linker script. The fixed base in
+# `linker-aarch64.ld` (0x8000_0000) lands in the kernel's EL0 alias region —
+# the L1[2] block that mirrors RAM PA [1 GiB, 2 GiB) at VA [2 GiB, 3 GiB) with
+# AP=01 (EL0 R/W/exec). The kernel's loader copies the ELF segments to PA
+# `vaddr - EL0_ALIAS_OFFSET` (= `vaddr - 0x4000_0000`) so EL0 can fetch them
+# through the alias VA.
+#
+# relocation-model=static produces a non-PIE ET_EXEC the loader can lay out at
+# the program headers' p_vaddr directly. `-z max-page-size=0x1000` keeps the
+# PT_LOAD segments 4K-aligned (default would be 64K on aarch64) so the baked
+# ELF stays small.
+
+[build]
+target = "aarch64-unknown-none"
+
+[target.aarch64-unknown-none]
+rustflags = [
+    "-C", "relocation-model=static",
+    "-C", "link-arg=-Tlinker-aarch64.ld",
+    "-C", "link-arg=-z",
+    "-C", "link-arg=max-page-size=0x1000",
+]

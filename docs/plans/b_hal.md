@@ -442,6 +442,47 @@ at once.
     build + clippy clean; fmt clean. EL0 now runs with the full normal
     PSTATE (no masking kludge) — the substrate B-HAL.5.2's ELF-loaded user
     programs need.
+  - **B-HAL.5.2 — separately-compiled user ELF runs at EL0 on aarch64. DONE
+    (2026-05-30).** First "real" user program on the second ISA — a
+    standalone aarch64 crate, built by its own `cargo build` invocation,
+    laid out by its own linker script, *baked into the kernel image* by
+    `kernel/build.rs`, and *parsed + loaded* by a minimal in-kernel ELF
+    reader before `eret`-ing to its entry. Pieces:
+    * **`user-aarch64-hello/`** — new standalone crate, excluded from the
+      workspace. `Cargo.toml` + `.cargo/config.toml` (target =
+      `aarch64-unknown-none`, `-Tlinker-aarch64.ld`, `-z max-page-size=0x1000`,
+      `relocation-model=static`) + `linker-aarch64.ld` (`OUTPUT_FORMAT(elf64-
+      littleaarch64)`, `ENTRY(_start)`, two PT_LOAD segments — text R+X
+      `:text`, data R+W `:data` — fixed VA `0x80A00000`, well into the
+      kernel's L1[2] EL0 alias region) + `src/main.rs` (~50 lines: a
+      `_start` that does `svc #0` per byte to write "hello from aarch64
+      ELF\n", then `svc #1` to exit; `#[panic_handler]` also exits).
+    * **`kernel/build.rs`** — gained `build_aarch64_user_demo()`, mirror of
+      the x86 `build_user_program`: nested `cargo build --release` with
+      scrubbed RUSTFLAGS / clippy wrapper, copies the produced ELF to
+      `OUT_DIR/user_hello_aarch64.elf`, runs only when the kernel target is
+      aarch64.
+    * **`kernel/src/arch/aarch64/usermode.rs`** — `include_bytes!` the staged
+      ELF; `load_aarch64_elf()` walks the ELF64 header (magic + class +
+      data + e_type + e_machine sanity checks against EL64 ET_EXEC aarch64),
+      iterates program headers, copies each PT_LOAD's `[p_offset,
+      p_offset+p_filesz)` bytes from the file image to PA `p_vaddr -
+      EL0_ALIAS_OFFSET` (the kernel writes through the identity map; EL0
+      will read through the alias VA), zero-fills the BSS tail, returns
+      `e_entry`. `run_elf_demo()` calls it, sets up an EL0 stack, reuses
+      `enter_el0` from B-HAL.5.0/.5.1, and `eret`s to the entry. The same
+      `rust_svc_handler` dispatches the program's writes + exit unchanged
+      — *the syscall surface is the contract*; the kernel doesn't care
+      whether the user code came from a baked ELF or from inline asm.
+    * **`kernel/src/arch/aarch64/boot.rs`** — calls `run_elf_demo()` right
+      after the inline EL0 demo.
+    Observed: `[el0-elf] loading aarch64 user ELF...` → `[el0-elf] entry VA
+    = 0x0000000080a00000` → `hello from aarch64 ELF` → `[el0-elf] back at
+    EL1 — wrote 23 byte(s); exit=true` → `[el0-elf] ELF load + EL0 run:
+    ok`. Validated: `cargo xtask qemu-aarch64` PASS; x86 + aarch64 build +
+    clippy clean; fmt clean. With this, "user-mode Rust on the second ISA"
+    isn't a hand-asm trick — it's a real toolchain end-to-end. B-HAL.5.3+
+    can scale up (virtio-mmio for real storage, mount FS, `ish` shell).
 
 ## Risks / honest scope
 

@@ -130,6 +130,76 @@ fn main() -> Result<()> {
         build_user_program(workspace_root, &out_dir)?;
     }
 
+    // --- AArch64 user-mode demo program (B-HAL.5.2) -----------------------
+    // The aarch64 boot path bakes in a tiny user ELF — the kernel loads it +
+    // erets to EL0 to run it. Built only when the kernel target is aarch64.
+    if target_arch == "aarch64" {
+        build_aarch64_user_demo(workspace_root, &out_dir)?;
+    }
+
+    Ok(())
+}
+
+/// Compile the `user-aarch64-hello/` standalone crate to an
+/// `aarch64-unknown-none` ELF and stage it at `OUT_DIR/user_hello_aarch64.elf`
+/// where `arch/aarch64/usermode.rs` `include_bytes!`s it (B-HAL.5.2).
+///
+/// Same isolation pattern as `build_user_program`: nested cargo with its own
+/// target dir and scrubbed env so the kernel's RUSTFLAGS / clippy wrapper
+/// can't leak into the user build.
+fn build_aarch64_user_demo(workspace_root: &Path, out_dir: &Path) -> Result<()> {
+    let user_dir = workspace_root.join("user-aarch64-hello");
+    let user_target = out_dir.join("user-aarch64-target");
+
+    let status = Command::new(env_var("CARGO").unwrap_or_else(|_| "cargo".into()))
+        .current_dir(&user_dir)
+        .env("CARGO_TARGET_DIR", &user_target)
+        .env_remove("RUSTFLAGS")
+        .env_remove("CARGO_ENCODED_RUSTFLAGS")
+        .env_remove("CARGO_BUILD_RUSTFLAGS")
+        .env_remove("RUSTC_WORKSPACE_WRAPPER")
+        .env_remove("RUSTC_WRAPPER")
+        .args(["build", "--release"])
+        .status()
+        .with_context(|| {
+            format!(
+                "failed to invoke cargo for user-aarch64-hello at {}",
+                user_dir.display()
+            )
+        })?;
+    if !status.success() {
+        return Err(anyhow!("user-aarch64-hello build failed"));
+    }
+
+    let elf = user_target
+        .join("aarch64-unknown-none")
+        .join("release")
+        .join("hello");
+    if !elf.exists() {
+        return Err(anyhow!(
+            "user-aarch64-hello ELF not found at {}",
+            elf.display()
+        ));
+    }
+    let staged = out_dir.join("user_hello_aarch64.elf");
+    std::fs::copy(&elf, &staged).with_context(|| {
+        format!(
+            "failed to stage aarch64 user ELF {} -> {}",
+            elf.display(),
+            staged.display()
+        )
+    })?;
+
+    // Rebuild whenever the user-aarch64-hello sources change.
+    for f in [
+        "src/main.rs",
+        "linker-aarch64.ld",
+        "Cargo.toml",
+        ".cargo/config.toml",
+    ] {
+        println!("cargo:rerun-if-changed={}", user_dir.join(f).display());
+    }
+
     Ok(())
 }
 
