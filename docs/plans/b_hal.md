@@ -362,6 +362,35 @@ at once.
     *integration* layer — wiring the generic-timer IRQ into a kernel thread
     that drives the Scheduler (the aarch64 analogue of x86's `sched.rs` /
     `pcsched.rs`), which is build-out on top of the seams now in place.
+  - **B-HAL.4.5 — Timer-driven preemptive scheduling on aarch64. DONE
+    (2026-05-30).** Closes B-HAL.4 cleanly. The generic-timer IRQ now
+    *preempts* non-yielding kernel threads on aarch64, and the same Frame
+    `Scheduler` (which it shares with the x86 path) owns the run/halt mode.
+    Upgraded `arch/aarch64/vectors.rs` `irq_stub` to save the **full interrupt
+    frame** of the interrupted thread — x0..x30 (31 GPRs) + ELR_EL1 +
+    SPSR_EL1, 272 B / 16-byte aligned — passes the saved-frame SP to
+    `rust_irq_handler`, which now returns a SP for the stub to `mov sp, x0`
+    + restore + `eret`. When `sched_preempt::ACTIVE` is false (the existing
+    B-HAL.3.5 tick-counter demo) the handler returns the same SP and the
+    interrupted thread resumes unchanged — same observable behavior, same
+    smoke markers. When active, the handler calls `sched_preempt::schedule(sp)`,
+    which records this thread's SP, walks the TCB table round-robin for the
+    next `Runnable` (boot context = idle fallback), and returns *its*
+    saved-frame SP. `init_thread` lays out a synthetic full frame on a fresh
+    stack (31 zeroed GPRs, `ELR_EL1 = entry`, `SPSR_EL1 = 0x5` = EL1h with all
+    masks clear), so the first preemption into a brand-new worker `eret`s to
+    `entry` with IRQs unmasked. `run()` spawns two non-yielding workers
+    (`task_ready ×2` → $Active), unmasks DAIF.I, and idles in `wfi` until
+    `Scheduler::is_idle()`; each worker prints '1' or '2' in a busy spin
+    between prints and calls `exit_current` (`task_unready` + mark Dead +
+    park) after a few rounds. The native/Frame split is exactly the one
+    `sched.rs` draws on x86: the FSM owns the *mode* ($Idle vs $Active), the
+    native owns the *mechanism* (register/stack save+restore inside the ISR).
+    Validated: `cargo xtask qemu-aarch64` PASS — `[preempt] starting two
+    non-yielding threads`, interleaved `11122221` output, `[preempt] both
+    threads exited; Frame Scheduler $Idle — done`; x86 + aarch64 build +
+    clippy clean; fmt clean. **B-HAL.4 closed**: the kernel substrate +
+    Frame-driven preemptive scheduling now lives on both ISAs, end-to-end.
 - **B-HAL.5 — AArch64 user mode + a storage/console device.** `svc` syscall path,
   the `SyscallProcessBackend` over it, a virtio-mmio (QEMU virt) or RPi device, so
   `ish` (already arch-agnostic — its FSMs + syscalls) runs. Then `console-test`

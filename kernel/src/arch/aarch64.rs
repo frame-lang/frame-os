@@ -16,6 +16,7 @@ pub mod fdt;
 pub mod gic;
 pub mod mmu;
 pub mod percpu;
+pub mod sched_preempt;
 pub mod serial;
 pub mod timer;
 pub mod vectors;

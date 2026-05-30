@@ -289,6 +289,15 @@ unsafe extern "C" fn kmain(dtb: usize) -> ! {
         }
     }
 
+    // B-HAL.4.5: timer-driven preemptive scheduling on aarch64. The same
+    // pattern x86 uses (`sched.rs` `run()`): spawn two non-yielding workers
+    // that print '1'/'2' in busy loops; the generic-timer IRQ preempts mid-
+    // spin and `sched_preempt::schedule` rotates between them; each worker
+    // exits via `task_unready` after a few rounds; the boot context idles
+    // until the Frame Scheduler reports `$Idle`, then returns. Interleaved
+    // 1/2/1/2/… output is the proof of preemption.
+    crate::arch::aarch64::sched_preempt::run();
+
     serial::writeln("[aarch64] halting.");
     crate::halt_forever();
 }
