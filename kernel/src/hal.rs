@@ -305,3 +305,47 @@ pub trait PerCpu {
 pub fn per_cpu() -> &'static imp::PerCpuDevice {
     imp::per_cpu()
 }
+
+/// Cooperative kernel-thread context switch — save the callee-saved registers
+/// of the *current* thread onto its own stack, store its SP, load the new
+/// thread's SP, restore *its* callee-saved registers, and return into it.
+/// Caller-saved registers don't need saving here: the Rust/SysV (and AArch64
+/// AAPCS) calling convention spills anything live across a `switch` call site,
+/// and the trait method itself is an ordinary call from the caller's view.
+///
+/// x86_64 saves rbp/rbx/r12–r15 (6 GPRs) — the existing `context_switch` global
+/// asm. aarch64 saves x19–x28/x29(FP)/x30(LR) (12 GPRs). The *stack* holds the
+/// saved state — `old_sp` records where, `new_sp` selects the resume. The
+/// preemptive timer ISR's full-frame save (whole CPU state at an asynchronous
+/// boundary) is a different beast and stays in arch code.
+///
+/// (B-HAL.4.3 — the seam deferred from B-HAL.2's core-coupled survey.)
+pub trait Context {
+    /// Save current callee-saved regs onto the current stack, store the new SP
+    /// into `*old_sp`, switch to `new_sp`, restore that thread's callee-saved
+    /// regs, return into it.
+    ///
+    /// # Safety
+    /// `old_sp` must be a valid, writable `*mut u64`. `new_sp` must be an SP
+    /// previously produced by [`Context::init_stack`] or saved by a prior
+    /// `switch`. Single-core, no preemption — the caller serializes.
+    unsafe fn switch(&self, old_sp: *mut u64, new_sp: u64);
+
+    /// Lay out a fresh thread's stack so the first `switch` into it lands at
+    /// `entry`. Returns the SP to hand to `switch` as `new_sp`.
+    ///
+    /// # Safety
+    /// `stack_top` must point one byte past a writable stack region of at least
+    /// the arch's saved-state size (x86_64: 64 B; aarch64: 96 B), and in
+    /// practice a whole per-thread stack. `entry` must never return — if it
+    /// did, the return instruction would consume garbage.
+    unsafe fn init_stack(&self, stack_top: *mut u8, entry: extern "C" fn() -> !) -> u64;
+}
+
+/// The cooperative context-switch surface for this build's target architecture
+/// (build-time selected, concrete type — no vtable). Available on both x86_64
+/// (rbp/rbx/r12–r15) and aarch64 (x19–x30) (B-HAL.4.3). Callers bring the
+/// methods into scope with `use crate::hal::Context as _;`.
+pub fn context() -> &'static imp::ContextDevice {
+    imp::context()
+}

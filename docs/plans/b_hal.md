@@ -314,6 +314,30 @@ at once.
     `Box<dyn StateContext>`, `Vec<…>`, `Rc<FrameEvent>` etc.) compiles for the
     second ISA — making B-HAL.4.4 (run the same `Scheduler`/`Task` FSMs on
     aarch64) a matter of context-switch primitive (.4.3) + boot wiring.
+  - **B-HAL.4.3 — Cooperative context switch on aarch64. DONE (2026-05-30).**
+    The cooperative kernel-thread switch — the seam deferred from B-HAL.2 as
+    core-coupled — extracted to `hal::Context` and implemented on both ISAs.
+    The trait is the *x86 cooperative API behind an interface*: `unsafe fn
+    switch(old_sp, new_sp)` + `unsafe fn init_stack(stack_top, entry) -> u64`,
+    SP-as-saved-state. x86_64 impl (`arch/x86_64/context.rs`) wraps the
+    existing `context_switch` global asm (rbp/rbx/r12–r15, 6 GPRs / 48 B) — no
+    behavior change, just routed through the trait. aarch64 impl
+    (`arch/aarch64/context.rs`) is a new naked-asm `aarch64_context_switch`
+    that stp's x19–x28 + x29 (FP) + x30 (LR) — 12 GPRs / 96 B — onto the
+    current stack with pre-decrement, swaps SP, ldp's back in mirror order
+    (x29/x30 first so `ret` consumes the freshly-init'd `entry` LR), and
+    `ret`s. `init_stack` mirrors the layout — 12 zeros + entry-in-LR-slot. The
+    SP-stays-16-aligned ABI rule holds naturally (96 is 16-aligned). The
+    preemptive ISR full-frame save stays arch-specific — only the cooperative
+    switch goes behind the seam. `sched_demo` ports through `hal::context()`
+    too — same x86 asm, one indirection out — exercising the trait on x86 in
+    smoke. aarch64 kmain runs an identical 5-round A/B ping-pong on independent
+    16 KiB stacks; the closing banner proves the switch returns. Validated:
+    `cargo xtask qemu-aarch64` PASS — `[switch] starting A/B ping-pong`,
+    `ABABABABAB`, `[switch] back in main, demo done`; x86 + aarch64 build +
+    clippy clean; fmt clean. With this seam, the same scheduler logic can now
+    drive kernel threads on both ISAs — B-HAL.4.4 just needs to plug
+    `frame_systems::Scheduler` into the aarch64 timer IRQ.
 - **B-HAL.5 — AArch64 user mode + a storage/console device.** `svc` syscall path,
   the `SyscallProcessBackend` over it, a virtio-mmio (QEMU virt) or RPi device, so
   `ish` (already arch-agnostic — its FSMs + syscalls) runs. Then `console-test`

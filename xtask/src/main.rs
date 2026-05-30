@@ -1565,6 +1565,16 @@ fn run_qemu_aarch64() -> Result<()> {
         // succeeds while the alloc counter bumps. The substrate the Frame
         // systems' Rc/Vec event plumbing needs (B-HAL.4.3+).
         wait_for_output(&buf, "[heap] Box+Vec round-trip: ok", 30)?;
+        // B-HAL.4.3: cooperative context switch via `hal::context()`. Two
+        // kernel "threads" ping-pong on independent stacks for 5 rounds (the
+        // aarch64 mirror of x86 sched_demo, same trait); reaching the closing
+        // banner means the naked-asm aarch64_context_switch saves+restores
+        // x19–x30, init_stack laid out 12 callee-saved slots + LR=entry, and
+        // the first switch into a freshly init'd thread lands at its entry.
+        // "ABABABABAB" = 5 perfect rounds.
+        wait_for_output(&buf, "[switch] starting A/B ping-pong", 30)?;
+        wait_for_output(&buf, "ABABABABAB", 30)?;
+        wait_for_output(&buf, "[switch] back in main, demo done", 30)?;
         Ok(())
     })();
 
@@ -1577,7 +1587,7 @@ fn run_qemu_aarch64() -> Result<()> {
         bail!("qemu-aarch64: kernel panicked:\n{captured}");
     }
     eprintln!(
-        "qemu-aarch64: PASS — banner + PL011 console + device-tree memory map (RAM base 0x40000000) + per-CPU base via TPIDR_EL1 + frame allocator from FDT + global heap (Box/Vec)"
+        "qemu-aarch64: PASS — banner + PL011 console + device-tree memory map (RAM base 0x40000000) + per-CPU base via TPIDR_EL1 + frame allocator from FDT + global heap (Box/Vec) + cooperative context switch (A/B ping-pong)"
     );
     Ok(())
 }

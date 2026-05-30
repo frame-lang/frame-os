@@ -241,8 +241,79 @@ unsafe extern "C" fn kmain(dtb: usize) -> ! {
         // Drops `b` + `v` here; counter only tracks allocs, so no read-back.
     }
 
+    // B-HAL.4.3: cooperative context switch via `hal::context()`. Two kernel
+    // "threads" ping-pong on independent stacks for 5 rounds (mirror of the x86
+    // sched_demo, same trait, different ISA underneath). Reaching
+    // "[switch] back in main" proves: aarch64 init_stack laid out the 12
+    // callee-saved slots + LR=entry correctly, the naked-asm `aarch64_context_switch`
+    // saves+restores x19–x30 around the SP swap, and the freshly-init'd thread's
+    // first switch lands at `entry` via `ret` consuming x30.
+    aarch64_ctx_pingpong();
+
     serial::writeln("[aarch64] halting.");
     crate::halt_forever();
+}
+
+// ---------------------------------------------------------------------------
+// B-HAL.4.3 cooperative ping-pong demo (mirror of x86 sched_demo, on aarch64).
+//
+// Two threads (A and B) hand control back and forth via `hal::context().switch`
+// until ROUNDS reaches MAX_ROUNDS; B's last switch returns to `main` (kmain),
+// which prints the closing banner. All three SP slots (MAIN/A/B) are plain
+// statics (single-core, no preemption — kmain is alone here).
+// ---------------------------------------------------------------------------
+
+const PP_STACK_SIZE: usize = 16 * 1024;
+const PP_MAX_ROUNDS: u32 = 5;
+
+static mut PP_STACK_A: [u8; PP_STACK_SIZE] = [0; PP_STACK_SIZE];
+static mut PP_STACK_B: [u8; PP_STACK_SIZE] = [0; PP_STACK_SIZE];
+static mut PP_MAIN_SP: u64 = 0;
+static mut PP_A_SP: u64 = 0;
+static mut PP_B_SP: u64 = 0;
+static PP_ROUNDS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+extern "C" fn pp_thread_a() -> ! {
+    use crate::hal::{self, Context as _};
+    loop {
+        crate::serial::write_str("A");
+        unsafe {
+            let b = (&raw const PP_B_SP).read();
+            hal::context().switch(&raw mut PP_A_SP, b);
+        }
+    }
+}
+
+extern "C" fn pp_thread_b() -> ! {
+    use crate::hal::{self, Context as _};
+    use core::sync::atomic::Ordering;
+    loop {
+        crate::serial::write_str("B");
+        let done = PP_ROUNDS.fetch_add(1, Ordering::SeqCst) + 1 >= PP_MAX_ROUNDS;
+        unsafe {
+            if done {
+                let m = (&raw const PP_MAIN_SP).read();
+                hal::context().switch(&raw mut PP_B_SP, m);
+            } else {
+                let a = (&raw const PP_A_SP).read();
+                hal::context().switch(&raw mut PP_B_SP, a);
+            }
+        }
+    }
+}
+
+fn aarch64_ctx_pingpong() {
+    use crate::hal::{self, Context as _};
+    crate::serial::writeln("[switch] starting A/B ping-pong");
+    unsafe {
+        let a_top = (&raw mut PP_STACK_A).add(1) as *mut u8;
+        let b_top = (&raw mut PP_STACK_B).add(1) as *mut u8;
+        (&raw mut PP_A_SP).write(hal::context().init_stack(a_top, pp_thread_a));
+        (&raw mut PP_B_SP).write(hal::context().init_stack(b_top, pp_thread_b));
+        let a_start = (&raw const PP_A_SP).read();
+        hal::context().switch(&raw mut PP_MAIN_SP, a_start);
+    }
+    crate::serial::writeln("\n[switch] back in main, demo done");
 }
 
 #[inline]

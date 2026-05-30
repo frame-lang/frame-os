@@ -14,6 +14,7 @@
 // (Cpu / Mmu / Irq / Timer / Clock / PerCpu / Fpu / Context / Boot /
 // SyscallEntry) is added here as each seam is extracted.
 
+pub mod context;
 pub mod cpu;
 pub mod fpu;
 pub mod paging;
@@ -23,6 +24,8 @@ pub mod serial;
 
 /// The console device type the `hal::console()` accessor returns on x86_64.
 pub type ConsoleDevice = serial::Uart;
+/// The cooperative context-switch type the `hal::context()` accessor returns on x86_64.
+pub type ContextDevice = context::X86Context;
 /// The CPU control surface type the `hal::cpu()` accessor returns on x86_64.
 pub type CpuDevice = cpu::X86Cpu;
 /// The wall-clock device type the `hal::clock()` accessor returns on x86_64.
@@ -34,6 +37,7 @@ pub type MmuDevice = paging::X86Mmu;
 /// The per-CPU base register type the `hal::per_cpu()` accessor returns on x86_64.
 pub type PerCpuDevice = percpu::X86PerCpu;
 
+pub use context::context;
 pub use cpu::cpu;
 pub use fpu::{fpu, FpuState};
 pub use paging::mmu;

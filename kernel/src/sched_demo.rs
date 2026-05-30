@@ -1,11 +1,16 @@
 // kernel/src/sched_demo.rs
 //
 // B1 Step 2 transitional demo: two cooperative kernel threads ping-pong via
-// `context_switch`, proving the native switch works (control transfers
-// between two independent stacks and back to main) before Step 3 wires the
-// timer ISR + Frame `Scheduler` for real preemption. This whole module is
-// replaced at Step 3 — it exists only to isolate and validate the #1-risk
-// assembly.
+// the HAL's cooperative context switch (`hal::context()`), proving the native
+// switch works (control transfers between two independent stacks and back to
+// main) before Step 3 wires the timer ISR + Frame `Scheduler` for real
+// preemption. This whole module is replaced at Step 3 — it exists only to
+// isolate and validate the #1-risk assembly.
+//
+// As of B-HAL.4.3 this demo goes through `hal::Context::{switch, init_stack}`
+// — the same trait the aarch64 boot's mirror demo uses, just with the x86_64
+// impl wired in. The asm is unchanged; the call sites moved one indirection
+// out, behind the seam.
 //
 // Flow:  main → A → B → A → B → … (5 rounds) → back to main.
 // Output: "[switch] starting A/B ping-pong", then "ABABABABAB", then
@@ -13,7 +18,7 @@
 
 use core::sync::atomic::{AtomicU32, Ordering};
 
-use crate::context::{context_switch, init_stack};
+use crate::hal::{self, Context as _};
 use crate::serial;
 
 const STACK_SIZE: usize = 16 * 1024;
@@ -37,7 +42,7 @@ extern "C" fn thread_a() -> ! {
         // B; when B yields back to A, we continue this loop.
         unsafe {
             let b = (&raw const B_RSP).read();
-            context_switch(&raw mut A_RSP, b);
+            hal::context().switch(&raw mut A_RSP, b);
         }
     }
 }
@@ -50,10 +55,10 @@ extern "C" fn thread_b() -> ! {
             if done {
                 // Last round: hand control back to main and never return.
                 let m = (&raw const MAIN_RSP).read();
-                context_switch(&raw mut B_RSP, m);
+                hal::context().switch(&raw mut B_RSP, m);
             } else {
                 let a = (&raw const A_RSP).read();
-                context_switch(&raw mut B_RSP, a);
+                hal::context().switch(&raw mut B_RSP, a);
             }
         }
     }
@@ -68,12 +73,12 @@ pub fn run() {
         // downward from there.
         let a_top = (&raw mut STACK_A).add(1) as *mut u8;
         let b_top = (&raw mut STACK_B).add(1) as *mut u8;
-        (&raw mut A_RSP).write(init_stack(a_top, thread_a));
-        (&raw mut B_RSP).write(init_stack(b_top, thread_b));
+        (&raw mut A_RSP).write(hal::context().init_stack(a_top, thread_a));
+        (&raw mut B_RSP).write(hal::context().init_stack(b_top, thread_b));
 
         let a_start = (&raw const A_RSP).read();
         // Switch into A; control returns here when B switches back to main.
-        context_switch(&raw mut MAIN_RSP, a_start);
+        hal::context().switch(&raw mut MAIN_RSP, a_start);
     }
     serial::writeln("\n[switch] back in main, demo done");
 }

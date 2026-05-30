@@ -11,6 +11,7 @@
 // point `hal.rs`'s currently x86-only accessors gain their aarch64 branch.
 
 pub mod boot;
+pub mod context;
 pub mod fdt;
 pub mod gic;
 pub mod mmu;
@@ -21,8 +22,11 @@ pub mod vectors;
 
 /// The console device type the `hal::console()` accessor returns on aarch64.
 pub type ConsoleDevice = serial::Pl011;
+/// The cooperative context-switch type the `hal::context()` accessor returns on aarch64.
+pub type ContextDevice = context::AArch64Context;
 /// The per-CPU base-register type the `hal::per_cpu()` accessor returns on aarch64.
 pub type PerCpuDevice = percpu::AArch64PerCpu;
 
+pub use context::context;
 pub use percpu::per_cpu;
 pub use serial::console;
