@@ -66,7 +66,9 @@ mod elf;
 mod fpu;
 #[cfg(target_arch = "x86_64")]
 mod frame_systems;
-#[cfg(target_arch = "x86_64")]
+// `frames` is arch-agnostic — the bitmap allocator + alloc/free is the same
+// code on both ISAs; each arch's boot path supplies its own usable-region list
+// via `init_from_regions` (Limine on x86, FDT on aarch64). B-HAL.4.1.
 mod frames;
 #[cfg(target_arch = "x86_64")]
 mod fs;

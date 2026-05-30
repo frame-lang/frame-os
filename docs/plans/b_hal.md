@@ -275,6 +275,26 @@ at once.
     arches) + fmt clean. The headline: the same Rust data layer, one ISA-specific
     base-register primitive underneath — the seam pattern the rest of B-HAL.4
     (Irq/Timer/Context/Cpu) will follow.
+  - **B-HAL.4.1 — Physical frame allocator on aarch64. DONE (2026-05-30).** The
+    second shared data layer to grow an aarch64 leg — same pattern as `percpu`,
+    different source for the input. `frames.rs` refactored: the Limine-specific
+    bits (memory-map + HHDM requests, the x86 `init()` reading them) are
+    `cfg(target_arch = "x86_64")`-gated; a new arch-agnostic
+    `init_from_regions(usable: &[(u64,u64)], hhdm: u64)` is the seam both arches
+    reach the bitmap allocator through. x86's `init()` is now a thin wrapper
+    that collects USABLE Limine entries and calls it — same behavior. On
+    aarch64, kmain carves a usable region from the FDT `/memory` node (RAM base
+    0x4000_0000 + 128 MiB on QEMU virt) minus the kernel image (everything
+    below the linker symbol `__stack_top`) and minus the DTB (loaded at
+    0x4400_0000, 1 MiB), then calls `init_from_regions` with HHDM offset 0 —
+    aarch64 boots through an identity map (B-HAL.3.4), so phys == virt and the
+    allocator's `phys_to_virt` is just the identity. `mod frames;` ungates in
+    main.rs. Validated: `cargo xtask qemu-aarch64` PASS — `[aarch64] frames
+    usable: 32326` (≈126 MiB of 128 MiB; DTB + kernel correctly excluded),
+    `alloc two distinct frames: ok`, `free restores count: ok`; x86 build +
+    clippy (both arches) + fmt clean. With frames live, the heap (`allocator.rs`,
+    B-HAL.4.2) is the next thing in the chain — and with the heap, the Frame
+    systems' `Box`/`Vec`/`Rc` machinery compiles for aarch64.
 - **B-HAL.5 — AArch64 user mode + a storage/console device.** `svc` syscall path,
   the `SyscallProcessBackend` over it, a virtio-mmio (QEMU virt) or RPi device, so
   `ish` (already arch-agnostic — its FSMs + syscalls) runs. Then `console-test`

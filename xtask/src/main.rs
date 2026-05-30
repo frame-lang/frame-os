@@ -1553,6 +1553,12 @@ fn run_qemu_aarch64() -> Result<()> {
         // and ran unchanged on a second ISA — the first shared HAL accessor
         // working on aarch64 (B-HAL.4.0).
         wait_for_output(&buf, "this_cpu_index = 0", 30)?;
+        // B-HAL.4.1: the bitmap frame allocator — the same code the x86 boot
+        // path uses — was fed a usable region carved from the FDT `/memory`
+        // node (minus kernel image + DTB). Two distinct alloc + free restoring
+        // the free count proves the data layer ran unchanged on aarch64.
+        wait_for_output(&buf, "[frames] alloc two distinct frames: ok", 30)?;
+        wait_for_output(&buf, "[frames] free restores count: ok", 30)?;
         Ok(())
     })();
 
@@ -1565,7 +1571,7 @@ fn run_qemu_aarch64() -> Result<()> {
         bail!("qemu-aarch64: kernel panicked:\n{captured}");
     }
     eprintln!(
-        "qemu-aarch64: PASS — banner + PL011 console + device-tree memory map (RAM base 0x40000000) + per-CPU base via TPIDR_EL1"
+        "qemu-aarch64: PASS — banner + PL011 console + device-tree memory map (RAM base 0x40000000) + per-CPU base via TPIDR_EL1 + frame allocator from FDT"
     );
     Ok(())
 }

@@ -50,6 +50,13 @@ global_asm!(
     "  b 3b",
 );
 
+// `__stack_top` is provided by `linker-aarch64.ld` — the address just past the
+// kernel image + initial stack. RAM at or above this is free for the frame
+// allocator to manage (B-HAL.4.1).
+extern "C" {
+    static __stack_top: u8;
+}
+
 /// The AArch64 kernel entry, called by `_start` once SP + BSS are set up. `dtb`
 /// is the flattened-device-tree pointer QEMU passed in x0 (preserved through
 /// `_start`, which clobbers only x9/x10).
@@ -92,11 +99,14 @@ unsafe extern "C" fn kmain(dtb: usize) -> ! {
             None => core::ptr::null(),
         }
     };
+    let mut mem_region: Option<(u64, u64)> = None;
+    let mut dtb_size: u64 = 0;
     if !dtb_ptr.is_null() && unsafe { fdt::valid(dtb_ptr) } {
+        dtb_size = unsafe { fdt::total_size(dtb_ptr) } as u64;
         serial::write_str("[aarch64] DTB @ 0x");
         serial::write_hex_u64(dtb_ptr as u64);
         serial::write_str(", totalsize 0x");
-        serial::write_hex_u64(unsafe { fdt::total_size(dtb_ptr) } as u64);
+        serial::write_hex_u64(dtb_size);
         serial::writeln("");
         match unsafe { fdt::memory_region(dtb_ptr) } {
             Some((base, size)) => {
@@ -107,6 +117,7 @@ unsafe extern "C" fn kmain(dtb: usize) -> ! {
                 serial::write_str(" (");
                 serial::write_u32_decimal((size / (1024 * 1024)) as u32);
                 serial::writeln(" MiB)");
+                mem_region = Some((base, size));
             }
             None => serial::writeln("[aarch64] no /memory node in DTB"),
         }
@@ -153,6 +164,68 @@ unsafe extern "C" fn kmain(dtb: usize) -> ! {
     serial::write_u32_decimal(crate::percpu::this_cpu_index());
     serial::writeln("");
 
+    // B-HAL.4.1: physical frame allocator. The x86 boot path takes its USABLE
+    // regions from Limine; here we carve one from the FDT `/memory` node, minus
+    // the kernel image (everything below `__stack_top`) and the DTB. The
+    // allocator's bitmap + alloc/free is the same code on both ISAs — only the
+    // memory-map source differs. HHDM offset = 0: aarch64 boots through an
+    // identity map (B-HAL.3.4), so phys == virt in the kernel.
+    if let Some((ram_base, ram_size)) = mem_region {
+        let kernel_end = page_align_up((&__stack_top as *const u8) as u64);
+        let ram_end = ram_base + ram_size;
+        let dtb_start = if dtb_size > 0 {
+            page_align_down(dtb_ptr as u64)
+        } else {
+            ram_end
+        };
+        let dtb_end = if dtb_size > 0 {
+            page_align_up(dtb_ptr as u64 + dtb_size)
+        } else {
+            ram_end
+        };
+        // Two usable runs around the DTB (whichever is non-empty). Defensive
+        // ordering: only include a run if its end actually exceeds its start.
+        let mut regions: [(u64, u64); 2] = [(0, 0); 2];
+        let mut n = 0usize;
+        if dtb_start > kernel_end {
+            regions[n] = (kernel_end, dtb_start - kernel_end);
+            n += 1;
+        }
+        if ram_end > dtb_end {
+            regions[n] = (dtb_end, ram_end - dtb_end);
+            n += 1;
+        }
+        crate::frames::init_from_regions(&regions[..n], 0);
+
+        serial::write_str("[aarch64] frames usable: ");
+        serial::write_u32_decimal(crate::frames::free_count() as u32);
+        serial::writeln("");
+        let before = crate::frames::free_count();
+        let f1 = crate::frames::alloc_frame().expect("frame alloc");
+        let f2 = crate::frames::alloc_frame().expect("frame alloc");
+        if f1 != f2 && f1 % 4096 == 0 && f2 % 4096 == 0 && crate::frames::free_count() == before - 2
+        {
+            serial::writeln("[frames] alloc two distinct frames: ok");
+        }
+        crate::frames::free_frame(f1);
+        crate::frames::free_frame(f2);
+        if crate::frames::free_count() == before {
+            serial::writeln("[frames] free restores count: ok");
+        }
+    } else {
+        serial::writeln("[aarch64] frame allocator skipped (no /memory in DTB)");
+    }
+
     serial::writeln("[aarch64] halting.");
     crate::halt_forever();
+}
+
+#[inline]
+fn page_align_up(addr: u64) -> u64 {
+    (addr + 0xFFF) & !0xFFF
+}
+
+#[inline]
+fn page_align_down(addr: u64) -> u64 {
+    addr & !0xFFF
 }
