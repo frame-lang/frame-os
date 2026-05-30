@@ -14,11 +14,15 @@ pub mod boot;
 pub mod fdt;
 pub mod gic;
 pub mod mmu;
+pub mod percpu;
 pub mod serial;
 pub mod timer;
 pub mod vectors;
 
 /// The console device type the `hal::console()` accessor returns on aarch64.
 pub type ConsoleDevice = serial::Pl011;
+/// The per-CPU base-register type the `hal::per_cpu()` accessor returns on aarch64.
+pub type PerCpuDevice = percpu::AArch64PerCpu;
 
+pub use percpu::per_cpu;
 pub use serial::console;

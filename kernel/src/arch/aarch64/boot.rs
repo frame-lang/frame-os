@@ -144,6 +144,15 @@ unsafe extern "C" fn kmain(dtb: usize) -> ! {
     serial::write_u32_decimal(vectors::TICK_COUNT.load(Ordering::Relaxed));
     serial::writeln(" ticks");
 
+    // B-HAL.4.0: per-CPU base register (TPIDR_EL1) — the ARM analogue of x86's
+    // GS base. Initialize this core's PerCpu block, then read its index back
+    // through the base register. Same arch-agnostic `percpu` data layer the
+    // x86 boot path uses; the seam underneath is the only ISA-specific bit.
+    crate::percpu::init_this_cpu(0, 0);
+    serial::write_str("[aarch64] this_cpu_index = ");
+    serial::write_u32_decimal(crate::percpu::this_cpu_index());
+    serial::writeln("");
+
     serial::writeln("[aarch64] halting.");
     crate::halt_forever();
 }

@@ -1548,6 +1548,11 @@ fn run_qemu_aarch64() -> Result<()> {
         // Taking a real generic-timer IRQ on a second ISA proves the EL1 vector
         // table + GICv2 init + CNTP_* work end-to-end (B-HAL.3.5).
         wait_for_output(&buf, "generic-timer fired", 30)?;
+        // Reading this core's index back through TPIDR_EL1 means the
+        // arch-agnostic `percpu` data layer (struct PerCpu + accessors) compiled
+        // and ran unchanged on a second ISA — the first shared HAL accessor
+        // working on aarch64 (B-HAL.4.0).
+        wait_for_output(&buf, "this_cpu_index = 0", 30)?;
         Ok(())
     })();
 
@@ -1560,7 +1565,7 @@ fn run_qemu_aarch64() -> Result<()> {
         bail!("qemu-aarch64: kernel panicked:\n{captured}");
     }
     eprintln!(
-        "qemu-aarch64: PASS — banner + PL011 console + device-tree memory map (RAM base 0x40000000)"
+        "qemu-aarch64: PASS — banner + PL011 console + device-tree memory map (RAM base 0x40000000) + per-CPU base via TPIDR_EL1"
     );
     Ok(())
 }

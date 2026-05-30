@@ -90,7 +90,8 @@ mod net;
 mod pci;
 #[cfg(target_arch = "x86_64")]
 mod pcsched;
-#[cfg(target_arch = "x86_64")]
+// `percpu` is arch-agnostic data — backed by `hal::per_cpu()`, available on both
+// ISAs as of B-HAL.4.0. The aarch64 boot path uses it directly.
 mod percpu;
 #[cfg(target_arch = "x86_64")]
 mod pic;

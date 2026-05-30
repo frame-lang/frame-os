@@ -262,6 +262,19 @@ at once.
 - **B-HAL.4 — AArch64 scheduling + ring-0 FSMs.** Context switch + timer
   preemption + per-CPU on ARM, until the `Scheduler`/`Task` FSMs run a kernel
   thread. The same FSMs, now on a second ISA.
+  - **B-HAL.4.0 — PerCpu via `TPIDR_EL1`. DONE (2026-05-30).** The first shared
+    HAL accessor to grow an aarch64 leg. `arch/aarch64/percpu.rs`: `AArch64PerCpu`
+    impls `hal::PerCpu` via the `TPIDR_EL1` system register (the ARM analogue of
+    x86's GS base) — `msr tpidr_el1, …` to set the base, `mrs …, tpidr_el1` +
+    deref the first u32 to read this core's index. `hal::per_cpu()` ungates on
+    aarch64 (was `#[cfg(target_arch = "x86_64")]`), the top-level `percpu.rs` —
+    the *arch-agnostic* PerCpu struct + `init_this_cpu` + `this_cpu_index` — now
+    compiles on both ISAs unchanged, and kmain runs the same one-call init +
+    readback the x86 BSP does. Validated: `cargo xtask qemu-aarch64` PASS (now
+    also asserts `this_cpu_index = 0` over PL011); x86 build + clippy (both
+    arches) + fmt clean. The headline: the same Rust data layer, one ISA-specific
+    base-register primitive underneath — the seam pattern the rest of B-HAL.4
+    (Irq/Timer/Context/Cpu) will follow.
 - **B-HAL.5 — AArch64 user mode + a storage/console device.** `svc` syscall path,
   the `SyscallProcessBackend` over it, a virtio-mmio (QEMU virt) or RPi device, so
   `ish` (already arch-agnostic — its FSMs + syscalls) runs. Then `console-test`

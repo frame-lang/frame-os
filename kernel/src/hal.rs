@@ -299,8 +299,9 @@ pub trait PerCpu {
 }
 
 /// The per-core base register for this build's target architecture (build-time
-/// selected, concrete type — no vtable).
-#[cfg(target_arch = "x86_64")]
+/// selected, concrete type — no vtable). Available on both x86_64 (GS base) and
+/// aarch64 (TPIDR_EL1) — the first shared HAL accessor on the second ISA
+/// (B-HAL.4.0).
 pub fn per_cpu() -> &'static imp::PerCpuDevice {
     imp::per_cpu()
 }
