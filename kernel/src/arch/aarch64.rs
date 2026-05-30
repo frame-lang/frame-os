@@ -19,6 +19,7 @@ pub mod percpu;
 pub mod sched_preempt;
 pub mod serial;
 pub mod timer;
+pub mod usermode;
 pub mod vectors;
 
 /// The console device type the `hal::console()` accessor returns on aarch64.

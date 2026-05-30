@@ -396,6 +396,32 @@ at once.
   `ish` (already arch-agnostic — its FSMs + syscalls) runs. Then `console-test`
   on `qemu-system-aarch64`. **Real Pi hardware** is a further step (RPi-specific
   drivers + SD-card boot) past the QEMU `virt` board.
+  - **B-HAL.5.0 — EL0 + SVC roundtrip. DONE (2026-05-30).** The first proof of
+    the user/kernel boundary on a second ISA. Kernel drops to EL0 running an
+    inline user routine that prints "HELLO from EL0" byte-by-byte via `svc #0`
+    (x8 = 0, x0 = byte) and exits via `svc #1` (x8 = 1); each SVC raises a
+    Lower EL aarch64 Sync exception (vector slot 8) wired to a new `svc_stub`
+    structurally identical to B-HAL.4.5's full-frame irq_stub (saves x0..x30 +
+    ELR_EL1 + SPSR_EL1 = 272 B); `rust_svc_handler` reads ESR_EL1, dispatches
+    by x8, services the write through PL011, and for exit rewrites the saved
+    frame's ELR/SPSR to redirect the stub's `eret` back to a kernel return
+    point at EL1, longjmp-style. **MMU twist found empirically**: setting
+    AP=01 (EL0+EL1 R/W) on the kernel's L1 block makes QEMU's cortex-a72
+    fault EL1 *instruction fetches* from that block (ESR EC=0x21 IFSC=0x0d,
+    Permission fault L1) — architecturally surprising but reproducible. Worked
+    around by adding a *second* L1 entry (L1[2], VA [2 GiB, 3 GiB)) that
+    aliases the same RAM PA with AP=01: EL0 enters through the alias VA, EL1
+    keeps fetching from the original L1[1] block AP=00. The `enter_el0`
+    helper saves the kernel caller's FP+LR, sets ELR_EL1 / SP_EL0 / SPSR_EL1
+    (EL0t with all DAIF masked — slot 9 IRQ stays the wfe-park until
+    B-HAL.5.1 wires it), and `eret`s. Validated: `cargo xtask qemu-aarch64`
+    PASS — `HELLO from EL0` on the PL011, `[el0] EL0 + SVC roundtrip: ok`
+    (15 bytes round-tripped, exit syscall serviced); the preemptive demo
+    that follows still works (the EL0 demo leaves DAIF properly restored on
+    return). x86 + aarch64 build + clippy clean; fmt clean. The substrate
+    for the rest of B-HAL.5: B-HAL.5.1 wires lower-EL IRQ + expands the
+    syscall table; B-HAL.5.2 adds aarch64 user ELF loading; B-HAL.5.3+
+    bring up virtio-mmio + ish.
 
 ## Risks / honest scope
 

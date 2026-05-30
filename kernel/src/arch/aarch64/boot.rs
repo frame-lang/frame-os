@@ -125,6 +125,14 @@ unsafe extern "C" fn kmain(dtb: usize) -> ! {
         serial::writeln("[aarch64] no DTB found (x0=0, no FDT magic in RAM scan)");
     }
 
+    // Install the EL1 exception vectors *before* MMU enable so any fault on
+    // the MMU-enable instruction (or after) lands at a real handler instead of
+    // PC=0 (which is in the device-memory region post-MMU and would generate
+    // an instruction-abort loop). The vectors themselves live in the kernel
+    // image and have valid PAs both before and after translation (identity
+    // map), so `msr vbar_el1, vectors` set here stays correct across enable.
+    unsafe { crate::arch::aarch64::vectors::install() };
+
     // B-HAL.3.4: enable the MMU (identity map). That this line — and the halt
     // banner below — still reach the PL011 proves translation is live and the
     // device/normal mappings are correct (the console runs translated now).
@@ -140,7 +148,7 @@ unsafe extern "C" fn kmain(dtb: usize) -> ! {
     use core::sync::atomic::Ordering;
     const TARGET_TICKS: u32 = 3;
     unsafe {
-        vectors::install();
+        // Vectors are already installed (above, pre-MMU); GIC + timer next.
         gic::init();
         timer::init(10); // 10 Hz tick
         gic::unmask(timer::TIMER_IRQ);
@@ -288,6 +296,15 @@ unsafe extern "C" fn kmain(dtb: usize) -> ! {
             serial::writeln("[sched] Frame Scheduler trajectory: ok ($Idle→$Active→$Idle)");
         }
     }
+
+    // B-HAL.5.0: drop to EL0 and run a tiny user routine that prints
+    // "HELLO from EL0" byte-by-byte via `svc #0` then exits via `svc #1`.
+    // First proof of the user/kernel boundary on aarch64: the EL0→EL1 sync
+    // vector + ESR_EL1 decode + per-syscall dispatch + `eret`-back round-trip
+    // every call. Runs *before* the preemptive demo so the SVC path is
+    // exercised against the IRQs-still-masked boot context (the preemption
+    // demo unmasks IRQs and never returns to idle masked).
+    crate::arch::aarch64::usermode::run_el0_demo();
 
     // B-HAL.4.5: timer-driven preemptive scheduling on aarch64. The same
     // pattern x86 uses (`sched.rs` `run()`): spawn two non-yielding workers

@@ -27,8 +27,23 @@ static mut L1: Table = Table([0; 512]);
 // Block/page descriptor attribute bits (L1/L2 block).
 const VALID_BLOCK: u64 = 0b01; // bits[1:0] = 0b01 → valid block descriptor
 const ATTRIDX_NORMAL: u64 = 1 << 2; // AttrIndx = MAIR attr1 (Normal WB); attr0 (Device) = 0
+/// AP[2:1] permission bits. AP[1] = 1 (bit 6) → EL0 access allowed (R/W); AP[2]
+/// stays 0 → read+write (not read-only). Set on the *EL0 alias* block for the
+/// B-HAL.5.0 user-mode demo (see below). Setting AP[1]=1 on the *kernel* block
+/// would make EL1 instruction fetch fault with permission abort at level 1 on
+/// QEMU's cortex-a72 (confirmed empirically: ESR EC=0x21 IFSC=0x0d), so the
+/// design uses a *separate* L1 entry aliased to the same RAM PA — EL0 enters
+/// through the alias VA, EL1 keeps using the kernel block. (A production design
+/// would do per-page L3 table walks with proper AP per page; the alias is the
+/// minimum that exercises EL0 + SVC without that scaffolding.)
+const AP_EL0: u64 = 1 << 6;
 const SH_INNER: u64 = 0b11 << 8; // inner shareable (for Normal memory)
 const AF: u64 = 1 << 10; // Access Flag (else first access faults)
+
+/// VA offset for the EL0 alias of RAM: the user-mode demo runs at
+/// `kernel_va + EL0_ALIAS_OFFSET`. The alias is L1[2] = [2 GiB, 3 GiB) mapped
+/// to the same PA range [1 GiB, 2 GiB) as the kernel block at L1[1].
+pub const EL0_ALIAS_OFFSET: u64 = 0x4000_0000;
 
 // MAIR_EL1 attributes: attr0 = Device-nGnRnE (0x00, implicit), attr1 = Normal WB
 // RW-allocate (0xFF) in byte[1].
@@ -43,9 +58,15 @@ pub unsafe fn enable() {
     let l1 = (&raw mut L1) as *mut u64;
     // [0, 1 GiB): device memory — covers the PL011 and the GIC.
     l1.add(0).write(AF | VALID_BLOCK);
-    // [1 GiB, 2 GiB): normal cacheable RAM (output address 0x4000_0000).
+    // [1 GiB, 2 GiB): normal cacheable RAM (output address 0x4000_0000). The
+    // kernel runs here, AP unchanged from B-HAL.3.4 (EL1 R/W, no EL0 access).
     l1.add(1)
         .write(0x4000_0000 | ATTRIDX_NORMAL | SH_INNER | AF | VALID_BLOCK);
+    // [2 GiB, 3 GiB): the EL0 alias of the same RAM PA (B-HAL.5.0). AP=01
+    // permits EL0 R/W and exec; UXN/PXN stay 0. EL0 enters through this VA
+    // for the user-mode demo, EL1 still uses L1[1] for its own fetches.
+    l1.add(2)
+        .write(0x4000_0000 | ATTRIDX_NORMAL | SH_INNER | AF | AP_EL0 | VALID_BLOCK);
 
     // TCR_EL1: T0SZ=25 (39-bit VA) | IRGN0/ORGN0 = WB-WA cacheable walks |
     // SH0 = inner shareable | TG0 = 4 KiB (bits[15:14]=0) | EPD1 = disable the
