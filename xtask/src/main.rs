@@ -1643,6 +1643,17 @@ fn run_qemu_aarch64() -> Result<()> {
         wait_for_output(&buf, "[vio-mmio] found block device at MMIO", 30)?;
         wait_for_output(&buf, "FrameOS-Disk: hello from virtio-mmio sector 0", 30)?;
         wait_for_output(&buf, "[vio-mmio] sector 0 read: ok", 30)?;
+        // B-HAL.5.4a: write a known pattern to sector 1, read it back,
+        // verify match — each transfer wrapped in a fresh `BlockRequest`
+        // FSM (the same pure Frame system the x86 path uses). Proves the
+        // Frame layer composes with virtio-mmio: the FSM hits $Complete
+        // only when the device returned status 0, and the bytes round-trip
+        // exactly.
+        wait_for_output(
+            &buf,
+            "[vio-mmio] sector 1 write+read+verify via BlockRequest FSM: ok",
+            30,
+        )?;
         // B-HAL.4.5: timer-driven preemptive scheduling on aarch64. Two
         // non-yielding workers print '1'/'2' in busy loops; the generic-timer
         // IRQ saves the full interrupt frame, schedule() picks the next
@@ -1668,7 +1679,7 @@ fn run_qemu_aarch64() -> Result<()> {
         bail!("qemu-aarch64: kernel panicked:\n{captured}");
     }
     eprintln!(
-        "qemu-aarch64: PASS — banner + PL011 console + device-tree memory map (RAM base 0x40000000) + per-CPU base via TPIDR_EL1 + frame allocator from FDT + global heap (Box/Vec) + cooperative context switch (A/B ping-pong) + Frame Scheduler ($Idle→$Active→$Idle) + preemptive scheduling (timer IRQ interleaves two threads) + EL0 + SVC roundtrip (HELLO from EL0, IRQs at EL0) + separately-compiled user ELF (hello from aarch64 ELF) + virtio-mmio block driver (sector 0 read)"
+        "qemu-aarch64: PASS — banner + PL011 console + device-tree memory map (RAM base 0x40000000) + per-CPU base via TPIDR_EL1 + frame allocator from FDT + global heap (Box/Vec) + cooperative context switch (A/B ping-pong) + Frame Scheduler ($Idle→$Active→$Idle) + preemptive scheduling (timer IRQ interleaves two threads) + EL0 + SVC roundtrip (HELLO from EL0, IRQs at EL0) + separately-compiled user ELF (hello from aarch64 ELF) + virtio-mmio block driver (sector 0 read + sector 1 write/read/verify via BlockRequest FSM)"
     );
     Ok(())
 }

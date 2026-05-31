@@ -61,6 +61,7 @@ struct BlkReq {
     sector: u64,
 }
 const VIRTIO_BLK_T_IN: u32 = 0;
+const VIRTIO_BLK_T_OUT: u32 = 1;
 
 const SECTOR_SIZE: usize = 512;
 
@@ -236,40 +237,89 @@ unsafe fn set_desc(q: &VQueue, i: u16, addr: u64, len: u32, flags: u16, next: u1
 }
 
 // ---------------------------------------------------------------------------
-// Read sector 0. Single in-flight request, polled completion.
+// I/O. Single in-flight request, polled completion. One pre-allocated buffer
+// (16 B header + SECTOR_SIZE data + 1 B status) used by every transfer — the
+// driver is single-threaded right now, so reuse is safe.
 // ---------------------------------------------------------------------------
 
-/// Reservation: 16 B request header + SECTOR_SIZE data + 1 B status, all
-/// adjacent in one alloc'd frame so we can hand 3 descriptors at known
-/// addresses to the device.
 const REQ_OFFSET: usize = 0;
 const DATA_OFFSET: usize = 16;
 const STATUS_OFFSET: usize = 16 + SECTOR_SIZE;
 
-unsafe fn read_sector0(q: &VQueue) -> bool {
-    // Allocate one page for the request region.
-    let buf_pa = frames::alloc_contiguous(1).expect("blk buf alloc");
-    let buf_va = buf_pa; // identity-mapped
-    let buf = buf_va as *mut u8;
-    unsafe { core::ptr::write_bytes(buf, 0, 4096) };
+/// The shared request region. Allocated lazily on the first transfer and
+/// reused for the rest of this single-threaded driver's lifetime.
+static mut REQ_BUF_PA: u64 = 0;
 
-    // Header at offset 0: type=IN, sector=0.
+/// Direction of a virtio-blk request.
+pub enum BlkDir {
+    Read,
+    Write,
+}
+
+fn req_buf() -> u64 {
+    unsafe {
+        let p = &raw mut REQ_BUF_PA;
+        if p.read() == 0 {
+            let pa = frames::alloc_contiguous(1).expect("blk req buf alloc");
+            core::ptr::write_bytes(pa as *mut u8, 0, 4096);
+            p.write(pa);
+        }
+        p.read()
+    }
+}
+
+/// Submit one transfer at `sector`, hand-off `data` per direction, poll the
+/// used ring until the device acks, return true iff the device reported
+/// status 0. Pure native I/O — no FSM, no IRQ. The Frame `BlockRequest`
+/// system wraps this with its lifecycle ($Submitted → $Complete/$Failed).
+unsafe fn submit_and_wait(q: &VQueue, sector: u64, dir: BlkDir, data: &mut [u8]) -> bool {
+    assert!(
+        data.len() == SECTOR_SIZE,
+        "virtio-mmio: data buf must be 512 B"
+    );
+    let buf_pa = req_buf();
+    let buf = buf_pa as *mut u8;
+
+    // Header.
     let hdr = (buf as u64 + REQ_OFFSET as u64) as *mut BlkReq;
+    let type_ = match dir {
+        BlkDir::Read => VIRTIO_BLK_T_IN,
+        BlkDir::Write => VIRTIO_BLK_T_OUT,
+    };
     unsafe {
         write_volatile(
             hdr,
             BlkReq {
-                type_: VIRTIO_BLK_T_IN,
+                type_,
                 reserved: 0,
-                sector: 0,
+                sector,
             },
         );
     }
-    // Pre-poison status byte.
+
+    // For a write, copy the caller's data into the shared region before
+    // handing it to the device. For a read, the device will fill it.
+    if matches!(dir, BlkDir::Write) {
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                data.as_ptr(),
+                (buf as u64 + DATA_OFFSET as u64) as *mut u8,
+                SECTOR_SIZE,
+            );
+        }
+    }
+
+    // Pre-poison the status byte so we can tell whether the device wrote it.
     let status = (buf as u64 + STATUS_OFFSET as u64) as *mut u8;
     unsafe { write_volatile(status, 0xFF) };
 
-    // 3 chained descriptors. Device reads header + writes data + writes status.
+    // 3 chained descriptors. Device always reads the header. For IN, it
+    // writes the data + status. For OUT, the data is also device-readable
+    // (no WRITE flag), only the status is device-written.
+    let data_flags = match dir {
+        BlkDir::Read => VRING_DESC_F_NEXT | VRING_DESC_F_WRITE,
+        BlkDir::Write => VRING_DESC_F_NEXT,
+    };
     unsafe {
         set_desc(q, 0, buf_pa + REQ_OFFSET as u64, 16, VRING_DESC_F_NEXT, 1);
         set_desc(
@@ -277,7 +327,7 @@ unsafe fn read_sector0(q: &VQueue) -> bool {
             1,
             buf_pa + DATA_OFFSET as u64,
             SECTOR_SIZE as u32,
-            VRING_DESC_F_NEXT | VRING_DESC_F_WRITE,
+            data_flags,
             2,
         );
         set_desc(
@@ -310,7 +360,7 @@ unsafe fn read_sector0(q: &VQueue) -> bool {
     let mut spins = 0u64;
     while unsafe { read_volatile(&(*used).idx) } == initial_used {
         if spins > 200_000_000 {
-            serial::writeln("[vio-mmio] read timeout (no used-ring advance)");
+            serial::writeln("[vio-mmio] I/O timeout (no used-ring advance)");
             return false;
         }
         spins += 1;
@@ -329,27 +379,48 @@ unsafe fn read_sector0(q: &VQueue) -> bool {
         return false;
     }
 
-    // Print the first 48 bytes of the data (printable + newline-terminated).
-    serial::write_str("[vio-mmio] sector 0: \"");
-    for i in 0..48usize {
-        let b = unsafe { read_volatile((buf as u64 + DATA_OFFSET as u64 + i as u64) as *const u8) };
-        if b == 0 || b == b'\n' {
-            break;
+    // For a read, copy the device-written data back to the caller.
+    if matches!(dir, BlkDir::Read) {
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                (buf as u64 + DATA_OFFSET as u64) as *const u8,
+                data.as_mut_ptr(),
+                SECTOR_SIZE,
+            );
         }
-        serial::write_byte(b);
     }
-    serial::writeln("\"");
 
     true
 }
 
 // ---------------------------------------------------------------------------
-// Public entry — the smoke demo.
+// Public entry — the smoke demo. Read sector 0 (the marker the harness put
+// there), then drive a write+read+verify round-trip on sector 1 through the
+// `BlockRequest` Frame system — its $Submitted → $Complete lifecycle wraps
+// each native transfer, the same pattern the x86 virtio-blk path uses. The
+// BlockRequest FSM is `pure` (compiles for both ISAs since B-HAL.4.4), so
+// the Frame layer comes for free on aarch64 now that there's a storage
+// backend to drive it (B-HAL.5.4a).
 // ---------------------------------------------------------------------------
 
-/// Probe for a virtio-mmio block device, init it, and read sector 0. Returns
-/// true on success. Single-shot; no IRQ wiring; the device is left in
-/// DRIVER_OK state so a follow-up read would work.
+use crate::frame_systems::BlockRequest;
+
+/// Run one block-I/O transfer wrapped in a fresh `BlockRequest` FSM, return
+/// true iff both the native I/O succeeded *and* the FSM reached $Complete.
+unsafe fn run_request(q: &VQueue, sector: u64, dir: BlkDir, data: &mut [u8]) -> bool {
+    let mut req = BlockRequest::__create();
+    req.submit(); // $Idle → $Submitted
+    let io_ok = unsafe { submit_and_wait(q, sector, dir, data) };
+    if io_ok {
+        req.complete(); // $Submitted → $Complete
+    } else {
+        req.fail(); // $Submitted → $Error
+    }
+    io_ok && req.is_complete()
+}
+
+/// Probe for a virtio-mmio block device, init it, read sector 0, then do a
+/// write+read+verify round-trip on sector 1 driven through `BlockRequest`.
 pub fn run_demo() {
     serial::writeln("[vio-mmio] probing for virtio-mmio block device...");
     let base = match probe_block_device() {
@@ -373,7 +444,38 @@ pub fn run_demo() {
     // Mark device live.
     unsafe { mmio_w32(base, R_STATUS, STAT_ACK | STAT_DRIVER | STAT_DRIVER_OK) };
 
-    if unsafe { read_sector0(&q) } {
+    // --- Read sector 0 through a BlockRequest FSM, print marker -----------
+    let mut sec0 = [0u8; SECTOR_SIZE];
+    if unsafe { run_request(&q, 0, BlkDir::Read, &mut sec0) } {
+        serial::write_str("[vio-mmio] sector 0: \"");
+        for &b in sec0.iter().take(48) {
+            if b == 0 || b == b'\n' {
+                break;
+            }
+            serial::write_byte(b);
+        }
+        serial::writeln("\"");
         serial::writeln("[vio-mmio] sector 0 read: ok");
+    }
+
+    // --- Round-trip on sector 1: write known pattern, read back, verify ---
+    let mut wbuf = [0u8; SECTOR_SIZE];
+    let pattern = b"FrameOS-aarch64-RW-rountrip-OK";
+    wbuf[..pattern.len()].copy_from_slice(pattern);
+    let write_ok = unsafe { run_request(&q, 1, BlkDir::Write, &mut wbuf) };
+
+    let mut rbuf = [0u8; SECTOR_SIZE];
+    let read_ok = unsafe { run_request(&q, 1, BlkDir::Read, &mut rbuf) };
+
+    let bytes_match = rbuf[..pattern.len()] == *pattern;
+    if write_ok && read_ok && bytes_match {
+        serial::writeln("[vio-mmio] sector 1 write+read+verify via BlockRequest FSM: ok");
+    } else {
+        serial::write_str("[vio-mmio] sector 1 round-trip FAILED: write=");
+        serial::write_str(if write_ok { "ok" } else { "fail" });
+        serial::write_str(" read=");
+        serial::write_str(if read_ok { "ok" } else { "fail" });
+        serial::write_str(" match=");
+        serial::writeln(if bytes_match { "ok" } else { "fail" });
     }
 }

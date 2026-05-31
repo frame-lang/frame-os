@@ -512,6 +512,32 @@ at once.
     fmt clean. Scope honesty: single-shot polled read; no IRQ wiring; no
     integration with the kernel's Frame `BlockRequest` / `IoScheduler`
     (B-HAL.5.4 plugs it in once the FS-mount path runs on aarch64).
+  - **B-HAL.5.4a — virtio-mmio bidirectional I/O + `BlockRequest` FSM on
+    aarch64. DONE (2026-05-30).** Extends .5.3 from read-only sector 0 to a
+    write+read+verify round-trip on sector 1, with each transfer wrapped in
+    a fresh `BlockRequest` Frame system instance — the *same* `pure`
+    system the x86 path uses (compiles for both ISAs since B-HAL.4.4). The
+    FSM hits `$Complete` only when the device returned status 0; on
+    failure the driver calls `fail()` and the FSM goes to `$Error`. Driver
+    refactor: extracted `submit_and_wait(q, sector, dir, data: &mut [u8;
+    512])` as the reusable native I/O primitive; `BlkDir::{Read, Write}`
+    selects between VIRTIO_BLK_T_IN and VIRTIO_BLK_T_OUT (only the header
+    `type` field + the data descriptor's VRING_DESC_F_WRITE flag differ
+    between directions); one pre-allocated request page (16 B header +
+    512 B data + 1 B status) is reused across transfers (single-threaded
+    driver, no overlap). Wrapper `run_request(q, sector, dir, data)`
+    creates a `BlockRequest`, drives `submit → complete | fail` around the
+    native I/O, returns true iff the FSM reached `is_complete()`. Demo:
+    read sector 0 + print marker (same as .5.3), write
+    `"FrameOS-aarch64-RW-rountrip-OK"` to sector 1, read sector 1 back,
+    verify the pattern matches. Observed: `[vio-mmio] sector 1
+    write+read+verify via BlockRequest FSM: ok`. Validated: `cargo xtask
+    qemu-aarch64` PASS; x86 + aarch64 build + clippy clean; fmt clean.
+    **The Frame layer composes with aarch64 storage**: not just FSM
+    execution (B-HAL.4.4) + a storage backend (B-HAL.5.3) running
+    side-by-side, but the FSM *wrapping* the storage transfer with its
+    lifecycle — the same pattern the x86 path uses for the full I/O
+    stack. B-HAL.5.4b extends with FS mount on top.
 
 ## Risks / honest scope
 
