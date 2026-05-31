@@ -1489,6 +1489,23 @@ fn run_qemu_aarch64() -> Result<()> {
         bail!("failed to dump the virt DTB to {}", dtb.display());
     }
 
+    // 2b. Build a tiny virtio-blk disk image at a known path. The first sector
+    //     contains a marker string the kernel reads + prints, proving the
+    //     virtio-mmio block driver actually moved bytes (B-HAL.5.3).
+    let disk = target_dir(&workspace).join("virt-aarch64.img");
+    {
+        const DISK_BYTES: usize = 1024 * 1024; // 1 MiB — far more than needed
+        let mut img = vec![0u8; DISK_BYTES];
+        let marker = b"FrameOS-Disk: hello from virtio-mmio sector 0\n";
+        img[..marker.len()].copy_from_slice(marker);
+        std::fs::write(&disk, &img).with_context(|| {
+            format!(
+                "failed to write the virtio-blk disk image to {}",
+                disk.display()
+            )
+        })?;
+    }
+
     // 3. Boot, loading the DTB at a fixed address; capture serial on a thread.
     const DTB_ADDR: u64 = 0x4400_0000;
     eprintln!("booting aarch64 kernel under qemu-system-aarch64 -M virt...");
@@ -1514,6 +1531,17 @@ fn run_qemu_aarch64() -> Result<()> {
             dtb.display(),
             DTB_ADDR
         ))
+        // B-HAL.5.3: attach a virtio-blk-device (the QEMU virt machine's storage
+        // transport is virtio-mmio, not virtio-pci). `if=none` keeps QEMU from
+        // hooking the drive up via the default IDE/SCSI path; the drive's `id`
+        // is what `-device virtio-blk-device,drive=…` references.
+        .arg("-drive")
+        .arg(format!(
+            "id=disk0,if=none,format=raw,file={}",
+            disk.display()
+        ))
+        .arg("-device")
+        .arg("virtio-blk-device,drive=disk0")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -1606,6 +1634,15 @@ fn run_qemu_aarch64() -> Result<()> {
         // table the inline demo uses. The first real user program on aarch64.
         wait_for_output(&buf, "hello from aarch64 ELF", 30)?;
         wait_for_output(&buf, "[el0-elf] ELF load + EL0 run: ok", 30)?;
+        // B-HAL.5.3: virtio-mmio block driver. QEMU virt's storage transport
+        // (the `-device virtio-blk-device,drive=disk0` above hangs off the
+        // virt board's virtio-mmio bus). Probing the 32 fixed slots finds the
+        // block device, legacy v1 handshake brings it up, queue 0 setup +
+        // a single VIRTIO_BLK_T_IN at LBA 0 round-trips a sector — the marker
+        // string the harness wrote at sector 0 comes back via DMA.
+        wait_for_output(&buf, "[vio-mmio] found block device at MMIO", 30)?;
+        wait_for_output(&buf, "FrameOS-Disk: hello from virtio-mmio sector 0", 30)?;
+        wait_for_output(&buf, "[vio-mmio] sector 0 read: ok", 30)?;
         // B-HAL.4.5: timer-driven preemptive scheduling on aarch64. Two
         // non-yielding workers print '1'/'2' in busy loops; the generic-timer
         // IRQ saves the full interrupt frame, schedule() picks the next
@@ -1631,7 +1668,7 @@ fn run_qemu_aarch64() -> Result<()> {
         bail!("qemu-aarch64: kernel panicked:\n{captured}");
     }
     eprintln!(
-        "qemu-aarch64: PASS — banner + PL011 console + device-tree memory map (RAM base 0x40000000) + per-CPU base via TPIDR_EL1 + frame allocator from FDT + global heap (Box/Vec) + cooperative context switch (A/B ping-pong) + Frame Scheduler ($Idle→$Active→$Idle) + preemptive scheduling (timer IRQ interleaves two threads) + EL0 + SVC roundtrip (HELLO from EL0, IRQs at EL0) + separately-compiled user ELF (hello from aarch64 ELF)"
+        "qemu-aarch64: PASS — banner + PL011 console + device-tree memory map (RAM base 0x40000000) + per-CPU base via TPIDR_EL1 + frame allocator from FDT + global heap (Box/Vec) + cooperative context switch (A/B ping-pong) + Frame Scheduler ($Idle→$Active→$Idle) + preemptive scheduling (timer IRQ interleaves two threads) + EL0 + SVC roundtrip (HELLO from EL0, IRQs at EL0) + separately-compiled user ELF (hello from aarch64 ELF) + virtio-mmio block driver (sector 0 read)"
     );
     Ok(())
 }

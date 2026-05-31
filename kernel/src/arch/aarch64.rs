@@ -21,6 +21,7 @@ pub mod serial;
 pub mod timer;
 pub mod usermode;
 pub mod vectors;
+pub mod virtio_mmio;
 
 /// The console device type the `hal::console()` accessor returns on aarch64.
 pub type ConsoleDevice = serial::Pl011;

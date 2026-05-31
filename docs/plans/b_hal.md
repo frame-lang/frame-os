@@ -483,6 +483,35 @@ at once.
     clippy clean; fmt clean. With this, "user-mode Rust on the second ISA"
     isn't a hand-asm trick — it's a real toolchain end-to-end. B-HAL.5.3+
     can scale up (virtio-mmio for real storage, mount FS, `ish` shell).
+  - **B-HAL.5.3 — virtio-mmio block driver on aarch64 (sector 0 read).
+    DONE (2026-05-30).** The first DMA round-trip on aarch64. QEMU's `virt`
+    board exposes virtio devices over MMIO (not PCI like `q35` on x86), so
+    the x86 `virtio_blk.rs` (virtio-pci) doesn't port directly — instead
+    a fresh, minimal `arch/aarch64/virtio_mmio.rs` covers the legacy v1
+    transport on its own (the virtqueue layer is identical; only the
+    config/IRQ surface changes). QEMU pins 32 virtio-mmio slots at
+    `0x0a00_0000 + i*0x200`; the driver walks them probing
+    `MAGIC = "virt"` + `VERSION = 1` + `DEVICE_ID = 2` (block). Init
+    handshake: status reset → ACK → DRIVER → `DRIVER_FEATURES = 0` (accept
+    device defaults; legacy doesn't require `FEATURES_OK`) →
+    `GUEST_PAGE_SIZE = 4096` → `QUEUE_SEL = 0`, `QUEUE_NUM =
+    min(QUEUE_NUM_MAX, 8)`, `QUEUE_ALIGN = 4096`. Virtqueue: one
+    contiguous page via `frames::alloc_contiguous`, zero it,
+    `QUEUE_PFN = pa / GUEST_PAGE_SIZE`. Sector read: a second page laid out
+    as `[16 B header][512 B data][1 B status]`, 3 chained descriptors
+    (header NEXT, data NEXT|WRITE, status WRITE), push head into avail,
+    `dsb st` so the descriptor writes are visible before idx bump,
+    `QUEUE_NOTIFY = 0`, poll used-ring idx, `INTERRUPT_ACK = 0x3`, check
+    status byte = 0, print the data bytes. xtask wires a `-drive` +
+    `-device virtio-blk-device,drive=disk0` pair pointed at a 1 MiB image
+    whose sector 0 contains a known marker. Observed: `[vio-mmio] found
+    block device at MMIO 0x000000000a003e00` (slot 31, where QEMU places
+    it), `handshake ok; queue 0 size = 8`, `sector 0: "FrameOS-Disk: hello
+    from virtio-mmio sector 0"`, `[vio-mmio] sector 0 read: ok`. Validated:
+    `cargo xtask qemu-aarch64` PASS; x86 + aarch64 build + clippy clean;
+    fmt clean. Scope honesty: single-shot polled read; no IRQ wiring; no
+    integration with the kernel's Frame `BlockRequest` / `IoScheduler`
+    (B-HAL.5.4 plugs it in once the FS-mount path runs on aarch64).
 
 ## Risks / honest scope
 

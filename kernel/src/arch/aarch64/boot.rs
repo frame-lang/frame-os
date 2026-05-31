@@ -313,6 +313,13 @@ unsafe extern "C" fn kmain(dtb: usize) -> ! {
     // program. Same `enter_el0` mechanism the inline demo uses.
     crate::arch::aarch64::usermode::run_elf_demo();
 
+    // B-HAL.5.3: virtio-mmio block driver — QEMU virt's storage transport.
+    // Probe the 32 fixed virtio-mmio slots at 0x0a00_0000+i*0x200, init the
+    // first block device (legacy v1 handshake), set up queue 0, read sector
+    // 0 and print the marker the xtask harness wrote there. The first DMA
+    // round-trip on aarch64.
+    crate::arch::aarch64::virtio_mmio::run_demo();
+
     // B-HAL.4.5: timer-driven preemptive scheduling on aarch64. The same
     // pattern x86 uses (`sched.rs` `run()`): spawn two non-yielding workers
     // that print '1'/'2' in busy loops; the generic-timer IRQ preempts mid-
